@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "upstream_commit": "08e2c4ae41e2b63573a299825cebe6753481407c",
+  "initialization": "zero-wam-pretrain",
+  "interface": "full",
+  "dimensions": {
+    "entity_dim": 4,
+    "proprio_dim": 3,
+    "embodiment_dim": 2,
+    "geometry_dim": 3,
+    "relation_dim": 3,
+    "event_dim": 2,
+    "demo_dim": 4,
+    "action_dim": 3,
+    "token_dim": 32,
+    "roles": 2
+  },
+  "synthetic_dimensions_only": true,
+  "current_offsets": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "remaining_offsets": [
+    5,
+    6,
+    7,
+    8
+  ],
+  "tokens": {
+    "current": 8,
+    "remaining": 8
+  },
+  "lora": {
+    "rank": 8,
+    "alpha": 8,
+    "dropout": 0
+  },
+  "training": {
+    "budget_kind": "pilot",
+    "max_steps": 1000,
+    "batch_size": 1,
+    "gradient_accumulation": 1,
+    "learning_rate": 0.0001,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "record_gpu_seconds": true
+  },
+  "conditioning": {
+    "unconditional_probability": 0.1,
+    "drop_icl": 0.0,
+    "droptext_target": 0.0,
+    "task_text": "",
+    "pair_dropout": 0.0,
+    "shared_robot_encoding": true,
+    "shared_noise_within_target": true
+  },
+  "video_snr_shift": 5.0,
+  "ifp": {
+    "enabled": true,
+    "num_mcp_modules": 4,
+    "mcp_blocks_per_group": 1,
+    "mcp_hidden_collect_layers": [
+      3,
+      11,
+      19,
+      29
+    ],
+    "mcp_snr_shift": 10.0,
+    "mcp_loss_weights": [
+      0.5,
+      0.25,
+      0.15,
+      0.1
+    ],
+    "future_chunk_stride": 2
+  },
+  "interaction_supervision": false,
+  "lambda_cv": 0.0,
+  "cv_fields": [
+    "current_binding",
+    "remaining_binding",
+    "relations",
+    "events"
+  ],
+  "pair_supervision_reduction": "mean",
+  "candidate_count": 1,
+  "f_ranking": false,
+  "split": {
+    "method": "source_trajectory_components",
+    "seed": 0,
+    "fractions": [
+      0.8,
+      0.1,
+      0.1
+    ]
+  },
+  "validation_locked": false,
+  "require_validation_lock_for_test": true
+}

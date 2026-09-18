@@ -1,0 +1,135 @@
+# Learned effect interfaces
+
+`src/evo_wam/models.py` contains trainable PyTorch modules, not trained robot skills.
+The CPU checks verify indexing, gradient and information-flow contracts; they do
+not establish grasping, migration or closed-loop success.
+
+## Requirements and tokens
+
+`RequirementCodec(entity_dim, geometry_dim, relation_dim, event_dim, roles,
+token_dim=64, interface="full")` is shared by current and remaining requirements.
+
+- `encode(requirement, entity_features)` returns `[B,T*R,D]` tokens, time-major.
+- `decode(tokens, entity_features, step_offsets, entity_ids)` returns a
+  `DecodedRequirement`: binding categorical logits `[B,R,N]`, geometry
+  `[B,T,R,Dg]`, independent relationship/event logits `[B,T,R,R,C/E]`, and
+  same-shaped requirement-mask logits.
+- `forward(requirement, entity_features)` combines encode and decode.
+- `decoded_requirement_loss(decoded, requirement, interface="full")` supervises
+  available values and requirement masks. A predicted mask cannot switch off a
+  label. Invalid numeric labels are replaced before arithmetic, including NaNs.
+- `DecodedRequirement.probabilities()` returns binding categorical probabilities
+  and independent relationship/event Bernoulli probabilities. For a two-category
+  comparison, convert each Bernoulli `p` to `[p,1-p]`; do not softmax across
+  different relationships.
+- `materialize(threshold=0.5)` builds a runtime requirement. Its available-field
+  flags mean that outputs exist, not that predictions are true annotations.
+  Never write this materialization back as ground-truth supervision. Active empty
+  requirements still receive an infinite cost.
+
+The codec binds roles to observed entity features, not to numeric entity IDs.
+Permuting the entity table and inverse-mapping bindings preserves encoded tokens;
+binding output probabilities follow the entity permutation. Current and remaining
+may have different time grids. The same role vocabulary, feature dimensions and
+trained codec apply to both.
+
+The `geometry` control keeps exactly the same token width, count and parameter
+shapes as the full interface. Its encoder zeros every relationship/event value,
+mask and validity input, and its decoder loss omits those fields. The main WAM
+may still receive the same independent interaction auxiliary supervision in both
+experiments; the geometry representation is not claimed to be information-pure.
+
+## Demonstration reader
+
+`EffectReader(demo_dim, entity_dim, proprio_dim, embodiment_dim, roles,
+token_dim=64)` consumes already-encoded demonstration tokens; it adds no image
+encoder. Its forward arguments are:
+
+```python
+goals = reader(
+    demo_tokens,       # B,S,Ddemo
+    entity_history,    # B,L,N,Dentity, before task conditioning
+    proprio_history,  # B,L,Dproprio
+    embodiment,       # B,Dembodiment
+    current_offsets,  # Tcurrent
+    remaining_offsets,# Tremaining
+    entity_present=entity_ids >= 0,  # required when padded slots are used
+)
+```
+
+`goals.current` and `goals.remaining` are `[B,T*R,D]`. The reader attends to
+demonstration tokens and observed scene entities. Entity order is a set axis;
+observation history and time queries remain ordered. Demonstration tokens must
+follow a fixed frame-major temporal/spatial order. The reader adds deterministic
+sinusoidal token positions so reversing event order cannot become the same set
+of inputs; upstream local motion features do not replace this global order.
+Missing entities use the
+explicit presence mask rather than becoming a false contact absence.
+
+## Physical predictor and auxiliary head
+
+`CausalEffectPredictor(observation_dim, proprio_dim, action_dim, embodiment_dim,
+geometry_dim, relation_dim, event_dim, hidden_dim=64)` accepts only:
+
+```python
+prediction = predictor(history, proprio, actions, embodiment,
+                       entity_present=entity_ids >= 0)
+# history B,L,N,Dobs; proprio B,L,Dproprio; actions B,H,Daction
+```
+
+It returns `PhysicalPrediction(geometry, relation_logits, event_logits,
+prediction_uncertainty)`. Shapes are `[B,H,N,Dg]`, `[B,H,N,N,C]`,
+`[B,H,N,N,E]`, and `[B,H,N]`. Geometry is relative to the present observed state;
+relations are states at each step, and events describe intervals ending at that
+step. A shared per-entity recurrent model and ordered pair readouts preserve
+entity permutation. The action recurrence is causal: future actions cannot
+change a prefix prediction. There is no goal, demonstration, text or task-cache
+argument. The caller must supply features from before task conditioning.
+
+`physical_prediction_loss(prediction, outcome)` selects one-based action steps
+using `outcome.step_offsets`. Data validity alone gates supervised residuals.
+The uncertainty head learns detached, per-entity residual magnitude, including
+incident relationships. This is not a success probability or calibrated risk;
+calibration and rejection thresholds require independent validation data.
+
+`TemporalInteractionHead(feature_dim, relation_dim, event_dim, hidden_dim=64)`
+is a separate training-only head. `head(phi, offsets)` returns relationship and
+event logits `[B,K,N,N,C/E]`. `phi` is entity-aligned `[B,N,D]` or `[B,N,S,D]`,
+where only `S` is pooled. Native video hidden states must first be pooled/aligned
+with observation-derived entity masks. A raw video-patch axis is not an entity
+axis. Neither the head nor alignment metadata may directly read goals or
+demonstration tokens. This head is not the action-conditioned predictor.
+
+## Matching costs and time
+
+```python
+scores = effect_cost(prediction, requirement, entity_visible, prefix_steps,
+                     field_weights=None, uncertainty_weight=1.0, active=None)
+```
+
+The scene entity table must have the same order as the predictor history.
+`step_offsets` selects the required physical times from the complete candidate
+window. Geometric squared error and relationship/event Brier errors are averaged
+within each required field, then combined using fixed positive field weights.
+The weights are calibration knobs, locked on validation data before evaluation.
+
+The deployed prefix never moves a terminal requirement earlier. `prefix_steps`
+only selects an extra early-window uncertainty contribution; the cost still
+checks each requirement at its own time. Goals outside the candidate horizon
+raise a clear error: callers must plan a longer window or provide an explicit
+local-progress requirement, not silently omit the goal.
+
+Uncertainty contributes a nonnegative additive term for involved entities;
+increasing it cannot reduce a fixed requirement's cost. Missing required entity
+observations, missing required labels, or active empty requirements yield
+`inf` for rejection. Malformed contracts raise errors rather than being repaired.
+An explicit inactive flag returns zero only after the caller independently
+verified completion or a permitted idle state. Costs do not certify hardware
+safety, and complete-candidate predictions are not claims about prefix-and-replan
+closed-loop outcomes.
+
+Run the interface checks with:
+
+```bash
+python -m unittest discover -s tests -p test_models.py -v
+```

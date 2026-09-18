@@ -1,0 +1,3 @@
+[submodule "third_party/Zero-WAM"]
+	path = third_party/Zero-WAM
+	url = https://github.com/robbyant-research/Zero-WAM.git

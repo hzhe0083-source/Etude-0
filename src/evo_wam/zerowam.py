@@ -1,0 +1,499 @@
+"""Thin, commit-pinned integration with the real Zero-WAM transformer.
+
+No attention replacement: both training and sampling execute the upstream model.
+The wrapper routes task slots with native FlexAttention masks and keeps sampling
+and supervised training graphs separate. Calls on one adapter are sequential.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import importlib
+import json
+import subprocess
+import sys
+from typing import Sequence
+
+import torch
+from torch import Tensor, nn
+
+
+ZERO_WAM_COMMIT = "08e2c4ae41e2b63573a299825cebe6753481407c"
+DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "third_party" / "Zero-WAM"
+
+
+class NativeDependencyError(ImportError):
+    """The real upstream runtime cannot be imported; never substitute attention."""
+
+
+def verify_source(source: str | Path = DEFAULT_SOURCE) -> Path:
+    source = Path(source).resolve()
+    result = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, check=True)
+    if result.stdout.strip() != ZERO_WAM_COMMIT:
+        raise ValueError(f"Zero-WAM must be at {ZERO_WAM_COMMIT}")
+    subprocess.run(["git", "-C", str(source), "diff", "--quiet", "HEAD", "--"],
+                   check=True)
+    return source
+
+
+def load_native_class(source: str | Path = DEFAULT_SOURCE):
+    source = verify_source(source)
+    previous = sys.modules.get("wan_va")
+    if previous and Path(previous.__file__).resolve().parent != source / "wan_va":
+        raise RuntimeError("Another wan_va installation is already imported")
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    try:
+        return importlib.import_module("wan_va.modules.icl_model").WanICLTransformer3DModel
+    except ImportError as exc:
+        raise NativeDependencyError(
+            "Native Zero-WAM needs its pinned torch/diffusers/transformers stack, "
+            f"einops, easydict and a real flash-attn installation: {exc}"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class TaskConditions:
+    current: Tensor | None
+    remaining: Tensor | None
+    null: Tensor  # Native empty-text embedding, [1, N_null, text_dim].
+
+    def detached(self) -> "TaskConditions":
+        return TaskConditions(None if self.current is None else self.current.detach(),
+                              None if self.remaining is None else self.remaining.detach(),
+                              self.null.detach())
+
+    def unconditional(self) -> "TaskConditions":
+        return TaskConditions(None, None, self.null)
+
+
+@dataclass
+class NativeOutput:
+    video: Tensor
+    action: Tensor
+    mcp: list[Tensor]
+    phi: Tensor  # Current noisy-video tokens only; contains no clean-prefix tokens.
+
+
+@dataclass(frozen=True)
+class GeneratedFuture:
+    latents: Tensor
+    conditions: TaskConditions
+    grid_id: Tensor
+    frame_id: int
+
+
+class VideoLoRA(nn.Module):
+    """Also used for action-specific projections; never applied to shared K/V."""
+    def __init__(self, base: nn.Linear, rank: int = 4, alpha: float | None = None):
+        super().__init__()
+        if not 0 < rank <= min(base.in_features, base.out_features):
+            raise ValueError("LoRA rank must fit the linear projection")
+        self.base = base.requires_grad_(False)
+        self.down = nn.Linear(base.in_features, rank, bias=False).to(base.weight)
+        self.up = nn.Linear(rank, base.out_features, bias=False).to(base.weight)
+        nn.init.zeros_(self.up.weight)
+        alpha = float(rank if alpha is None else alpha)
+        if not torch.isfinite(torch.tensor(alpha)) or alpha <= 0:
+            raise ValueError("LoRA alpha must be finite and positive")
+        self.scale = alpha / rank
+
+    def forward(self, value: Tensor) -> Tensor:
+        return self.base(value) + self.up(self.down(value)) * self.scale
+
+    def enable(self, enabled: bool) -> None:
+        self.down.requires_grad_(enabled)
+        self.up.requires_grad_(enabled)
+
+
+def route_allowed(query: Tensor, key: Tensor, *, latent_length: int,
+                  action_length: int, null_length: int, current_length: int,
+                  conditional: bool, mcp: bool) -> Tensor:
+    """Native cross-mask intersection; also directly testable on CPU."""
+    real_query = query < latent_length + action_length
+    null = key < null_length
+    current = (key >= null_length) & (key < null_length + current_length)
+    remaining = key >= null_length + current_length
+    task = conditional and not mcp
+    return real_query & (null | (task & current) |
+                         (task & (query < latent_length) & remaining))
+
+
+def unpack_velocity(value: Tensor, shape: Sequence[int], patch_size=(1, 1, 1)) -> Tensor:
+    """Undo upstream token order, including its within-patch video ordering."""
+    batch, channels, frames, height, width = shape
+    pt, ph, pw = patch_size
+    if frames % pt or height % ph or width % pw:
+        raise ValueError("Latent shape must be divisible by the patch size")
+    expected = (batch, frames * height * width, channels)
+    if tuple(value.shape) != expected:
+        raise ValueError(f"Expected native velocity {expected}, got {tuple(value.shape)}")
+    patches = value.reshape(batch, frames // pt, height // ph, width // pw,
+                            pt, ph, pw, channels)
+    return patches.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(tuple(shape))
+
+
+class ZeroWAMAdapter(nn.Module):
+    def __init__(self, native: nn.Module, condition_dim: int, *, current_tokens=1,
+                 remaining_tokens=1, lora_rank=4, lora_alpha=None, lora_dropout=0.0):
+        super().__init__()
+        if current_tokens < 1 or remaining_tokens < 1:
+            raise ValueError("Both fixed task slot groups must be nonempty")
+        if lora_dropout != 0:
+            raise ValueError("Paired LoRA forwards require lora_dropout=0")
+        self.native = native
+        if any(isinstance(module, nn.Dropout) and module.p != 0 for module in native.modules()):
+            raise ValueError("Paired native forwards require model dropout=0")
+        self.current_tokens, self.remaining_tokens = current_tokens, remaining_tokens
+        self.condition_dim = condition_dim
+        self.condition_projection = nn.Linear(condition_dim, native.config.text_dim)
+        self.condition_projection.to(next(native.parameters()))
+        self._video_loras, self._action_loras = [], []
+        for block in native.blocks:
+            for name, modules in (("to_q", self._video_loras),
+                                  ("action_to_q", self._action_loras)):
+                lora = VideoLoRA(getattr(block.attn2, name), lora_rank, lora_alpha)
+                setattr(block.attn2, name, lora)
+                modules.append(lora)
+            for name, modules in (("to_out", self._video_loras),
+                                  ("action_to_out", self._action_loras)):
+                outputs = getattr(block.attn2, name)
+                outputs[0] = VideoLoRA(outputs[0], lora_rank, lora_alpha)
+                modules.append(outputs[0])
+        self._routing = None
+        self._hidden: dict[int, Tensor] = {}
+        self._fused: Tensor | None = None
+        self._physical_actions: Tensor | None = None
+        self._handles = []
+        for index, block in enumerate(native.blocks):
+            self._handles.append(block.attn2.register_forward_pre_hook(self._mask_hook(False)))
+            self._handles.append(block.register_forward_hook(self._hidden_hook(index)))
+        for group in getattr(native, "mcp_blocks", []):
+            self._handles.append(group[0].register_forward_pre_hook(self._physical_action_hook))
+            for block in group:
+                self._handles.append(block.attn2.register_forward_pre_hook(self._mask_hook(True)))
+        if hasattr(native, "mcp_mlp_hidden"):
+            self._handles.append(native.mcp_mlp_hidden.register_forward_hook(self._fused_hook))
+        self.set_stage("reader")
+
+    @classmethod
+    def from_config(cls, config: str | Path | dict, condition_dim: int, *,
+                    source=DEFAULT_SOURCE, device="cpu", dtype=torch.bfloat16, **kwargs):
+        if not isinstance(config, dict):
+            config = json.loads(Path(config).read_text())
+        native = load_native_class(source).from_config(config).to(device=device, dtype=dtype)
+        return cls(native, condition_dim, **kwargs)
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: str | Path, condition_dim: int, *,
+                        source=DEFAULT_SOURCE, device="cuda", dtype=torch.bfloat16, **kwargs):
+        checkpoint = Path(checkpoint).resolve()
+        if (checkpoint / "transformer").is_dir():
+            checkpoint = checkpoint / "transformer"
+        if not (checkpoint / "config.json").is_file():
+            raise FileNotFoundError(f"Missing native transformer config in {checkpoint}")
+        native = load_native_class(source).from_pretrained(
+            str(checkpoint), local_files_only=True, torch_dtype=dtype)
+        return cls(native.to(device=device, dtype=dtype), condition_dim, **kwargs)
+
+    def set_stage(self, stage: str) -> None:
+        if stage not in {"interface", "reader", "joint"}:
+            raise ValueError("stage must be interface, reader or joint")
+        self.requires_grad_(False)
+        self.condition_projection.requires_grad_(stage == "interface")
+        for lora in self._video_loras:
+            lora.enable(stage in {"interface", "joint"})
+        for lora in self._action_loras:
+            lora.enable(stage == "interface")
+        if stage == "joint":
+            for name in ("mcp_mlp_hidden", "mcp_projections", "mcp_blocks"):
+                module = getattr(self.native, name, None)
+                if module is not None:
+                    module.requires_grad_(True)
+        self.stage = stage
+
+    def _hidden_hook(self, index):
+        def capture(module, args, output):
+            if output[0] is not None:
+                self._hidden[index] = output[0]
+        return capture
+
+    def _fused_hook(self, module, args, output):
+        self._fused = output
+
+    def _physical_action_hook(self, module, args):
+        # Main action hidden states now receive g_current directly. Feeding them
+        # to MCP would bypass Phi. Keep the native action embedding and masks,
+        # but replace that task-contaminated context before the first MCP block.
+        if self._physical_actions is None:
+            raise RuntimeError("Missing task-free MCP action context")
+        return (args[0], self._physical_actions, *args[2:])
+
+    def _mask_hook(self, mcp):
+        def route(module, args):
+            from torch.nn.attention.flex_attention import create_block_mask
+            if self._routing is None:
+                raise RuntimeError("Native model must be called through its adapter")
+            null_length, conditional = self._routing
+            latent, action, pad, encoder = args[:4]
+            nl = 0 if latent is None else latent.shape[1]
+            na = 0 if action is None else action.shape[1]
+            original = module.cross_block_mask.mask_mod
+
+            def mask(b, h, q, k):
+                return original(b, h, q, k) & route_allowed(
+                    q, k, latent_length=nl, action_length=na,
+                    null_length=null_length, current_length=self.current_tokens,
+                    conditional=conditional, mcp=mcp)
+
+            module.cross_block_mask = create_block_mask(
+                mask, 1, 1, nl + na + pad.shape[1], encoder.shape[1],
+                device=encoder.device, _compile=False)
+        return route
+
+    def _condition_input(self, inputs: dict, conditions: TaskConditions) -> dict:
+        if inputs.get("icl_latent_dict") is not None:
+            raise ValueError("Raw ICL tokens bypass the Evo-WAM task interface")
+        null = conditions.null
+        if null.ndim != 3 or null.shape[0] != 1 or null.shape[1] < 1 or null.shape[2] != self.native.config.text_dim:
+            raise ValueError("null must be a nonempty native [1,N,text_dim] embedding")
+        active = conditions.current is not None
+        if active != (conditions.remaining is not None):
+            raise ValueError("Drop current and remaining together")
+        reference = self.condition_projection.weight
+        null = null.to(reference)
+        task = []
+        for tokens, length in ((conditions.current, self.current_tokens),
+                               (conditions.remaining, self.remaining_tokens)):
+            if tokens is None:
+                task.append(null.new_zeros(1, length, self.native.config.text_dim))
+            else:
+                if tuple(tokens.shape) != (1, length, self.condition_dim):
+                    raise ValueError("Task tokens do not match their fixed slot shape")
+                task.append(self.condition_projection(tokens.to(reference)))
+        text = torch.cat([null, *task], dim=1)
+        if not torch.isfinite(text).all():
+            raise ValueError("Condition embeddings must be finite")
+        self._routing = (null.shape[1], active)
+        return {**inputs, "text_emb": text,
+                "encoder_seq_ids": torch.zeros(text.shape[1], device=text.device, dtype=torch.int)}
+
+    def clear_cache(self) -> None:
+        self.native.clear_cache()
+        self._hidden.clear()
+        self._fused = None
+        self._physical_actions = None
+
+    def forward_train(self, inputs: dict, conditions: TaskConditions) -> NativeOutput:
+        self.clear_cache()
+        try:
+            if getattr(self.native, "enable_mcp", False):
+                action = inputs["action_dict"]
+                self._physical_actions = torch.cat([
+                    self.native._training_embed(action["noisy_latents"], action["timesteps"], "action")[0],
+                    self.native._training_embed(action["latent"], action["cond_timesteps"], "action")[0],
+                ], dim=1)
+            result = self.native(self._condition_input(inputs, conditions), train_mode=True)
+            video, action = result[:2]
+            count = video.shape[1] // int(torch.tensor(self.native.patch_size).prod())
+            if self._fused is not None:
+                phi = self._fused[:, :count]
+            elif hasattr(self.native, "mcp_mlp_hidden"):
+                phi = self.native.mcp_mlp_hidden(torch.cat(
+                    [self._hidden[i][:, :count] for i in self.native.mcp_hidden_collect_layers], -1))
+            else:
+                phi = self._hidden[len(self.native.blocks) - 1][:, :count]
+            return NativeOutput(video, action, list(result[2]) if len(result) == 3 else [], phi)
+        finally:
+            self.clear_cache()
+
+    def _stream(self, data: Tensor, mode: str, timestep, frame_id: int,
+                grid_id: Tensor | None = None, cache_type=1) -> dict:
+        from wan_va.utils import get_mesh_id
+        if data.ndim != 5 or data.shape[0] != 1:
+            raise ValueError("Native streams require [1,C,F,H,W]")
+        if mode not in {"video", "action"}:
+            raise ValueError("History stream mode must be video or action")
+        patch = self.native.patch_size if mode == "video" else (1, 1, 1)
+        if any(n % p for n, p in zip(data.shape[-3:], patch)):
+            raise ValueError("Stream shape is not patch aligned")
+        if grid_id is None:
+            f, h, w = (n // p for n, p in zip(data.shape[-3:], patch))
+            grid_id = get_mesh_id(f, h, w, int(mode == "action"), f_shift=frame_id // 2).to(data.device)
+        if grid_id.ndim == 3:
+            grid_id = grid_id[0]
+        count = grid_id.shape[1]
+        t = torch.as_tensor(timestep, device=data.device, dtype=torch.float32)
+        if t.numel() == 1:
+            t = t.expand(data.shape[2] // patch[0])
+        stream = {"noisy_latents": data, "timesteps": t,
+                  "cache_type_ids": torch.full((count,), cache_type, device=data.device, dtype=torch.int)}
+        key = "latent" if mode == "video" else "action"
+        return {f"{key}_res_lst": stream, f"{key}_grid_id": grid_id,
+                "current_seq_ids": torch.zeros(count, device=data.device, dtype=torch.int),
+                "current_frame_ids": torch.full((count,), frame_id, device=data.device, dtype=torch.int)}
+
+    @torch.no_grad()
+    def prefill_history(self, history: Sequence[tuple[str, Tensor, int]],
+                        conditions: TaskConditions) -> None:
+        """Clear and replay only actual observed video/action chunks in time order."""
+        self.clear_cache()
+        previous = -1
+        for mode, observed, frame_id in history:
+            if frame_id <= previous:
+                raise ValueError("History frame IDs must be strictly increasing")
+            previous = frame_id
+            payload = self._stream(observed.detach(), mode, 0, frame_id, cache_type=0)
+            self.native(self._condition_input(payload, conditions.detached()),
+                        mode=f"forward_{'latent' if mode == 'video' else 'action'}_only", update_cache=1)
+
+    @torch.no_grad()
+    def sample_video(self, initial_noise: Tensor, conditions: TaskConditions, *,
+                     history=(), steps=4, shift=5.0, frame_id=2, grid_id=None) -> GeneratedFuture:
+        """From noise only; ground-truth future/training dictionaries are not inputs."""
+        from wan_va.utils import FlowMatchScheduler
+        if steps < 1:
+            raise ValueError("Sampling steps must be positive")
+        if history and frame_id <= history[-1][2]:
+            raise ValueError("Future must follow the actual history")
+        conditions = conditions.detached()
+        scheduler = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
+        scheduler.set_timesteps(steps)
+        self.prefill_history(history, conditions)
+        sample = initial_noise.detach().clone()
+        try:
+            for timestep in scheduler.timesteps:
+                payload = self._stream(sample, "video", timestep, frame_id, grid_id)
+                velocity = self.native(self._condition_input(payload, conditions),
+                                       mode="forward_latent_only", update_cache=0)
+                velocity = unpack_velocity(velocity, sample.shape, self.native.patch_size)
+                sample = scheduler.step(velocity, timestep, sample)
+            return GeneratedFuture(sample.detach(), conditions,
+                                   payload["latent_grid_id"].detach(), frame_id)
+        finally:
+            self.clear_cache()
+
+    def action_velocity(self, noisy_action: Tensor, timestep, conditions: TaskConditions,
+                        future: GeneratedFuture, *, history=()) -> Tensor:
+        """Frozen action parameters still transmit gradients to current task tokens."""
+        if not isinstance(future, GeneratedFuture) or future.latents.requires_grad:
+            raise ValueError("Action decoding requires a detached GeneratedFuture")
+        if history and future.frame_id <= history[-1][2]:
+            raise ValueError("Generated future must follow the actual history")
+        self.prefill_history(history, future.conditions)
+        try:
+            with torch.no_grad():
+                video = self._stream(future.latents, "video", 0, future.frame_id,
+                                     future.grid_id, cache_type=1)
+                self.native(self._condition_input(video, future.conditions),
+                            mode="forward_latent_only", update_cache=1)
+            action = self._stream(noisy_action, "action", timestep, future.frame_id + 1)
+            result = self.native(self._condition_input(action, conditions),
+                                 mode="forward_action_only", update_cache=0)
+            return unpack_velocity(result, noisy_action.shape)
+        finally:
+            self.clear_cache()
+
+    @torch.no_grad()
+    def sample_actions(self, initial_noise: Tensor, conditions: TaskConditions,
+                       future: GeneratedFuture, *, history=(), steps=4, shift=1.0) -> Tensor:
+        from wan_va.utils import FlowMatchScheduler
+        if steps < 1:
+            raise ValueError("Sampling steps must be positive")
+        scheduler = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
+        scheduler.set_timesteps(steps)
+        sample = initial_noise.detach().clone()
+        # ponytail: replay history each step for strict cache isolation; cache snapshots
+        # can replace replay only after memory/latency measurements justify them.
+        for timestep in scheduler.timesteps:
+            velocity = self.action_velocity(sample, timestep, conditions, future, history=history)
+            sample = scheduler.step(velocity, timestep, sample)
+        return sample
+
+
+def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
+    """Real CUDA FlexAttention forward/MCP/backward and generated-video action path."""
+    if not torch.cuda.is_available():
+        raise NativeDependencyError("Native smoke requires CUDA; CPU structure checks are separate")
+    native_cls = load_native_class(source)
+    from wan_va.utils import get_mesh_id
+    model = native_cls(patch_size=(1, 1, 1), num_attention_heads=2,
+                      attention_head_dim=18, in_channels=4, out_channels=4,
+                      action_dim=3, text_dim=8, freq_dim=4, ffn_dim=16,
+                      num_layers=1, rope_max_seq_len=32, action_inner_dim=36,
+                      action_ffn_dim=16, attn_window=8, enable_mcp=True,
+                      num_mcp_modules=1, mcp_hidden_collect_layers=(0,))
+    adapter = ZeroWAMAdapter(model.to(device="cuda", dtype=torch.bfloat16), 8, lora_rank=2)
+    adapter.eval().set_stage("joint")
+    device, dtype = "cuda", torch.bfloat16
+    video = torch.randn(1, 4, 2, 1, 2, device=device, dtype=dtype)
+    action = torch.randn(1, 3, 2, 2, 1, device=device, dtype=dtype)
+
+    def stream(data, action=False, shift=0):
+        grid = get_mesh_id(*data.shape[-3:], int(action), f_shift=shift).to(device)[None]
+        return {"noisy_latents": data, "latent": data.clone(), "grid_id": grid,
+                "timesteps": torch.full((1, 2), 500., device=device),
+                "cond_timesteps": torch.zeros(1, 2, device=device)}
+
+    inputs = {"latent_dict": stream(video), "action_dict": stream(action, True),
+              "mcp_latent_dicts": [stream(torch.randn_like(video), shift=1)],
+              "chunk_size": 1, "max_frame_chunk_size": 4, "window_size": 8}
+    current = torch.randn(1, 1, 8, device=device, dtype=dtype, requires_grad=True)
+    remaining = torch.randn_like(current).requires_grad_()
+    conditions = TaskConditions(current, remaining, torch.zeros_like(current))
+    captured = {}
+
+    def capture_fusion(module, args, output):
+        captured["fusion"] = output.detach().clone()
+
+    def check_physical_context(module, args):
+        assert args[1] is adapter._physical_actions
+        assert not args[1].requires_grad
+        captured["actions"] = args[1].detach().clone()
+
+    fusion_handle = model.mcp_mlp_hidden.register_forward_hook(capture_fusion)
+    action_handle = model.mcp_blocks[0][0].register_forward_pre_hook(check_physical_context)
+    result = adapter.forward_train(inputs, conditions)
+    fusion_handle.remove()
+    original_actions = captured["actions"]
+    fusion = captured["fusion"]
+    assert result.phi.shape == (1, 4, 36) and len(result.mcp) == 1
+    loss = result.video.float().square().mean() + result.mcp[0].float().square().mean()
+    loss.backward()
+    assert all(torch.isfinite(x).all() for x in [result.video, result.action, result.phi, *result.mcp])
+    assert any(x.up.weight.grad is not None and x.up.weight.grad.abs().sum() > 0
+               for x in adapter._video_loras)
+    assert all(x.up.weight.grad is None for x in adapter._action_loras)
+    # Hold the ONLY task-bearing MCP input fixed. Task changes must then have no
+    # effect via direct text or the auxiliary action context.
+    fixed_handle = model.mcp_mlp_hidden.register_forward_hook(lambda module, args, output: fusion)
+    alternate_current = (current.detach() + 0.5).requires_grad_()
+    alternate = TaskConditions(alternate_current, conditions.remaining + 0.5, conditions.null)
+    blocked = adapter.forward_train(inputs, alternate)
+    fixed_handle.remove()
+    action_handle.remove()
+    torch.testing.assert_close(blocked.mcp[0], result.mcp[0].detach(), rtol=0, atol=0)
+    assert torch.equal(captured["actions"], original_actions)
+    shortcut = torch.autograd.grad(blocked.mcp[0].float().square().mean(),
+                                   alternate_current, allow_unused=True)[0]
+    assert shortcut is None or not shortcut.any()
+    adapter.zero_grad(set_to_none=True)
+    current.grad = None
+    remaining.grad = None
+    # Keep W LoRA trainable here: absence of W gradients must come from the
+    # stopped sampling/encoding path, not merely from freezing every parameter.
+    adapter.set_stage("joint")
+    history = [("video", video[:, :, :1].detach(), 0)]
+    future = adapter.sample_video(torch.randn_like(video[:, :, :1]), conditions,
+                                  history=history, steps=2)
+    assert not future.latents.requires_grad and future.latents.grad_fn is None
+    velocity = adapter.action_velocity(action[:, :, :1], 500., conditions, future, history=history)
+    velocity.float().square().mean().backward()
+    assert current.grad is not None and torch.isfinite(current.grad).all() and current.grad.abs().sum() > 0
+    assert remaining.grad is None or not remaining.grad.any()
+    assert not any(p.grad is not None for p in adapter.parameters())
+    assert adapter.native.type_ids_cache is None
+    return {"native": True, "device": device, "mcp_heads": len(result.mcp),
+            "phi_shape": list(result.phi.shape), "direct_condition_gradient": True,
+            "mcp_phi_only_task_path": True}

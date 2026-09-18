@@ -1,12 +1,13 @@
 """Masked per-example losses; only data-provided validity controls coverage."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 from typing import Literal, Mapping
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 
 @dataclass
@@ -199,3 +200,21 @@ def pair_supervised_mean(first: MaskedLoss | Tensor, second: MaskedLoss | Tensor
     if isinstance(first, Tensor) and isinstance(second, Tensor) and first.shape == second.shape and first.device == second.device:
         return (first + second) / 2
     raise ValueError("paired supervision must be two matching tensors or two MaskedLoss values")
+
+
+@contextmanager
+def paired_dropout_disabled(*modules: nn.Module):
+    """Temporarily disable module dropout without switching all layers to eval.
+
+    Functional/attention dropout must be configured as zero by the adapter;
+    those probabilities are not represented by nn.Dropout child modules.
+    """
+    dropouts = {child for module in modules for child in module.modules() if isinstance(child, nn.modules.dropout._DropoutNd)}
+    previous = {child: child.training for child in dropouts}
+    try:
+        for child in dropouts:
+            child.train(False)
+        yield
+    finally:
+        for child, training in previous.items():
+            child.train(training)

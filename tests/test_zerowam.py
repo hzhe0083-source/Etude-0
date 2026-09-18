@@ -1,16 +1,41 @@
 import unittest
+from unittest.mock import patch
+import builtins
+import sys
 import torch
 from torch import nn
 
 from evo_wam.zerowam import (NativeDependencyError, TaskConditions, VideoLoRA, ZeroWAMAdapter,
                              load_native_class,
+                             optional_flash_source, _LEGACY_FLASH_IMPORT, _OptionalFlashFinder,
                              route_allowed, tiny_native_smoke, unpack_velocity,
+                             action_mask_for,
                              verify_source)
 
 
 class ZeroWAMStructureTests(unittest.TestCase):
     def test_pinned_source(self):
         self.assertTrue((verify_source() / "wan_va/modules/icl_model.py").is_file())
+
+    def test_optional_flash_guard_never_implements_attention(self):
+        original_import = builtins.__import__
+
+        def missing_flash(name, *args, **kwargs):
+            if name in {"flash_attn", "flash_attn_interface"}:
+                raise ImportError("deliberately unavailable in guard test")
+            return original_import(name, *args, **kwargs)
+
+        namespace = {}
+        module_before = sys.modules.get("flash_attn")
+        with patch("builtins.__import__", side_effect=missing_flash):
+            exec(optional_flash_source(_LEGACY_FLASH_IMPORT), namespace)
+        self.assertTrue(namespace["_EVO_FLASH_UNAVAILABLE"])
+        with self.assertRaisesRegex(ImportError, "real flash-attn"):
+            namespace["flash_attn_func"](torch.ones(1))
+        self.assertIs(sys.modules.get("flash_attn"), module_before)
+        with self.assertRaises(RuntimeError):
+            optional_flash_source("unexpected source")
+        self.assertIsNone(_OptionalFlashFinder(verify_source()).find_spec("flash_attn"))
 
     def test_task_slots_and_unconditional(self):
         q, k = torch.arange(5)[:, None], torch.arange(3)[None, :]
@@ -46,6 +71,21 @@ class ZeroWAMStructureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             unpack_velocity(packed[:, :-1], shape, patch_size)
 
+    def test_action_mask_broadcast_and_validation(self):
+        sample = torch.randn(1, 3, 2, 4, 1)
+        for mask in [torch.tensor([True, False, True]), torch.tensor([1., 0., 1.])]:
+            active = action_mask_for(mask.reshape(1, 3, 1, 1, 1), sample)
+            self.assertEqual(active.shape, sample.shape)
+            self.assertTrue(active[:, 0].all())
+            self.assertFalse(active[:, 1].any())
+        self.assertTrue(action_mask_for(None, sample).all())
+        invalid = [torch.ones(1, 2, 1, 1, 1), torch.tensor([0.5]),
+                   torch.tensor([float("nan")]), torch.tensor([float("inf")]),
+                   torch.ones(1, requires_grad=True)]
+        for mask in invalid:
+            with self.subTest(mask=mask), self.assertRaises(ValueError):
+                action_mask_for(mask, sample)
+
 
 class ZeroWAMNativeTests(unittest.TestCase):
     def test_native_cpu_parameter_isolation(self):
@@ -53,6 +93,7 @@ class ZeroWAMNativeTests(unittest.TestCase):
             native = load_native_class()
         except NativeDependencyError as exc:
             self.skipTest(str(exc))
+        self.assertFalse(any(isinstance(finder, _OptionalFlashFinder) for finder in sys.meta_path))
         model = native(patch_size=(1, 1, 1), num_attention_heads=2,
                        attention_head_dim=18, in_channels=4, out_channels=4,
                        action_dim=3, text_dim=8, freq_dim=4, ffn_dim=16,
@@ -64,6 +105,7 @@ class ZeroWAMNativeTests(unittest.TestCase):
         self.assertIs(attention.to_v, attention.action_to_v)
         adapter.set_stage("interface")
         self.assertTrue(adapter.condition_projection.weight.requires_grad)
+        self.assertTrue(adapter.condition_types.requires_grad)
         self.assertTrue(attention.action_to_q.up.weight.requires_grad)
         self.assertFalse(attention.to_k.weight.requires_grad)
         adapter.set_stage("reader")
@@ -72,6 +114,7 @@ class ZeroWAMNativeTests(unittest.TestCase):
         self.assertTrue(attention.to_q.up.weight.requires_grad)
         self.assertFalse(attention.action_to_q.up.weight.requires_grad)
         self.assertFalse(adapter.condition_projection.weight.requires_grad)
+        self.assertFalse(adapter.condition_types.requires_grad)
         self.assertFalse(attention.to_k.weight.requires_grad)
         self.assertTrue(any(p.requires_grad for p in model.mcp_blocks.parameters()))
 
@@ -83,6 +126,8 @@ class ZeroWAMNativeTests(unittest.TestCase):
         self.assertTrue(result["native"])
         self.assertTrue(result["direct_condition_gradient"])
         self.assertTrue(result["mcp_phi_only_task_path"])
+        self.assertTrue(result["current_remaining_types"])
+        self.assertTrue(result["inactive_action_channels_zero_each_step"])
 
 
 if __name__ == "__main__":

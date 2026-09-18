@@ -69,6 +69,10 @@ Present entities must have positive observation patch mass, and padded entity
 slots must have zero mass. Patch weights describe pure robot observations,
 never task roles or target attention. Their patch axis must match the adapter's
 video token layout; that checkpoint-specific check occurs in the adapter.
+In a native packed teacher-forcing window, pool weights must be zero after the
+first prediction chunk. The interaction head forecasts relative to the current
+state and must not read later future tokens to recover its labels. The trainer
+checks this causal pooling boundary using the actual patch and chunk sizes.
 
 The loader intersects physical validity with `step_offsets <= executed_steps`.
 It does not relabel continuation results as effects of unexecuted planned

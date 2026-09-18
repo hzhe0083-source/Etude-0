@@ -34,8 +34,9 @@ may have different time grids. The same role vocabulary, feature dimensions and
 trained codec apply to both.
 
 The `geometry` control keeps exactly the same token width, count and parameter
-shapes as the full interface. Its encoder zeros every relationship/event value,
-mask and validity input, and its decoder loss omits those fields. The main WAM
+shapes as the full interface. Its encoder zeros every relationship/event value
+and requirement mask, and its decoder loss omits those fields. Label validity
+is never a goal-token input. The main WAM
 may still receive the same independent interaction auxiliary supervision in both
 experiments; the geometry representation is not claimed to be information-pure.
 
@@ -133,3 +134,10 @@ Run the interface checks with:
 ```bash
 python -m unittest discover -s tests -p test_models.py -v
 ```
+# Requirement annotation coverage
+
+`label_valid` is loss/annotation metadata, not a semantic token input. G encodes
+required values and requirement masks only. Executable teacher goals must have
+known values for their required fields; encoding an unknown required value fails
+explicitly rather than inventing a zero target. Unrequired fields may be missing,
+and physical outcomes retain sparse labels for F and interaction supervision.

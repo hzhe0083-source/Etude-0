@@ -228,6 +228,15 @@ class EvoTrainer(nn.Module):
                     or (pool < 0).any() or ((pool.sum(-1) <= 0) & present).any()
                     or (pool[~present] != 0).any()):
                 raise ValueError("entity patch weights must be fixed, nonnegative [1,N,S] with visible entity support")
+            # Native teacher forcing packs multiple future chunks. Interaction
+            # queries are relative to the window start, so they may pool only
+            # its first prediction chunk, never a later teacher-forced future.
+            video = inputs["latent_dict"]["noisy_latents"]
+            pt, ph, pw = self.adapter.native.patch_size
+            chunk = min(inputs.get("chunk_size", video.shape[2]), video.shape[2])
+            prefix_tokens = (chunk // pt) * (video.shape[3] // ph) * (video.shape[4] // pw)
+            if prefix_tokens < 1 or (pool[..., prefix_tokens:] != 0).any():
+                raise ValueError("interaction pooling must use only the current prediction chunk, not later future tokens")
             pool = torch.where(present[..., None], pool, 0)
             pool = pool / pool.sum(-1, keepdim=True).clamp_min(torch.finfo(pool.dtype).tiny)
             phi = torch.bmm(pool.to(output.phi), output.phi)

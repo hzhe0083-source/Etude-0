@@ -1,6 +1,6 @@
 # Native Zero-WAM integration
 
-`evo_wam.zerowam` calls the unmodified upstream transformer at commit
+`evo_wam.zerowam` calls the upstream transformer at commit
 `08e2c4ae41e2b63573a299825cebe6753481407c`. Loading verifies both HEAD and
 tracked-file cleanliness. It does not download model weights. Use
 `ZeroWAMAdapter.from_checkpoint(local_path, condition_dim=...)` with a local
@@ -18,6 +18,11 @@ native text-conditioning path and intersects the native cross-attention masks:
 - Main video queries: null, current and remaining.
 - Action queries: null and current.
 - MCP queries: null only; task information reaches MCP through backbone Phi.
+
+Two learned type embeddings mark current versus remaining after projection;
+otherwise the main cross-attention would see an unordered combined token set.
+Type embeddings train with the interface projection in stage one and remain
+frozen in reader/joint stages. Within-group event order remains in codec tokens.
 
 The original self-attention/flow/MCP masks and inputs are retained. Raw ICL tokens
 are rejected, so they cannot bypass this task interface. Both task groups become
@@ -62,6 +67,8 @@ frame_id)`; use interleaved video/action frame IDs, for example 0/1 followed by
 future video/action 2/3. History chunks are real past observations/actions, never
 the recorded future. Native video tensors are `[1,C,F,H,W]`; actions are
 `[1,A,F,N,1]`. Explicit video grids can be supplied for non-default layouts.
+Stream tensors and explicit grids are moved to the native model's device, and
+stream values use its parameter dtype; sampling returns native-device tensors.
 
 The returned `GeneratedFuture` holds detached generated latents, their grid/frame
 and the fixed task conditions used to generate/encode them. Pass this same object
@@ -94,7 +101,17 @@ tokens: MCP outputs must remain identical, auxiliary action inputs must remain
 identical, and the bypass gradient to task tokens must be zero.
 
 Upstream pins torch 2.9.0, diffusers 0.36.0 and transformers 4.55.2; matching CUDA
-torchvision, einops, easydict, imageio, websockets/msgpack and a real flash-attn
-installation are also needed by upstream imports. Despite using FlexAttention,
-upstream `model.py` imports flash-attn unconditionally. Robot data, released
+torchvision, einops, easydict, imageio and websockets/msgpack are also needed by
+upstream imports. Robot data, released
 checkpoints and simulator execution remain separate from tiny random-model QA.
+
+The pinned legacy `model.py` imports flash-attn even though `icl_model.py` uses
+real PyTorch FlexAttention exclusively. A scoped source loader changes exactly
+that import block to an optional ImportError guard, only for the verified absolute
+`wan_va/modules/model.py` path. The finder is removed in `finally`; no upstream
+source or bytecode is changed. If real flash-attn is unavailable, calling the
+legacy `flash_attn_func` raises explicitly: it never executes approximate or
+replacement attention. No fake `flash_attn` module is inserted into `sys.modules`.
+All model forward and ICL attention code remains upstream code. The guard test
+forces missing FlashAttention and checks this failure behavior and module hygiene;
+the CUDA smoke separately runs the real native FlexAttention kernels.

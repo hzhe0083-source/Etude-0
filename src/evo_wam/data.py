@@ -396,6 +396,9 @@ def load_experiment(path: str | Path, *, for_test: bool = False) -> dict:
     """Load an experiment without silently relaxing its frozen comparison rules."""
     with Path(path).open(encoding="utf-8") as stream:
         config = json.load(stream)
+    from .zerowam import ZERO_WAM_COMMIT
+    if config.get("upstream_commit") != ZERO_WAM_COMMIT:
+        raise ValueError("experiment must use the pinned Zero-WAM source revision")
     if config.get("schema_version") != 1 or config.get("interface") not in {"geometry", "full"}:
         raise ValueError("unsupported experiment schema or interface")
     condition = config["conditioning"]
@@ -414,3 +417,58 @@ def load_experiment(path: str | Path, *, for_test: bool = False) -> dict:
     if for_test and not config.get("validation_locked", False):
         raise ValueError("lock the common configuration on validation data before test evaluation")
     return config
+
+
+@dataclass(frozen=True)
+class Observation:
+    """Deployment inputs: no future outcomes, true requirements or actions."""
+    entity_ids: Tensor
+    robot_history: Tensor
+    proprio_history: Tensor
+    embodiment: Tensor
+    robot_latent: Tensor
+    demonstrations: tuple[Tensor, ...]
+    chunk_size: int
+    actions_per_frame: int
+    action_space: dict
+
+
+def load_observation(manifest_path: str | Path) -> Observation:
+    path = Path(manifest_path)
+    meta = json.loads(path.read_text())
+    if meta.get("format_version") != 1 or meta.get("kind") != "observation":
+        raise ValueError("inference requires a version-1 observation manifest, not a labeled training sample")
+    for key in ("chunk_size", "actions_per_frame"):
+        if type(meta.get(key)) is not int or meta[key] < 1:
+            raise ValueError(f"observation requires positive {key}")
+    views = meta.get("view_ids", [])
+    if not isinstance(views, list) or not views or any(not isinstance(v, str) or not v for v in views):
+        raise ValueError("observation must identify its demonstration views")
+    name = meta.get("arrays")
+    if not isinstance(name, str):
+        raise ValueError("observation arrays must name a relative NPZ")
+    arrays_path = (path.parent / name).resolve()
+    if Path(name).is_absolute() or not arrays_path.is_relative_to(path.parent.resolve()) or arrays_path.suffix != ".npz":
+        raise ValueError("observation arrays must remain inside the manifest directory")
+    required = {"entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent"}
+    required |= {f"demo_view_{i}" for i in range(len(views))}
+    with np.load(arrays_path, allow_pickle=False) as arrays:
+        if set(arrays.files) != required:
+            raise ValueError("observation NPZ must contain only current/history and demonstration fields")
+        values = {key: torch.from_numpy(arrays[key].copy()) for key in required}
+    ids = values["entity_ids"]
+    if ids.dtype != torch.int64 or ids.ndim != 1 or not (ids >= 0).any() or (ids < -1).any() or ids[ids >= 0].unique().numel() != (ids >= 0).sum():
+        raise ValueError("observation entity IDs must be unique nonnegative integers or -1 padding")
+    for key, value in values.items():
+        if key != "entity_ids" and (not value.is_floating_point() or not torch.isfinite(value).all() or not value.numel()):
+            raise ValueError("observation features must be nonempty finite floating tensors")
+    history, proprio = values["robot_history"], values["proprio_history"]
+    if history.ndim != 3 or history.shape[1] != len(ids) or proprio.ndim != 2 or proprio.shape[0] != history.shape[0]:
+        raise ValueError("observation entity/history/state axes differ")
+    if values["embodiment"].ndim != 1 or values["robot_latent"].ndim != 4:
+        raise ValueError("embodiment must be [E], observed video latent [C,F,H,W]")
+    if any(values[f"demo_view_{i}"].ndim != 2 for i in range(len(views))):
+        raise ValueError("demonstrations must be ordered [tokens,features]")
+    return Observation(ids[None], history[None], proprio[None], values["embodiment"][None],
+                       values["robot_latent"][None], tuple(values[f"demo_view_{i}"][None] for i in range(len(views))),
+                       meta["chunk_size"], meta["actions_per_frame"], meta.get("action_space", {}))

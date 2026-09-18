@@ -75,11 +75,35 @@ class ModelTests(unittest.TestCase):
         loss_after = decoded_requirement_loss(decoded, req)
         self.assertGreater(loss_after.item(), loss_before.item())
 
+    def test_annotation_coverage_is_not_a_goal_token_feature(self):
+        first, entities = requirement(), torch.randn(2, 3, 5)
+        first.requirement_mask["geometry"][..., 0] = False
+        second = copy.deepcopy(first)
+        second.label_valid["geometry"][..., 0] = False
+        second.geometry[..., 0] = float("nan")
+        codec = RequirementCodec(5, 3, 2, 1, 2, 12)
+        torch.testing.assert_close(codec.encode(first, entities), codec.encode(second, entities), rtol=0, atol=0)
+
+    def test_geometry_materialization_never_enables_unsupervised_control_requirements(self):
+        req, entities = requirement(), torch.randn(2, 3, 5)
+        codec = RequirementCodec(5, 3, 2, 1, 2, 12, interface="geometry")
+        decoded = codec(req, entities)
+        for logits in decoded.requirement_mask_logits.values():
+            logits.data.fill_(100)
+        geometry = decoded.materialize(interface="geometry")
+        self.assertTrue(geometry.requirement_mask["geometry"].all())
+        self.assertFalse(geometry.requirement_mask["relations"].any())
+        self.assertFalse(geometry.requirement_mask["events"].any())
+        self.assertTrue(decoded.materialize().requirement_mask["relations"].any())
+
     def test_unknown_label_is_not_nan_input(self):
         req, entities = requirement(), torch.randn(2, 3, 5)
         req.geometry[0, 0, 0, 0] = float("nan")
         req.label_valid["geometry"][0, 0, 0, 0] = False
         codec = RequirementCodec(5, 3, 2, 1, 2, 12)
+        with self.assertRaises(ValueError):
+            codec.encode(req, entities)
+        req.requirement_mask["geometry"][0, 0, 0, 0] = False
         loss = decoded_requirement_loss(codec(req, entities), req)
         self.assertTrue(torch.isfinite(loss))
         loss.backward()

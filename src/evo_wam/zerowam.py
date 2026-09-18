@@ -9,6 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import importlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import json
 import subprocess
 import sys
@@ -24,6 +27,55 @@ DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "third_party" / "Zero-WAM
 
 class NativeDependencyError(ImportError):
     """The real upstream runtime cannot be imported; never substitute attention."""
+
+
+_LEGACY_FLASH_IMPORT = """try:
+    from flash_attn_interface import flash_attn_func
+except:
+    from flash_attn import flash_attn_func
+"""
+_OPTIONAL_FLASH_IMPORT = """_EVO_OPTIONAL_FLASH_IMPORT = True
+_EVO_FLASH_UNAVAILABLE = False
+try:
+    from flash_attn_interface import flash_attn_func
+except ImportError:
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError as _flash_error:
+        _EVO_FLASH_UNAVAILABLE = True
+        _EVO_FLASH_IMPORT_ERROR = _flash_error
+        def flash_attn_func(*args, **kwargs):
+            raise ImportError(
+                "Legacy FlashAttention execution requires a real flash-attn installation; "
+                "the Evo-WAM ICL path uses upstream PyTorch FlexAttention."
+            ) from _EVO_FLASH_IMPORT_ERROR
+"""
+
+
+def optional_flash_source(source: str) -> str:
+    """Change precisely the legacy import guard, never an attention implementation."""
+    if source.count(_LEGACY_FLASH_IMPORT) != 1:
+        raise RuntimeError("Pinned Zero-WAM legacy FlashAttention import block changed")
+    return source.replace(_LEGACY_FLASH_IMPORT, _OPTIONAL_FLASH_IMPORT, 1)
+
+
+class _OptionalFlashLoader(importlib.machinery.SourceFileLoader):
+    def get_code(self, fullname):
+        # Bypass bytecode caches: compatibility must never alter upstream source
+        # or create a .pyc that ordinary upstream imports would silently reuse.
+        source = self.get_data(self.path).decode("utf-8")
+        return compile(optional_flash_source(source), self.path, "exec", dont_inherit=True)
+
+
+class _OptionalFlashFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, source: Path):
+        self.path = (source / "wan_va/modules/model.py").resolve()
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "wan_va.modules.model":
+            return None
+        loader = _OptionalFlashLoader(fullname, str(self.path))
+        return importlib.util.spec_from_file_location(fullname, self.path, loader=loader)
 
 
 def verify_source(source: str | Path = DEFAULT_SOURCE) -> Path:
@@ -44,13 +96,17 @@ def load_native_class(source: str | Path = DEFAULT_SOURCE):
         raise RuntimeError("Another wan_va installation is already imported")
     if str(source) not in sys.path:
         sys.path.insert(0, str(source))
+    finder = _OptionalFlashFinder(source)
+    sys.meta_path.insert(0, finder)
     try:
         return importlib.import_module("wan_va.modules.icl_model").WanICLTransformer3DModel
     except ImportError as exc:
         raise NativeDependencyError(
-            "Native Zero-WAM needs its pinned torch/diffusers/transformers stack, "
-            f"einops, easydict and a real flash-attn installation: {exc}"
+            "Native Zero-WAM needs its pinned torch/diffusers/transformers stack "
+            f"and upstream utility dependencies: {exc}"
         ) from exc
+    finally:
+        sys.meta_path.remove(finder)
 
 
 @dataclass(frozen=True)
@@ -134,6 +190,21 @@ def unpack_velocity(value: Tensor, shape: Sequence[int], patch_size=(1, 1, 1)) -
     return patches.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(tuple(shape))
 
 
+def action_mask_for(mask: Tensor | None, sample: Tensor) -> Tensor:
+    """Validate data-owned 0/1 masks and broadcast to native [1,A,F,N,1]."""
+    if mask is None:
+        return torch.ones_like(sample, dtype=torch.bool)
+    mask = torch.as_tensor(mask)
+    if mask.requires_grad:
+        raise ValueError("action_mask must not require gradients")
+    if mask.is_complex() or not ((mask == 0) | (mask == 1)).all():
+        raise ValueError("action_mask must contain only boolean or 0/1 values")
+    try:
+        return torch.broadcast_to(mask.to(device=sample.device, dtype=torch.bool), sample.shape)
+    except RuntimeError as exc:
+        raise ValueError("action_mask must broadcast to native [1,A,F,N,1] shape") from exc
+
+
 class ZeroWAMAdapter(nn.Module):
     def __init__(self, native: nn.Module, condition_dim: int, *, current_tokens=1,
                  remaining_tokens=1, lora_rank=4, lora_alpha=None, lora_dropout=0.0):
@@ -149,6 +220,10 @@ class ZeroWAMAdapter(nn.Module):
         self.condition_dim = condition_dim
         self.condition_projection = nn.Linear(condition_dim, native.config.text_dim)
         self.condition_projection.to(next(native.parameters()))
+        self.condition_types = nn.Parameter(torch.empty(2, native.config.text_dim,
+                                                        device=next(native.parameters()).device,
+                                                        dtype=next(native.parameters()).dtype))
+        nn.init.normal_(self.condition_types, std=native.config.text_dim ** -0.5)
         self._video_loras, self._action_loras = [], []
         for block in native.blocks:
             for name, modules in (("to_q", self._video_loras),
@@ -202,6 +277,7 @@ class ZeroWAMAdapter(nn.Module):
             raise ValueError("stage must be interface, reader or joint")
         self.requires_grad_(False)
         self.condition_projection.requires_grad_(stage == "interface")
+        self.condition_types.requires_grad_(stage == "interface")
         for lora in self._video_loras:
             lora.enable(stage in {"interface", "joint"})
         for lora in self._action_loras:
@@ -240,12 +316,27 @@ class ZeroWAMAdapter(nn.Module):
             nl = 0 if latent is None else latent.shape[1]
             na = 0 if action is None else action.shape[1]
             original = module.cross_block_mask.mask_mod
+            # FlexAttention's dynamic lowering cannot capture arbitrary SymInt
+            # arithmetic in mask_mod. Like upstream's sequence masks, capture
+            # tensor metadata rather than token-count scalars.
+            query_roles = torch.cat([
+                torch.full((nl,), 2, device=encoder.device, dtype=torch.int),
+                torch.full((na,), 1, device=encoder.device, dtype=torch.int),
+                torch.zeros(pad.shape[1], device=encoder.device, dtype=torch.int),
+            ])
+            task = conditional and not mcp
+            key_roles = torch.cat([
+                torch.zeros(null_length, device=encoder.device, dtype=torch.int),
+                torch.full((self.current_tokens,), 1 if task else 3,
+                           device=encoder.device, dtype=torch.int),
+                torch.full((self.remaining_tokens,), 2 if task else 3,
+                           device=encoder.device, dtype=torch.int),
+            ])
 
             def mask(b, h, q, k):
-                return original(b, h, q, k) & route_allowed(
-                    q, k, latent_length=nl, action_length=na,
-                    null_length=null_length, current_length=self.current_tokens,
-                    conditional=conditional, mcp=mcp)
+                qr, kr = query_roles[q], key_roles[k]
+                return original(b, h, q, k) & (qr > 0) & (
+                    (kr == 0) | (kr == 1) | ((kr == 2) & (qr == 2)))
 
             module.cross_block_mask = create_block_mask(
                 mask, 1, 1, nl + na + pad.shape[1], encoder.shape[1],
@@ -264,14 +355,14 @@ class ZeroWAMAdapter(nn.Module):
         reference = self.condition_projection.weight
         null = null.to(reference)
         task = []
-        for tokens, length in ((conditions.current, self.current_tokens),
-                               (conditions.remaining, self.remaining_tokens)):
+        for kind, (tokens, length) in enumerate(((conditions.current, self.current_tokens),
+                                                (conditions.remaining, self.remaining_tokens))):
             if tokens is None:
                 task.append(null.new_zeros(1, length, self.native.config.text_dim))
             else:
                 if tuple(tokens.shape) != (1, length, self.condition_dim):
                     raise ValueError("Task tokens do not match their fixed slot shape")
-                task.append(self.condition_projection(tokens.to(reference)))
+                task.append(self.condition_projection(tokens.to(reference)) + self.condition_types[kind])
         text = torch.cat([null, *task], dim=1)
         if not torch.isfinite(text).all():
             raise ValueError("Condition embeddings must be finite")
@@ -315,6 +406,8 @@ class ZeroWAMAdapter(nn.Module):
             raise ValueError("Native streams require [1,C,F,H,W]")
         if mode not in {"video", "action"}:
             raise ValueError("History stream mode must be video or action")
+        data = data.to(self.native.patch_embedding_mlp.weight if mode == "video"
+                       else self.native.action_embedder.weight)
         patch = self.native.patch_size if mode == "video" else (1, 1, 1)
         if any(n % p for n, p in zip(data.shape[-3:], patch)):
             raise ValueError("Stream shape is not patch aligned")
@@ -323,10 +416,14 @@ class ZeroWAMAdapter(nn.Module):
             grid_id = get_mesh_id(f, h, w, int(mode == "action"), f_shift=frame_id // 2).to(data.device)
         if grid_id.ndim == 3:
             grid_id = grid_id[0]
+        grid_id = grid_id.to(data.device)
         count = grid_id.shape[1]
-        t = torch.as_tensor(timestep, device=data.device, dtype=torch.float32)
+        t = torch.as_tensor(timestep, device=data.device, dtype=torch.float32).reshape(-1)
+        frames = data.shape[2] // patch[0]
+        if t.numel() not in (1, frames):
+            raise ValueError("Stream needs one timestep or one timestep per frame")
         if t.numel() == 1:
-            t = t.expand(data.shape[2] // patch[0])
+            t = t.expand(frames)
         stream = {"noisy_latents": data, "timesteps": t,
                   "cache_type_ids": torch.full((count,), cache_type, device=data.device, dtype=torch.int)}
         key = "latent" if mode == "video" else "action"
@@ -361,7 +458,7 @@ class ZeroWAMAdapter(nn.Module):
         scheduler = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
         scheduler.set_timesteps(steps)
         self.prefill_history(history, conditions)
-        sample = initial_noise.detach().clone()
+        sample = initial_noise.detach().to(self.native.patch_embedding_mlp.weight).clone()
         try:
             for timestep in scheduler.timesteps:
                 payload = self._stream(sample, "video", timestep, frame_id, grid_id)
@@ -397,18 +494,23 @@ class ZeroWAMAdapter(nn.Module):
 
     @torch.no_grad()
     def sample_actions(self, initial_noise: Tensor, conditions: TaskConditions,
-                       future: GeneratedFuture, *, history=(), steps=4, shift=1.0) -> Tensor:
+                       future: GeneratedFuture, *, history=(), steps=4, shift=1.0,
+                       action_mask: Tensor | None = None) -> Tensor:
+        """Keep unused action channels zero at initialization and every flow step."""
         from wan_va.utils import FlowMatchScheduler
         if steps < 1:
             raise ValueError("Sampling steps must be positive")
         scheduler = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
         scheduler.set_timesteps(steps)
-        sample = initial_noise.detach().clone()
+        sample = initial_noise.detach().to(self.native.action_embedder.weight).clone()
+        active = action_mask_for(action_mask, sample)
+        sample = torch.where(active, sample, 0)
         # ponytail: replay history each step for strict cache isolation; cache snapshots
         # can replace replay only after memory/latency measurements justify them.
         for timestep in scheduler.timesteps:
             velocity = self.action_velocity(sample, timestep, conditions, future, history=history)
             sample = scheduler.step(velocity, timestep, sample)
+            sample = torch.where(active, sample, 0)
         return sample
 
 
@@ -458,6 +560,8 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     fusion_handle.remove()
     original_actions = captured["actions"]
     fusion = captured["fusion"]
+    swapped = adapter.forward_train(inputs, TaskConditions(remaining, current, conditions.null))
+    assert not torch.equal(swapped.video, result.video), "W ignored current/remaining type markers"
     assert result.phi.shape == (1, 4, 36) and len(result.mcp) == 1
     loss = result.video.float().square().mean() + result.mcp[0].float().square().mean()
     loss.backward()
@@ -485,15 +589,35 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     # stopped sampling/encoding path, not merely from freezing every parameter.
     adapter.set_stage("joint")
     history = [("video", video[:, :, :1].detach(), 0)]
-    future = adapter.sample_video(torch.randn_like(video[:, :, :1]), conditions,
+    future = adapter.sample_video(torch.randn_like(video[:, :, :1]).float().cpu(), conditions,
                                   history=history, steps=2)
     assert not future.latents.requires_grad and future.latents.grad_fn is None
-    velocity = adapter.action_velocity(action[:, :, :1], 500., conditions, future, history=history)
+    velocity = adapter.action_velocity(action[:, :, :1].float().cpu(), torch.tensor([[500.]]), conditions,
+                                       future, history=history)
     velocity.float().square().mean().backward()
     assert current.grad is not None and torch.isfinite(current.grad).all() and current.grad.abs().sum() > 0
     assert remaining.grad is None or not remaining.grad.any()
     assert not any(p.grad is not None for p in adapter.parameters())
+    seen_actions = []
+
+    def capture_sample_input(module, args):
+        seen_actions.append(args[0].detach().clone())
+
+    sample_hook = model.action_embedder.register_forward_pre_hook(capture_sample_input)
+    action_noise = torch.randn_like(action[:, :, :1]).float().cpu()
+    action_noise[:, 1] = 100
+    try:
+        sampled_action = adapter.sample_actions(action_noise, conditions, future,
+            history=history, steps=2, action_mask=torch.tensor([1, 0, 1]).reshape(1, 3, 1, 1, 1))
+    finally:
+        sample_hook.remove()
+    assert len(seen_actions) == 2 and all(not value[..., 1].any() for value in seen_actions)
+    assert not sampled_action[:, 1].any()
+    assert sampled_action.shape == action[:, :, :1].shape
+    assert sampled_action.device.type == "cuda" and torch.isfinite(sampled_action).all()
+    assert not sampled_action.requires_grad
     assert adapter.native.type_ids_cache is None
     return {"native": True, "device": device, "mcp_heads": len(result.mcp),
             "phi_shape": list(result.phi.shape), "direct_condition_gradient": True,
-            "mcp_phi_only_task_path": True}
+            "mcp_phi_only_task_path": True, "current_remaining_types": True,
+            "inactive_action_channels_zero_each_step": True}

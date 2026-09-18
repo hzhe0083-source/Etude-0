@@ -62,7 +62,7 @@ class DecodedRequirement:
                 "relations": self.relation_logits.sigmoid(),
                 "events": self.event_logits.sigmoid()}
 
-    def materialize(self, threshold: float = 0.5) -> EffectRequirement:
+    def materialize(self, threshold: float = 0.5, *, interface: str = "full") -> EffectRequirement:
         """Decode a runtime requirement; model masks never gate training loss.
 
         All predictions are available for comparison, not asserted true labels.
@@ -71,6 +71,8 @@ class DecodedRequirement:
         """
         if not 0 < threshold < 1:
             raise ValueError("mask threshold must be in (0,1)")
+        if interface not in {"geometry", "full"}:
+            raise ValueError("interface must be geometry or full")
         values = {"geometry": self.geometry, "relations": self.relation_logits.sigmoid(),
                   "events": self.event_logits.sigmoid()}
         # Requirements are Boolean desired relations, whereas physical outputs
@@ -80,6 +82,9 @@ class DecodedRequirement:
         binding = self.binding_logits.argmax(-1)
         masks = {name: logits.sigmoid() >= threshold
                  for name, logits in self.requirement_mask_logits.items()}
+        if interface == "geometry":
+            for name in ("relations", "events"):
+                masks[name] = torch.zeros_like(masks[name])
         valid = {name: torch.ones_like(value, dtype=torch.bool) for name, value in values.items()}
         valid["binding"] = torch.ones_like(binding, dtype=torch.bool)
         return EffectRequirement(self.entity_ids, self.step_offsets, binding,
@@ -91,7 +96,7 @@ class RequirementCodec(nn.Module):
 
     Token layout is time-major [B,T*R,D]. ``current`` and ``remaining`` use
     this same codec. A geometry control has identical token/parameter capacity,
-    but zeros all relationship/event values, masks and validity inputs.
+    but zeros all relationship/event values and requirement masks.
     """
 
     def __init__(self, entity_dim: int, geometry_dim: int, relation_dim: int,
@@ -105,7 +110,7 @@ class RequirementCodec(nn.Module):
         self.entity_dim, self.roles, self.token_dim = entity_dim, roles, token_dim
         self.geometry_dim, self.relation_dim, self.event_dim = geometry_dim, relation_dim, event_dim
         self.interface = interface
-        width = entity_dim + 3 * (geometry_dim + roles * (relation_dim + event_dim))
+        width = entity_dim + 2 * (geometry_dim + roles * (relation_dim + event_dim))
         self.encoder = nn.Sequential(nn.Linear(width, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
         self.role = nn.Parameter(torch.randn(roles, token_dim) / math.sqrt(token_dim))
         self.time = nn.Linear(1, token_dim)
@@ -130,6 +135,8 @@ class RequirementCodec(nn.Module):
     def encode(self, requirement: EffectRequirement, entity_features: Tensor) -> Tensor:
         requirement.validate()
         self._entities(entity_features, requirement.entity_ids)
+        if ((requirement.binding >= 0) & ~requirement.label_valid["binding"]).any():
+            raise ValueError("executable goal bindings must be verified; use unbound unused roles rather than guessed slots")
         batch, steps, roles, geometry_dim = requirement.geometry.shape
         if (roles, geometry_dim, requirement.relations.shape[-1], requirement.events.shape[-1]) != (
                 self.roles, self.geometry_dim, self.relation_dim, self.event_dim):
@@ -140,8 +147,13 @@ class RequirementCodec(nn.Module):
         for name in ("geometry", "relations", "events"):
             value = getattr(requirement, name)
             mask, valid = requirement.requirement_mask[name], requirement.label_valid[name]
+            if self.interface == "full" or name == "geometry":
+                if (mask & ~valid).any():
+                    raise ValueError("encoding an executable goal requires known required values; unknown outcome labels remain allowed")
             clean = torch.where(mask & valid, value, 0)
-            field = torch.cat((clean, mask.to(value.dtype), valid.to(value.dtype)), -1)
+            # Annotation coverage is not task semantics. Never ask the reader
+            # to reproduce a dataset annotator's label-validity choices.
+            field = torch.cat((clean, mask.to(value.dtype)), -1)
             if self.interface == "geometry" and name != "geometry":
                 field = torch.zeros_like(field)
             pieces.append(field.reshape(batch, steps, roles, -1))

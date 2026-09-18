@@ -125,6 +125,27 @@ class TrainingTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
 
+    def test_interaction_head_cannot_pool_later_teacher_forced_chunks(self):
+        model = trainer(weights=LossWeights(next_video=0, ifp=0))
+        model.enable_ifp = False
+        model.adapter.dropout.p = 0
+        batch = make_batch()
+        stream = batch.native_inputs["latent_dict"]
+        for key in ("noisy_latents", "targets"):
+            stream[key] = stream[key].repeat(1, 1, 2, 1, 1)
+        batch.native_inputs["chunk_size"] = 1
+        batch.entity_patch_weights = torch.ones(1, 2, 4) / 4
+        from evo_wam.zerowam import TaskConditions
+        conditions = TaskConditions(torch.ones(1, 2, 4), torch.ones(1, 2, 4), batch.null_text)
+        with self.assertRaises(ValueError):
+            model._native(batch, conditions, include_action=False, include_interaction=True)
+        batch.entity_patch_weights[..., 2:] = 0
+        _, first = model._native(batch, conditions, include_action=False, include_interaction=True)
+        stream["noisy_latents"][:, :, 1:] += 100
+        _, second = model._native(batch, conditions, include_action=False, include_interaction=True)
+        torch.testing.assert_close(first["relation_logits"], second["relation_logits"])
+        torch.testing.assert_close(first["event_logits"], second["event_logits"])
+
     def test_interface_updates_codec_physics_and_native_but_not_reader(self):
         model, batch = trainer("interface"), make_batch()
         report = model.train_step(batch)

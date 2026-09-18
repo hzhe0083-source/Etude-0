@@ -22,4 +22,6 @@ logs/
 *.hdf5
 *.h5
 *.parquet
+*.npy
+*.npz
 wandb/

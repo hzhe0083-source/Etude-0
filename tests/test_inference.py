@@ -81,6 +81,19 @@ class InferenceTests(unittest.TestCase):
         self.reader.assert_not_called()
         self.assert_not_sampled()
 
+    def test_raw_features_and_encoded_demonstrations_cannot_be_silently_mixed(self):
+        encoding = {"kind": "video_effect_tokens", "encoder_sha256": "1" * 64,
+                    "feature_space_id": "frozen-test-v1", "token_dim": 4,
+                    "window_frames": 3, "num_tokens": 2}
+        encoded = replace(self.observation, demonstration_encoding=encoding)
+        with self.assertRaisesRegex(RequirementRejected, "encoding_differs"):
+            self.policy.candidates(encoded, None, random.Random(0))
+        self.trainer.demonstration_encoding = encoding
+        with self.assertRaisesRegex(RequirementRejected, "encoding_differs"):
+            self.policy.candidates(self.observation, None, random.Random(0))
+        self.reader.assert_not_called()
+        self.assert_not_sampled()
+
     def test_oracle_uses_real_codec_and_the_shared_native_sampling_path(self):
         with torch.no_grad():
             expected = tuple(self.codec.encode(getattr(self.requirement, name), self.observation.robot_history[:, -1])

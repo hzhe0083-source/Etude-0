@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "kind": "video_effect_experiment",
+  "synthetic_dimensions_only": true,
+  "model": {
+    "feature_dim": 4,
+    "latent_dim": 4,
+    "num_tokens": 2,
+    "hidden_dim": 16,
+    "noise_std": 0.0,
+    "geometry_dim": 3,
+    "relation_dim": 3,
+    "event_dim": 2
+  },
+  "window_frames": 3,
+  "context_frames": 1,
+  "loss_weights": {
+    "features": 1.0,
+    "geometry": 0.0,
+    "relations": 0.0,
+    "events": 0.0,
+    "capacity": 0.0
+  },
+  "domain_schedule": [
+    "robot"
+  ],
+  "training": {
+    "max_steps": 250,
+    "learning_rate": 0.001,
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "evaluation": {
+    "heldout_source_groups": true,
+    "synchronized_views_optional": true,
+    "candidate_count": 1,
+    "wam_updated_by_video_loss": false
+  }
+}

@@ -35,7 +35,9 @@ evo-wam predict --artifact /server/runs/joint/adapter.pt --checkpoint /server/ze
 
 使用冻结的真实 `AutoencoderKLWan` 后验均值和 `(latent-mean)/std`。
 人类 tokens 按时间、高度、宽度展开；机器人相机按声明顺序横向拼接，实体特征是纯观测区域的加权池化。
-配置中的 `demo_dim/entity_dim` 应与实际 VAE latent 通道数一致，不能继续使用数值 fixture 的维度。
+`raw_features` 模式的 `demo_dim/entity_dim` 应与实际 VAE latent 通道数一致；
+使用 B 时 `demo_dim` 改为 artifact 的 `token_dim`，机器人 `entity_dim` 仍为 VAE 通道数。
+不能继续使用数值 fixture 的维度。
 缓存身份包括权重、源视频、原始数组、采样配置、相机顺序与跟踪来源。
 
 实体检测、跨帧跟踪和几何标定仍由显式输入提供，不能从这个入口宣称已实现无标注的任意对象感知。
@@ -45,3 +47,62 @@ ROI 完全不可见或时间不齐会报错；未来可接已验证的状态估�
 这里没有把从原始视频估计接触和必要事件的问题伪装成自动标注。
 
 本地检查只使用随机微型 VAE 验证真实编码接口，不代表服务器完整 VAE、模型权重或视觉任务准确率已经验收。
+
+## 单视角、非配对视频预训练窗口
+
+`preprocess_video(manifest_path, output, device="cuda")` 接受独立的
+`format_version: 1, kind: "raw_video_pretrain"` JSON。它不需要机器人轨迹、
+第二视角、物体跟踪、动作或接触标签；只提取冻结 Wan VAE 的观测 patch 特征。
+这些窗口训练小型视频作用编码器 B，不直接对 W 计算人类视频损失。
+
+```json
+{
+  "format_version": 1,
+  "kind": "raw_video_pretrain",
+  "video": "screened-continuous-clip.mp4",
+  "vae_path": "/server/models/wan/vae",
+  "vae_sha256": {"config.json": "填入真实SHA256", "diffusion_pytorch_model.safetensors": "填入真实SHA256"},
+  "size": [320, 480],
+  "fps": 12,
+  "domain": "human",
+  "source_id": "original-clip-001",
+  "source_group": "original-recording-001",
+  "feature_space_id": "audited-wan-feature-space-v1",
+  "split": "train",
+  "window_frames": 5,
+  "context_frames": 2,
+  "continuous_segment_verified": true
+}
+```
+
+视频必须预先剪成已筛选的连续片段。入口不自动检测镜头切换，不接受隐式
+起止裁剪参数。`window_frames/context_frames` 指编码后的时间帧数：每窗至少
+1 个上下文帧和 2 个未来观测帧。默认相邻窗口不重叠；可显式设置
+`window_stride_frames`，其值须在 1 到窗口长度之间。不足一个完整窗口的尾部
+丢弃并记录，不能补成虚假的未来监督。机器人视频可另填真实 `trajectory_id`。
+
+输出 `index.json` 与多个 `window_*.json/.npz`。每个 NPZ 仅含
+`features[T,H*W,C]`、同形 Boolean `feature_valid`、`frame_times[T]`。
+时间使用实际采样原始帧索引的编码端点 `frame_indices[::4] / source_fps`，
+保留源视频秒数，不伪装成机器人控制步。先因果编码完整片段，再切分特征窗口；
+每窗保留源文件哈希、VAE 哈希、分辨率、采样率、端点索引和窗口策略。
+所有窗口继承同一个 `source_id/source_group/split`；跨文件汇总时索引加载器还会
+检查源组及下游机器人来源是否跨训练／验证／测试划分泄漏。
+
+生成的窗口不含自动作用标签。patch 可观测性不等于目标身份或接触状态已经标注。
+
+## 将已训练 B 用于机器人示范入口
+
+原 `raw_visual_observation` 可增加 `demo_encoder_artifact` 本地路径、必填的
+`demo_feature_space_id`，以及可选 `demo_encoder_sha256`。预处理先核对实际 artifact
+哈希与特征空间，再将每段归一化 Wan 特征 `[1,T,H*W,C]`、全有效观测掩码和源视频
+端点秒数送入冻结编码器的 `encode_demo`，按 artifact 的 `window_frames` 生成有序
+作用 tokens；无随机扰动，不更新 W。
+
+输出的 `demonstration_encoding` 记录编码器 SHA256、特征空间、token 维度、窗口长度
+和每窗 token 数，供下游机器人 reader artifact 核对。完整窗口策略另记入视觉来源：
+非重叠分窗，尾部只重复数值并标记为无效，绝不把补齐项当作观测。
+
+未提供 B artifact 时继续输出 `raw_features`，并新增 `demonstration_layouts`，为每个
+视角记录 `frames/tokens_per_frame/frame_times`。转换既有数据时必须使用这些时间和布局，
+不能根据扁平 token 总数猜测帧数。B 已编码模式不会把作用 tokens 冒充原始 patch 布局。

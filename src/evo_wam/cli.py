@@ -148,7 +148,7 @@ def make_fixture(directory):
             "window_start": 0, "observation_step": 0, "executed_steps": horizon, "control_dt": 0.05,
             "actions_per_frame": 2,
             "history_chunks": [{"mode": "video", "slice": [0, 1], "frame_id": 0, "rope_offset": 0}],
-            "view_ids": ["synthetic-front", "synthetic-side"], "provenance": "synthetic",
+            "view_ids": ["synthetic-front", "synthetic-side"], "pair_kind": "synchronized_views", "provenance": "synthetic",
             "native_arrays": {name + "_dict": {"latent": f"native_{name}_clean", "grid_id": f"native_{name}_grid"}
                               for name in ("latent", "action")},
             "native_scalars": {"chunk_size": 2, "max_frame_chunk_size": 4, "window_size": 32}}
@@ -360,7 +360,8 @@ def build_batch(sample, config, trainer, null, generator, *, conditional=None):
         action_timestep=action_times, execution_valid=execution_valid,
         sample_kwargs={"history": history, "steps": 4, "shift": config["video_snr_shift"],
                        **sample.sampling_position()},
-        per_view_valid=sample.per_view_valid if conditional else None)
+        per_view_valid=sample.per_view_valid if conditional else None,
+        pair_kind=sample.pair_kind if conditional else "none")
 
 
 def adapter_state(trainer):
@@ -379,7 +380,9 @@ def save_run(path, trainer, config, generator, attempted_steps, tiny_native):
                "updates": trainer.updates, "attempted_steps": attempted_steps, "rng": generator.get_state(),
                "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                "tiny_native": tiny_native, "base_identity": trainer.base_identity,
-               "action_spaces": getattr(trainer, "action_spaces", {})}
+               "action_spaces": getattr(trainer, "action_spaces", {}),
+               "demonstration_encoding": getattr(trainer, "demonstration_encoding", {"kind": "raw_features"}),
+               "video_pretraining_sources": getattr(trainer, "video_pretraining_sources", [])}
     torch.save(payload, temporary)
     temporary.replace(path)
 
@@ -401,6 +404,9 @@ def restore_run(path, trainer, config, generator, *, resume):
         raise ValueError("resume requires the same stage and full config; use initialize for stage transitions")
     if getattr(trainer, "action_spaces", {}) and checkpoint.get("action_spaces", {}) != trainer.action_spaces:
         raise ValueError("action normalization registry differs from the learned interface")
+    encoding = checkpoint.get("demonstration_encoding", {"kind": "raw_features"})
+    if hasattr(trainer, "demonstration_encoding") and trainer.demonstration_encoding != encoding:
+        raise ValueError("demonstration encoding identity differs from the trained reader")
     for key in ("dimensions", "interface", "tokens", "current_offsets", "remaining_offsets", "lora", "binding_policy"):
         if checkpoint["config"][key] != config[key]:
             raise ValueError(f"artifact {key} differs; do not mix interface controls or token contracts")
@@ -411,6 +417,8 @@ def restore_run(path, trainer, config, generator, *, resume):
         raise ValueError("artifact tensor shapes differ from the current interface architecture")
     trainer.load_state_dict(checkpoint["model"], strict=False)
     trainer.action_spaces = checkpoint.get("action_spaces", {})
+    trainer.demonstration_encoding = encoding
+    trainer.video_pretraining_sources = checkpoint.get("video_pretraining_sources", [])
     if resume:
         trainer.optimizer.load_state_dict(checkpoint["optimizer"])
         trainer.updates = checkpoint["updates"]
@@ -423,9 +431,26 @@ def restore_run(path, trainer, config, generator, *, resume):
 
 
 def train(args):
-    from .data import load_experiment, load_sample
+    from .data import load_experiment, load_sample, validate_demo_encoding
     config = load_experiment(args.config)
     samples, records = load_index(args.index, "train")
+    encodings = [validate_demo_encoding(record, config["dimensions"]["demo_dim"]) for record in records]
+    if any(encoding != encodings[0] for encoding in encodings):
+        raise ValueError("all dataset splits must use the same frozen demonstration representation")
+    encoding = encodings[0]
+    pretraining_sources = []
+    if encoding["kind"] == "video_effect_tokens":
+        from .video_cli import load_video_encoder, encoding_metadata
+        from .video_data import validate_video_sources
+        if not args.demo_encoder:
+            raise ValueError("encoded demonstrations require --demo-encoder for identity and source-split auditing")
+        _, video_payload = load_video_encoder(args.demo_encoder)
+        if encoding_metadata(video_payload, file_sha256(args.demo_encoder)) != encoding:
+            raise ValueError("demonstration tokens were produced by a different video encoder or window policy")
+        pretraining_sources = video_payload.get("training_source_records", video_payload["source_records"])
+        validate_video_sources([*pretraining_sources, *[dict(record, record_kind="bridge") for record in records]])
+    elif args.demo_encoder:
+        raise ValueError("raw features cannot claim a video encoder; encode demonstrations first")
     if args.stage != "interface" and not (args.resume or args.initialize):
         raise ValueError("reader/joint stages require the validated preceding stage artifact")
     if args.resume or args.initialize:
@@ -446,6 +471,8 @@ def train(args):
     generator = torch.Generator().manual_seed(args.seed)
     trainer, null = build_trainer(config, checkpoint=args.checkpoint, tiny_native=args.tiny_native,
                                   device=args.device, stage=args.stage)
+    trainer.demonstration_encoding = encoding
+    trainer.video_pretraining_sources = pretraining_sources
     trainer.action_spaces = {}
     for record in records:
         if record["split"] == "train":
@@ -468,7 +495,8 @@ def train(args):
         "index_sha256": file_sha256(args.index), "evo_revision": revision.stdout.strip(),
         "worktree_dirty": bool(dirty.stdout.strip()), "torch": torch.__version__, "device": args.device,
         "tiny_native": args.tiny_native, "base_identity": trainer.base_identity,
-        "action_spaces": trainer.action_spaces})
+        "action_spaces": trainer.action_spaces, "demonstration_encoding": trainer.demonstration_encoding,
+        "video_pretraining_source_records": len(trainer.video_pretraining_sources)})
     started = time.monotonic()
     metrics_path = output / "metrics.jsonl"
     with metrics_path.open("a", encoding="utf-8") as log:
@@ -482,6 +510,7 @@ def train(args):
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize()
             metrics.update(step=step, conditional=batch.conditional, stage=args.stage,
+                           view_count=len(batch.demonstrations), pair_kind=batch.pair_kind,
                            compute_seconds=time.monotonic() - before,
                            provenance="tiny-native-random-weights" if args.tiny_native else "checkpoint-training")
             log.write(json.dumps(metrics, allow_nan=False) + "\n")
@@ -662,6 +691,30 @@ def main(argv=None):
     visual.add_argument("--manifest", required=True)
     visual.add_argument("--output", required=True)
     visual.add_argument("--device", default="cuda")
+    video_visual = commands.add_parser("preprocess-video")
+    video_visual.add_argument("--manifest", required=True)
+    video_visual.add_argument("--output", required=True)
+    video_visual.add_argument("--device", default="cuda")
+    video_train = commands.add_parser("pretrain-video")
+    video_train.add_argument("--config", required=True)
+    video_train.add_argument("--index", required=True)
+    video_train.add_argument("--output", required=True)
+    video_train.add_argument("--resume")
+    video_train.add_argument("--steps", type=int, default=1)
+    video_train.add_argument("--seed", type=int, default=0)
+    video_train.add_argument("--device", default="cpu")
+    video_eval = commands.add_parser("evaluate-video")
+    video_eval.add_argument("--artifact", required=True)
+    video_eval.add_argument("--index", required=True)
+    video_eval.add_argument("--split", choices=("validation", "test"), default="validation")
+    video_eval.add_argument("--max-samples", type=int, default=100)
+    video_eval.add_argument("--device", default="cpu")
+    video_eval.add_argument("--output", required=True)
+    encode_demo = commands.add_parser("encode-demonstrations")
+    encode_demo.add_argument("--artifact", required=True)
+    encode_demo.add_argument("--manifest", required=True)
+    encode_demo.add_argument("--output", required=True)
+    encode_demo.add_argument("--device", default="cpu")
     fixture = commands.add_parser("make-fixture")
     fixture.add_argument("--output", required=True)
     validate = commands.add_parser("validate-data")
@@ -671,6 +724,7 @@ def main(argv=None):
     run.add_argument("--index", required=True)
     run.add_argument("--stage", choices=("interface", "reader", "joint"), required=True)
     run.add_argument("--checkpoint")
+    run.add_argument("--demo-encoder", help="local encoder artifact matching precomputed effect tokens")
     run.add_argument("--tiny-native", action="store_true")
     run.add_argument("--device", default="cuda")
     run.add_argument("--steps", type=int, default=1)
@@ -709,6 +763,18 @@ def main(argv=None):
         elif args.command == "preprocess-visual":
             from .vision import preprocess
             result = preprocess(args.manifest, args.output, device=args.device)
+        elif args.command == "preprocess-video":
+            from .vision import preprocess_video
+            result = preprocess_video(args.manifest, args.output, device=args.device)
+        elif args.command == "pretrain-video":
+            from .video_cli import train_video
+            result = train_video(args)
+        elif args.command == "evaluate-video":
+            from .video_cli import evaluate_video
+            result = evaluate_video(args)
+        elif args.command == "encode-demonstrations":
+            from .video_cli import encode_demonstrations
+            result = encode_demonstrations(args)
         elif args.command == "validate-data":
             from .data import load_sample
             samples, records = load_index(args.index)

@@ -55,6 +55,12 @@ class NativePolicy:
         current = torch.tensor(config["current_offsets"], device=device, dtype=torch.int64)
         remaining = torch.tensor(config["remaining_offsets"], device=device, dtype=torch.int64)
         if requirement is None:
+            from .data import validate_demo_encoding
+            encoding = validate_demo_encoding({"demonstration_encoding": observation.demonstration_encoding},
+                                               observation.demonstrations[self.view].shape[-1]
+                                               if 0 <= self.view < len(observation.demonstrations) else config["dimensions"]["demo_dim"])
+            if encoding != getattr(trainer, "demonstration_encoding", {"kind": "raw_features"}):
+                raise RequirementRejected("demonstration_encoding_differs_from_trained_reader")
             if self.source_stage not in {"reader", "joint"}:
                 raise RequirementRejected("demonstration_inference_requires_trained_reader")
             if not self.diagnostic and (not config.get("validation_locked")

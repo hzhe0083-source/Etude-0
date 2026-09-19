@@ -149,8 +149,8 @@ def load_video_window(manifest_path: str | Path) -> VideoWindow:
                        targets, masks, None if ids is None else ids.unsqueeze(0))
 
 
-def validate_video_sources(records: Sequence[Mapping]) -> None:
-    """Check transitive source leakage, including independently supplied bridge records.
+def _source_components(records: Sequence[Mapping]) -> list[tuple[int, ...]]:
+    """Validate and retain transitive provenance links, including bridge records.
 
     Video records join original source IDs and repost/window source groups.
     Robot source IDs also identify trajectories unless an explicit trajectory_id
@@ -185,20 +185,46 @@ def validate_video_sources(records: Sequence[Mapping]) -> None:
             if other != index:
                 neighbors[index].add(other)
                 neighbors[other].add(index)
-    seen = set()
+    seen, components = set(), []
     for start in range(len(records)):
         if start in seen:
             continue
-        stack, splits = [start], set()
+        stack, splits, component = [start], set(), []
         while stack:
             node = stack.pop()
             if node in seen:
                 continue
             seen.add(node)
+            component.append(node)
             splits.add(records[node]["split"])
             stack.extend(neighbors[node] - seen)
         if len(splits) > 1:
             raise ValueError("video/robot bridge source component crosses train/validation/test splits")
+        components.append(tuple(sorted(component)))
+    return components
+
+
+def validate_video_sources(records: Sequence[Mapping]) -> None:
+    """Reject train/validation/test overlap through any known source or bridge edge."""
+    _source_components(records)
+
+
+def select_training_sources(records: Sequence[Mapping], domains: Sequence[str]) -> list[dict]:
+    """Keep the provenance closure of train videos in the selected domains.
+
+    Bridge/alias records in those components remain necessary for later split
+    checks even when they were not model inputs. Independent unused domains are
+    excluded. Sampling counts, rather than this closure, describe actual updates.
+    """
+    if isinstance(domains, str) or set(domains) - {"human", "robot"}:
+        raise ValueError("training domains must be a sequence of human/robot names")
+    domains = set(domains)
+    selected = set()
+    for component in _source_components(records):
+        if any(records[i].get("record_kind", "video") == "video"
+               and records[i]["split"] == "train" and records[i]["domain"] in domains for i in component):
+            selected.update(component)
+    return [dict(record) for i, record in enumerate(records) if i in selected]
 
 
 def load_video_index(index_path: str | Path, split: str = "train") -> tuple[list[Path], list[dict]]:

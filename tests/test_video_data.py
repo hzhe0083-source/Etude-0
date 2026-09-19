@@ -6,7 +6,8 @@ import unittest
 import numpy as np
 import torch
 
-from evo_wam.video_data import load_video_index, load_video_window, validate_video_sources
+from evo_wam.video_data import (load_video_index, load_video_window,
+                                select_training_sources, validate_video_sources)
 
 
 def write_window(root, name="window", *, domain="human", tracked=False, effects=()):
@@ -180,6 +181,34 @@ class VideoWindowTest(unittest.TestCase):
 
 
 class VideoSourcesTest(unittest.TestCase):
+    def test_training_provenance_retains_bridge_closure_to_heldout_robot(self):
+        human = source("human-H")
+        bridge = {"record_kind": "bridge", "source_id": "human-H", "trajectory_id": "robot-R", "split": "train"}
+        alias = {"record_kind": "bridge", "source_id": "human-alias", "trajectory_id": "robot-R", "split": "train"}
+        unused = source("independent-robot", domain="robot")
+        ledger = select_training_sources([human, bridge, alias, unused], ["human"])
+        self.assertEqual(ledger, [human, bridge, alias])
+        for heldout in (source("camera-R", "test", domain="robot", trajectory_id="robot-R"),
+                        source("human-alias", "validation")):
+            with self.subTest(heldout=heldout), self.assertRaisesRegex(ValueError, "crosses"):
+                validate_video_sources([*ledger, heldout])
+
+    def test_robot_only_ledger_omits_independent_unused_human_but_keeps_alias_links(self):
+        robot = source("robot-R", domain="robot")
+        independent = source("unused-human")
+        bridge = {"record_kind": "bridge", "source_id": "linked-human", "trajectory_id": "robot-R", "split": "train"}
+        linked = source("linked-human")
+        ledger = select_training_sources([robot, independent, bridge, linked], ["robot"])
+        self.assertEqual(ledger, [robot, bridge, linked])
+        validate_video_sources([*ledger, source("unused-human", "test")])
+        with self.assertRaisesRegex(ValueError, "crosses"):
+            validate_video_sources([*ledger, source("linked-human", "test")])
+        self.assertEqual(select_training_sources([robot, independent], []), [])
+        with self.assertRaises(ValueError):
+            select_training_sources([robot], ["unknown"])
+        with self.assertRaises(ValueError):
+            select_training_sources([robot, source("robot-R", "test", domain="robot")], ["robot"])
+
     def test_source_reposts_adjacent_windows_and_transitive_links_cannot_cross_splits(self):
         cases = [
             [source("same", "train", group="a"), source("same", "test", group="b")],

@@ -13,5 +13,9 @@
   "visual_track_provider": null,
   "original_success_predicate": null,
   "zero_wam_success_predicate": null,
-  "control_dt": null
+  "control_dt": null,
+  "video_pretraining_index": null,
+  "video_pretraining_config": null,
+  "video_effect_encoder_artifact": null,
+  "visual_feature_space_id": null
 }

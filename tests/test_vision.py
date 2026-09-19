@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from evo_wam.vision import encode_rgb, load_vae, preprocess, read_video, robot_features, sha256
+from evo_wam.vision import encode_rgb, load_vae, preprocess, preprocess_video, read_video, robot_features, sha256
 
 
 class Capture:
@@ -143,6 +143,27 @@ class RobotFeatureTest(unittest.TestCase):
         bad[0][0, 0, 0, 0, 1] = float("nan")
         with self.assertRaises(ValueError):
             robot_features(bad, self.masks, self.ids)
+
+
+class VideoPretrainManifestTest(unittest.TestCase):
+    def test_invalid_windows_and_unscreened_segments_fail_before_video_io(self):
+        spec = {"format_version": 1, "kind": "raw_video_pretrain", "video": "segment.avi",
+                "vae_path": "local-vae", "vae_sha256": {"config.json": "0" * 64},
+                "size": [32, 32], "fps": 10, "domain": "human", "source_id": "original-clip",
+                "source_group": "original-recording", "feature_space_id": "wan-test-v1", "split": "train",
+                "window_frames": 3, "context_frames": 1, "continuous_segment_verified": True}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for change in ({"window_frames": 2}, {"context_frames": 0}, {"context_frames": 2},
+                           {"window_stride_frames": 4}, {"continuous_segment_verified": False},
+                           {"source_group": ""}, {"clip_start_seconds": 1}, {"split": "validation/test"}):
+                path = root / "raw.json"
+                path.write_text(json.dumps({**spec, **change}))
+                with self.subTest(change=change), patch("evo_wam.vision.read_video") as reader:
+                    with self.assertRaises(ValueError):
+                        preprocess_video(path, root / "output", device="cpu", vae=object())
+                    reader.assert_not_called()
+                self.assertFalse((root / "output").exists())
 
 
 @unittest.skipUnless(importlib.util.find_spec("diffusers"), "native Diffusers extra is unavailable")
@@ -282,6 +303,64 @@ class NativeWanVaeTest(unittest.TestCase):
                 load_vae(path, expected, device="cpu")
 
     @unittest.skipUnless(importlib.util.find_spec("cv2"), "native OpenCV extra is unavailable")
+    def test_single_unpaired_video_emits_patch_windows_at_actual_source_seconds(self):
+        import cv2
+        from evo_wam.video_data import load_video_index, load_video_window
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "single-human.avi"
+            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"FFV1"), 10, (48, 32))
+            if not writer.isOpened():
+                writer.release()
+                self.skipTest("OpenCV build has no FFV1 lossless encoder")
+            try:
+                for rgb in self.frames(49):
+                    writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            finally:
+                writer.release()
+            spec = {"format_version": 1, "kind": "raw_video_pretrain", "video": video.name,
+                    "vae_path": "unused-injected-test-encoder", "vae_sha256": {"config.json": "0" * 64},
+                    "size": [32, 32], "fps": 5, "domain": "human", "source_id": "human-clip",
+                    "source_group": "original-human-recording", "feature_space_id": "tiny-wan-2channels-v1",
+                    "split": "train", "window_frames": 3, "context_frames": 1,
+                    "continuous_segment_verified": True}
+            path = root / "raw-video.json"
+            path.write_text(json.dumps(spec))
+            report = preprocess_video(path, root / "encoded", device="cpu", vae=self.vae)
+            self.assertEqual(report["windows"], 2)
+            self.assertEqual(report["tokens_per_frame"], 4)
+            self.assertEqual(report["feature_dim"], 2)
+            self.assertFalse(report["automatic_effect_labels"])
+            self.assertFalse(report["released_vae_run"])
+            index = json.loads(Path(report["index"]).read_text())
+            load_video_index(report["index"])
+            self.assertEqual(index["bridge_sources"], [])
+            self.assertEqual([row["split"] for row in index["samples"]], ["train", "train"])
+            frames, sampling = read_video(video, 5)
+            expected = encode_rgb(self.vae, frames, [32, 32])[0].permute(1, 2, 3, 0).flatten(1, 2)
+            expected_times = np.asarray(sampling["frame_indices"])[::4] / sampling["source_fps"]
+            np.testing.assert_allclose(expected_times, [0, .8, 1.6, 2.4, 3.2, 4, 4.8])
+            for i, entry in enumerate(index["samples"]):
+                window_path = Path(report["index"]).parent / entry["manifest"]
+                window = load_video_window(window_path)
+                torch.testing.assert_close(window.features[0], expected[i * 3:i * 3 + 3])
+                np.testing.assert_allclose(window.frame_times.numpy(), expected_times[i * 3:i * 3 + 3])
+                self.assertTrue(window.feature_valid.all())
+                self.assertEqual(window.effect_targets, {})
+                self.assertEqual(window.context_frames, 1)
+                self.assertEqual(window.metadata["source_group"], spec["source_group"])
+                self.assertEqual(window.metadata["feature_kind"], "patches")
+                provenance = window.metadata["provenance"]
+                self.assertTrue(provenance["injected_test_encoder"])
+                self.assertEqual(provenance["source_video_sha256"], sha256(video))
+                self.assertEqual(provenance["window_policy"]["discarded_tail_frames"], 1)
+                with np.load(window_path.with_suffix(".npz"), allow_pickle=False) as arrays:
+                    self.assertEqual(set(arrays.files), {"features", "feature_valid", "frame_times"})
+            with self.assertRaises(ValueError):
+                preprocess_video(path, root / "encoded", device="cpu", vae=self.vae)
+
+    @unittest.skipUnless(importlib.util.find_spec("cv2"), "native OpenCV extra is unavailable")
     def test_real_raw_preprocessing_loads_v2_observation_with_explicit_test_provenance(self):
         import cv2
         from evo_wam.data import load_observation
@@ -351,6 +430,11 @@ class NativeWanVaeTest(unittest.TestCase):
 
             self.assertEqual(metadata["format_version"], 2)
             self.assertEqual(metadata["view_ids"], ["front", "side"])
+            self.assertEqual(metadata["demonstration_encoding"], {"kind": "raw_features"})
+            self.assertEqual(metadata["demonstration_layouts"], [
+                {"frames": 3, "tokens_per_frame": 4, "frame_times": [0., .4, .8]},
+                {"frames": 3, "tokens_per_frame": 4, "frame_times": [0., .4, .8]},
+            ])
             self.assertTrue(provenance["injected_test_encoder"])
             self.assertFalse(report["released_vae_run"])
             self.assertEqual(report["commands_sent"], 0)
@@ -388,6 +472,56 @@ class NativeWanVaeTest(unittest.TestCase):
             torch.testing.assert_close(packed_commands[:, :3], torch.from_numpy(commands)[None])
             self.assertFalse(packed_commands[:, 3].any())
             self.assertEqual(loaded.sampling_position(), {"frame_id": 6, "rope_offset": 3})
+
+            # Exercise the real local B artifact loader after one synthetic
+            # future-feature update; this is not a trained robotics result.
+            from evo_wam.video_effects import EffectFeaturePredictor, VideoEffectEncoder
+            with torch.random.fork_rng():
+                torch.manual_seed(19)
+                effect_encoder = VideoEffectEncoder(2, latent_dim=4, num_tokens=2, hidden_dim=8, noise_std=.2)
+                predictor = EffectFeaturePredictor(2, latent_dim=4, hidden_dim=8)
+                optimizer = torch.optim.Adam([*effect_encoder.parameters(), *predictor.parameters()], lr=.001)
+                feature_window = front.permute(0, 2, 3, 4, 1).flatten(2, 3)
+                valid_window = torch.ones_like(feature_window, dtype=torch.bool)
+                times = torch.tensor([0., .4, .8])
+                z = effect_encoder(feature_window, valid_window, times)
+                prediction = predictor(feature_window[:, :1], valid_window[:, :1], z, times[1:], past_times=times[:1])
+                update_loss = (prediction["features"] - feature_window[:, 1:]).square().mean()
+                update_loss.backward()
+                self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in effect_encoder.parameters()))
+                optimizer.step()
+            effect_encoder.eval().requires_grad_(False)
+            artifact = root / "synthetic-video-encoder.pt"
+            payload = {"format_version": 1, "kind": "video_effect_pretrain", "updates": 1,
+                       "feature_space_id": "tiny-wan-2channels-v1", "encoder": effect_encoder.state_dict(),
+                       "config": {"window_frames": 3, "context_frames": 1,
+                                  "model": {"feature_dim": 2, "latent_dim": 4, "num_tokens": 2,
+                                            "hidden_dim": 8, "noise_std": .2}}}
+            torch.save(payload, artifact)
+            encoded_spec = {**manifest, "demo_encoder_artifact": artifact.name,
+                            "demo_encoder_sha256": sha256(artifact),
+                            "demo_feature_space_id": payload["feature_space_id"]}
+            encoded_path = root / "raw-with-effect-encoder.json"
+            encoded_path.write_text(json.dumps(encoded_spec))
+            encoded_report = preprocess(encoded_path, root / "effect-tokens", device="cpu", vae=self.vae)
+            encoded_loaded = load_observation(encoded_report["manifest"])
+            encoded_meta = json.loads(Path(encoded_report["manifest"]).read_text())
+            self.assertNotIn("demonstration_layouts", encoded_meta)
+            self.assertEqual(encoded_meta["demonstration_encoding"], {
+                "kind": "video_effect_tokens", "encoder_sha256": sha256(artifact),
+                "feature_space_id": payload["feature_space_id"], "token_dim": 4,
+                "window_frames": 3, "num_tokens": 2})
+            self.assertEqual(encoded_meta["visual_provenance"]["demonstration_window_policy"]["stride"], "nonoverlapping")
+            for latent, tokens in zip((front, wrist), encoded_loaded.demonstrations):
+                values = latent.permute(0, 2, 3, 4, 1).flatten(2, 3)
+                with torch.no_grad():
+                    expected_tokens = effect_encoder.encode_demo(values, torch.ones_like(values, dtype=torch.bool), times, window_frames=3)
+                torch.testing.assert_close(tokens, expected_tokens)
+            for mismatch in ({"demo_encoder_sha256": "0" * 64}, {"demo_feature_space_id": "wrong-space"}):
+                encoded_path.write_text(json.dumps({**encoded_spec, **mismatch}))
+                with self.subTest(mismatch=mismatch), self.assertRaises(ValueError):
+                    preprocess(encoded_path, root / "rejected-artifact", device="cpu", vae=self.vae)
+                self.assertFalse((root / "rejected-artifact").exists())
 
 
 if __name__ == "__main__":

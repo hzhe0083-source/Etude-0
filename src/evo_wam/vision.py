@@ -141,7 +141,7 @@ def preprocess_video(manifest_path, output, *, device="cuda", vae=None):
     contact/effect labels. Source-group identity stays the same in every window.
     """
     from .cli import write_json
-    from .video_data import load_video_index, load_video_window
+    from .video_data import load_video_index, load_video_window, patch_grid_coordinates, PATCH_COORDINATE_SYSTEM
     path, output = Path(manifest_path).resolve(), Path(output).resolve()
     spec = json.loads(path.read_text())
     required = {"format_version", "kind", "video", "vae_path", "vae_sha256", "size", "fps",
@@ -179,6 +179,8 @@ def preprocess_video(manifest_path, output, *, device="cuda", vae=None):
     if vae is None:
         vae = load_vae((path.parent / spec["vae_path"]).resolve(), spec["vae_sha256"], device=device)
     encoded = encode_rgb(vae, frames, spec["size"])
+    patch_grid = list(encoded.shape[-2:])
+    patch_coordinates = patch_grid_coordinates(patch_grid).numpy()
     features = encoded[0].permute(1, 2, 3, 0).flatten(1, 2).numpy()  # [T,H*W,C]
     endpoints = np.asarray(sampling["frame_indices"], dtype=np.int64)[::4]
     times = endpoints.astype(np.float64) / sampling["source_fps"]
@@ -198,16 +200,18 @@ def preprocess_video(manifest_path, output, *, device="cuda", vae=None):
     for number, start in enumerate(starts):
         stop = start + window
         name = f"window_{number:06d}"
-        metadata = {"format_version": 1, "kind": "video_pretrain", "arrays": f"{name}.npz",
+        metadata = {"format_version": 2, "kind": "video_pretrain", "arrays": f"{name}.npz",
                     "sample_id": f"{spec['source_id']}:{start}:{stop}", "source_id": spec["source_id"],
                     "source_group": spec["source_group"], "domain": spec["domain"],
                     "feature_space_id": spec["feature_space_id"], "feature_kind": "patches", "context_frames": context,
+                    "patch_grid": patch_grid, "patch_coordinate_system": PATCH_COORDINATE_SYSTEM,
                     "provenance": {**common, "latent_frame_slice": [start, stop],
                                    "latent_endpoint_source_frame_indices": endpoints[start:stop].tolist()}}
         if "trajectory_id" in spec:
             metadata["trajectory_id"] = spec["trajectory_id"]
         np.savez_compressed(output / f"{name}.npz", features=features[start:stop],
-                            feature_valid=np.ones_like(features[start:stop], dtype=np.bool_), frame_times=times[start:stop])
+                            feature_valid=np.ones_like(features[start:stop], dtype=np.bool_), frame_times=times[start:stop],
+                            patch_coordinates=patch_coordinates)
         write_json(output / f"{name}.json", metadata)
         load_video_window(output / f"{name}.json")
         records.append({"manifest": f"{name}.json", "split": spec["split"]})
@@ -224,12 +228,29 @@ def preprocess(manifest_path, output, *, device="cuda", vae=None):
     """Write a v2 observed-only input from raw robot RGB, tracks and human video."""
     from .cli import write_json
     from .data import load_observation
+    from .video_data import patch_grid_coordinates, PATCH_COORDINATE_SYSTEM
     path, output = Path(manifest_path).resolve(), Path(output)
     spec = json.loads(path.read_text())
     if spec.get("format_version") != 1 or spec.get("kind") != "raw_visual_observation":
         raise ValueError("expected a raw_visual_observation version-1 manifest")
     if output.exists() and any(output.iterdir()):
         raise ValueError("visual preprocessing output must be a fresh directory")
+    demo_encoder, demo_payload, demonstration_encoding = None, None, {"kind": "raw_features"}
+    artifact_path = spec.get("demo_encoder_artifact")
+    if artifact_path is not None:
+        from .video_cli import encoding_metadata, load_video_encoder, require_feature_kind
+        if not isinstance(artifact_path, str) or not artifact_path.strip():
+            raise ValueError("demo_encoder_artifact must name a local artifact")
+        artifact_path = (path.parent / artifact_path).resolve()
+        artifact_sha = sha256(artifact_path)
+        if spec.get("demo_encoder_sha256", artifact_sha) != artifact_sha:
+            raise ValueError("demonstration encoder artifact SHA256 mismatch")
+        demo_encoder, demo_payload = load_video_encoder(artifact_path, device=device)
+        require_feature_kind(demo_payload, "patches")
+        if not spec.get("demo_feature_space_id") or spec["demo_feature_space_id"] != demo_payload["feature_space_id"]:
+            raise ValueError("demonstration feature space must match the video encoder artifact")
+        demo_encoder.eval().requires_grad_(False)
+        demonstration_encoding = encoding_metadata(demo_payload, artifact_sha)
     cameras = spec.get("camera_order")
     if not isinstance(cameras, list) or not cameras or len(set(cameras)) != len(cameras):
         raise ValueError("provide a fixed, unique camera_order")
@@ -261,38 +282,27 @@ def preprocess(manifest_path, output, *, device="cuda", vae=None):
     result = {key: arrays[key] for key in ("entity_ids", "proprio_history", "embodiment", "observed_action_history", "observed_action_step_offsets")}
     result.update(robot_latent=packed, robot_history=features, observed_video_step_offsets=encoded_offsets)
     demo_records, demo_layouts = [], []
-    demo_encoder, demo_payload, demonstration_encoding = None, None, {"kind": "raw_features"}
-    artifact_path = spec.get("demo_encoder_artifact")
-    if artifact_path is not None:
-        from .video_cli import encoding_metadata, load_video_encoder
-        if not isinstance(artifact_path, str) or not artifact_path.strip():
-            raise ValueError("demo_encoder_artifact must name a local artifact")
-        artifact_path = (path.parent / artifact_path).resolve()
-        artifact_sha = sha256(artifact_path)
-        if spec.get("demo_encoder_sha256", artifact_sha) != artifact_sha:
-            raise ValueError("demonstration encoder artifact SHA256 mismatch")
-        demo_encoder, demo_payload = load_video_encoder(artifact_path, device=device)
-        if not spec.get("demo_feature_space_id") or spec["demo_feature_space_id"] != demo_payload["feature_space_id"]:
-            raise ValueError("demonstration feature space must match the video encoder artifact")
-        demo_encoder.eval().requires_grad_(False)
-        demonstration_encoding = encoding_metadata(demo_payload, artifact_sha)
     for i, demo in enumerate(spec["demonstrations"]):
         video = (path.parent / demo["video"]).resolve()
         frames, sampling = read_video(video, spec["demo_fps"])
         encoded = encode_rgb(vae, frames, spec["demo_size"])
+        patch_grid = list(encoded.shape[-2:])
         features = encoded.permute(0, 2, 3, 4, 1).flatten(2, 3)
         times = torch.as_tensor(np.asarray(sampling["frame_indices"])[::4] / sampling["source_fps"], dtype=torch.float64)
         if features.shape[1] != len(times):
             raise ValueError("demonstration latent endpoints and sampled source times differ")
+        layout = {"frames": features.shape[1], "tokens_per_frame": features.shape[2], "frame_times": times.tolist(),
+                  "feature_kind": "patches", "patch_grid": patch_grid, "patch_coordinate_system": PATCH_COORDINATE_SYSTEM,
+                  "token_order": "time,height,width,channel"}
+        demo_layouts.append(layout)
         if demo_encoder is None:
             result[f"demo_view_{i}"] = features.flatten(1, 2)[0].numpy()
-            demo_layouts.append({"frames": features.shape[1], "tokens_per_frame": features.shape[2],
-                                 "frame_times": times.tolist()})
         else:
             features = features.to(next(demo_encoder.parameters()))
             with torch.no_grad():
                 tokens = demo_encoder.encode_demo(features, torch.ones_like(features, dtype=torch.bool),
-                                                   times.to(features.device), window_frames=demo_payload["config"]["window_frames"])
+                    times.to(features.device), window_frames=demo_payload["config"]["window_frames"],
+                    feature_kind="patches", patch_coordinates=patch_grid_coordinates(patch_grid).to(features))
             result[f"demo_view_{i}"] = tokens[0].cpu().float().numpy()
         demo_records.append({"view_id": demo["view_id"], "source_sha256": sha256(video), **sampling})
     identity = {"manifest_sha256": sha256(path), "robot_arrays_sha256": sha256(source),
@@ -312,7 +322,7 @@ def preprocess(manifest_path, output, *, device="cuda", vae=None):
                 view_ids=[d["view_id"] for d in spec["demonstrations"]], visual_provenance=identity,
                 demonstration_encoding=demonstration_encoding)
     if demo_layouts:
-        meta["demonstration_layouts"] = demo_layouts
+        meta["demonstration_layouts" if demo_encoder is None else "raw_demonstration_layouts"] = demo_layouts
     if "demo_feature_space_id" in spec:
         meta["demo_feature_space_id"] = spec["demo_feature_space_id"]
     output.mkdir(parents=True, exist_ok=True)

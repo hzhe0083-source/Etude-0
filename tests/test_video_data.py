@@ -6,13 +6,14 @@ import unittest
 import numpy as np
 import torch
 
-from evo_wam.video_data import (load_video_index, load_video_window,
-                                select_training_sources, validate_video_sources)
+from evo_wam.video_data import (PATCH_COORDINATE_SYSTEM, load_video_index, load_video_window,
+                                patch_grid_coordinates, select_training_sources,
+                                validate_patch_coordinates, validate_video_sources)
 
 
 def write_window(root, name="window", *, domain="human", tracked=False, effects=()):
     metadata = {
-        "format_version": 1, "kind": "video_pretrain", "arrays": f"{name}.npz",
+        "format_version": 2, "kind": "video_pretrain", "arrays": f"{name}.npz",
         "sample_id": name, "source_id": f"original-{name}", "source_group": f"group-{name}",
         "domain": domain, "feature_space_id": "fixed-wan-posterior-v1",
         "feature_kind": "tracked_entities" if tracked else "patches", "context_frames": 2,
@@ -25,6 +26,9 @@ def write_window(root, name="window", *, domain="human", tracked=False, effects=
     }
     if tracked:
         arrays["entity_ids"] = np.array([11, 22], dtype=np.int64)
+    else:
+        metadata.update(patch_grid=[1, 2], patch_coordinate_system=PATCH_COORDINATE_SYSTEM)
+        arrays["patch_coordinates"] = patch_grid_coordinates([1, 2]).numpy()
     if effects:
         metadata.update(effect_schema_id="observed-object-effects-v1", geometry_frame="object-relative-v1",
                         geometry_units="metres", evidence_source="audited-synthetic-fixture")
@@ -64,7 +68,87 @@ class VideoWindowTest(unittest.TestCase):
         self.assertEqual(window.effect_targets, {})
         self.assertEqual(window.effect_valid, {})
         self.assertIsNone(window.entity_ids)
+        torch.testing.assert_close(window.patch_coordinates, torch.tensor([[-0.5, 0.0], [0.5, 0.0]]))
         self.assertTrue(window.has_training_signal)
+
+    def test_patch_coordinates_use_actual_non_square_grid_and_preserve_storage_order(self):
+        coordinates = patch_grid_coordinates([2, 3])
+        torch.testing.assert_close(coordinates, torch.tensor([
+            [-2 / 3, -0.5], [0, -0.5], [2 / 3, -0.5],
+            [-2 / 3, 0.5], [0, 0.5], [2 / 3, 0.5],
+        ]))
+        self.assertEqual(coordinates.dtype, torch.float32)
+        reordered = coordinates[[5, 0, 2, 3, 1, 4]]
+        torch.testing.assert_close(validate_patch_coordinates(reordered, [2, 3], PATCH_COORDINATE_SYSTEM), reordered)
+
+        path, metadata, arrays = write_window(self.root)
+        arrays["features"] = arrays["features"][:, ::-1].copy()
+        arrays["feature_valid"] = arrays["feature_valid"][:, ::-1].copy()
+        arrays["patch_coordinates"] = arrays["patch_coordinates"][::-1].copy()
+        save_window(path, metadata, arrays)
+        window = load_video_window(path)
+        torch.testing.assert_close(window.patch_coordinates, torch.from_numpy(arrays["patch_coordinates"]))
+        torch.testing.assert_close(window.features[0], torch.from_numpy(arrays["features"]))
+
+    def test_patch_grid_is_explicit_never_guessed_from_token_count(self):
+        path, metadata, arrays = write_window(self.root)
+        for grid in (None, [2], [0, 2], [True, 2], [1.0, 2], [1, 3], [2, 1]):
+            changed = {**metadata, "patch_grid": grid}
+            if grid is None:
+                del changed["patch_grid"]
+            save_window(path, changed, arrays)
+            with self.subTest(grid=grid), self.assertRaisesRegex(ValueError, "patch_grid"):
+                load_video_window(path)
+        for convention in (None, "pixels", "normalized_yx_patch_centers"):
+            changed = {**metadata, "patch_coordinate_system": convention}
+            save_window(path, changed, arrays)
+            with self.subTest(convention=convention), self.assertRaisesRegex(ValueError, "patch_coordinate_system"):
+                load_video_window(path)
+
+    def test_patch_coordinates_reject_missing_duplicate_nonfinite_and_non_grid_positions(self):
+        path, metadata, arrays = write_window(self.root)
+        for coordinates in (None, np.zeros((2, 2), dtype=np.float32),
+                            np.array([[-0.5, 0], [np.nan, 0]], dtype=np.float32),
+                            np.array([[-0.5, 0], [np.inf, 0]], dtype=np.float32),
+                            np.array([[-0.4, 0], [0.5, 0]], dtype=np.float32),
+                            np.array([[-1, 0], [1, 0]], dtype=np.float32),
+                            np.zeros((2, 2), dtype=np.int64), np.zeros((1, 2), dtype=np.float32)):
+            changed = {**arrays, "patch_coordinates": coordinates}
+            if coordinates is None:
+                del changed["patch_coordinates"]
+            save_window(path, metadata, changed)
+            with self.subTest(coordinates=coordinates), self.assertRaisesRegex(ValueError, "patch_coordinates"):
+                load_video_window(path)
+
+    def test_patch_grid_size_must_match_feature_axis(self):
+        path, metadata, arrays = write_window(self.root)
+        metadata["patch_grid"] = [2, 2]
+        arrays["patch_coordinates"] = patch_grid_coordinates([2, 2]).numpy()
+        save_window(path, metadata, arrays)
+        with self.assertRaisesRegex(ValueError, "feature patch axis N"):
+            load_video_window(path)
+
+    def test_tracked_entity_ids_are_not_patch_positions(self):
+        path, metadata, arrays = write_window(self.root, tracked=True)
+        self.assertIsNone(load_video_window(path).patch_coordinates)
+        for changed in ({"patch_grid": [1, 2]}, {"patch_coordinate_system": PATCH_COORDINATE_SYSTEM}):
+            save_window(path, {**metadata, **changed}, arrays)
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "tracked_entities"):
+                load_video_window(path)
+        save_window(path, metadata, {**arrays, "patch_coordinates": patch_grid_coordinates([1, 2]).numpy()})
+        with self.assertRaisesRegex(ValueError, "tracked_entities"):
+            load_video_window(path)
+
+    def test_old_video_format_requires_regeneration_also_when_loading_index(self):
+        path, metadata, arrays = write_window(self.root)
+        save_window(path, {**metadata, "format_version": 1}, arrays)
+        with self.assertRaisesRegex(ValueError, "regenerate old windows"):
+            load_video_window(path)
+        index = self.root / "index.json"
+        index.write_text(json.dumps({"format_version": 1, "kind": "video_pretrain_index",
+                                    "samples": [{"manifest": path.name, "split": "train"}]}))
+        with self.assertRaisesRegex(ValueError, "regenerate old windows"):
+            load_video_index(index)
 
     def test_robot_replay_uses_same_unpaired_schema_without_actions(self):
         path, _, _ = write_window(self.root, domain="robot")

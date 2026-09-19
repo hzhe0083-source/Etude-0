@@ -83,6 +83,7 @@ class InferenceTests(unittest.TestCase):
 
     def test_raw_features_and_encoded_demonstrations_cannot_be_silently_mixed(self):
         encoding = {"kind": "video_effect_tokens", "encoder_sha256": "1" * 64,
+                    "encoder_version": 2,
                     "feature_space_id": "frozen-test-v1", "token_dim": 4,
                     "window_frames": 3, "num_tokens": 2}
         encoded = replace(self.observation, demonstration_encoding=encoding)

@@ -57,9 +57,22 @@ def build_video_models(config, device):
 
 def _read_artifact(path):
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(payload, dict) or payload.get("format_version") != 1 or payload.get("kind") != "video_effect_pretrain":
-        raise ValueError("expected a video-effect pretraining artifact")
+    if (not isinstance(payload, dict) or type(payload.get("format_version")) is not int
+            or payload["format_version"] != 2 or payload.get("kind") != "video_effect_pretrain"):
+        raise ValueError("expected a version-2 video-effect artifact; re-pretrain and re-export legacy encoders/tokens")
+    counts = payload.get("feature_kind_updates")
+    if (not isinstance(counts, dict) or set(counts) != {"patches", "tracked_entities"}
+            or any(type(count) is not int or count < 0 for count in counts.values())
+            or type(payload.get("updates")) is not int or sum(counts.values()) != payload["updates"]):
+        raise ValueError("artifact must record successful feature_kind_updates matching its total updates")
     return payload
+
+
+def require_feature_kind(payload, feature_kind):
+    if feature_kind not in {"patches", "tracked_entities"}:
+        raise ValueError("feature_kind must be patches or tracked_entities")
+    if payload.get("feature_kind_updates", {}).get(feature_kind, 0) < 1:
+        raise ValueError(f"encoder has no successful {feature_kind} updates; train that feature kind before evaluation or export")
 
 
 def load_video_encoder(path, *, device="cpu"):
@@ -75,7 +88,7 @@ def load_video_encoder(path, *, device="cpu"):
 
 def encoding_metadata(payload, digest):
     model = payload["config"]["model"]
-    return {"kind": "video_effect_tokens", "encoder_sha256": digest,
+    return {"kind": "video_effect_tokens", "encoder_version": 2, "encoder_sha256": digest,
             "feature_space_id": payload["feature_space_id"], "token_dim": model["latent_dim"],
             "window_frames": payload["config"]["window_frames"], "num_tokens": model["num_tokens"]}
 
@@ -110,6 +123,7 @@ def train_video(args):
     start, updates = 0, 0
     counts = {domain: 0 for domain in grouped}
     domain_updates = dict(counts)
+    feature_kind_updates = {"patches": 0, "tracked_entities": 0}
     visited_arrays = {}
     geometry_basis = None
     if args.resume:
@@ -124,6 +138,7 @@ def train_video(args):
             torch.cuda.set_rng_state_all(previous["cuda_rng"])
         start, updates = previous["attempted_steps"], previous["updates"]
         counts, domain_updates = previous["domain_windows"], previous["domain_updates"]
+        feature_kind_updates = previous["feature_kind_updates"]
         visited_arrays = previous["visited_arrays"]
         geometry_basis = previous.get("geometry_basis")
         known_paths = {str(path.relative_to(Path(args.index).resolve().parent)): path for items in grouped.values() for path in items}
@@ -159,11 +174,13 @@ def train_video(args):
             optimizer.zero_grad(set_to_none=True)
             losses = {"total": sample.features.new_zeros(()), "valid_count": sample.features.new_zeros(())}
             if sample.has_training_signal:
-                tokens = encoder(sample.features, sample.feature_valid, sample.frame_times)
+                tokens = encoder(sample.features, sample.feature_valid, sample.frame_times,
+                    feature_kind=sample.metadata["feature_kind"], patch_coordinates=sample.patch_coordinates)
                 past = sample.context_frames
                 predictions = predictor(sample.features[:, :past], sample.feature_valid[:, :past], tokens,
                     sample.frame_times[past:] - sample.frame_times[past - 1], past_times=sample.frame_times[:past],
-                    effect_fields=tuple(sample.effect_targets))
+                    effect_fields=tuple(sample.effect_targets), feature_kind=sample.metadata["feature_kind"],
+                    patch_coordinates=sample.patch_coordinates)
                 losses = effect_pretraining_loss(predictions, sample.features[:, past:], sample.feature_valid[:, past:],
                     sample.effect_targets, sample.effect_valid, tokens, config["loss_weights"])
             if not torch.isfinite(losses["total"]):
@@ -175,16 +192,18 @@ def train_video(args):
                 optimizer.step()
                 updates += 1
                 domain_updates[domain] += 1
+                feature_kind_updates[sample.metadata["feature_kind"]] += 1
             metric = {key: float(value.detach()) for key, value in losses.items()}
             metric.update(step=step, domain=domain, updated=updated, source_id=sample.metadata["source_id"])
             log.write(json.dumps(metric, allow_nan=False) + "\n")
             log.flush()
     if str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
-    payload = {"format_version": 1, "kind": "video_effect_pretrain", "config": config,
+    payload = {"format_version": 2, "kind": "video_effect_pretrain", "config": config,
         "encoder": encoder.state_dict(), "predictor": predictor.state_dict(), "optimizer": optimizer.state_dict(),
         "updates": updates, "attempted_steps": start + args.steps, "seed": args.seed,
         "domain_windows": counts, "domain_updates": domain_updates, "source_records": sources,
+        "feature_kind_updates": feature_kind_updates,
         "training_source_records": select_training_sources(sources, {domain for domain, count in counts.items() if count}),
         "feature_space_id": next(iter(feature_spaces)), "effect_schema_id": next(iter(schemas), None),
         "geometry_basis": geometry_basis,
@@ -195,7 +214,8 @@ def train_video(args):
     torch.save(payload, temporary)
     temporary.replace(output / "video_encoder.pt")
     report = {"artifact": str((output / "video_encoder.pt").resolve()), "updates": updates,
-        "domain_windows": counts, "domain_updates": domain_updates, "elapsed_seconds": time.monotonic() - started,
+        "domain_windows": counts, "domain_updates": domain_updates, "feature_kind_updates": feature_kind_updates,
+        "elapsed_seconds": time.monotonic() - started,
         "wam_updated_by_video_loss": False, "robot_execution_evaluated": False}
     write_json(output / "run.json", report)
     return report
@@ -222,10 +242,12 @@ def evaluate_video(args):
         sample = move(load_video_window(path), args.device)
         if not sample.has_training_signal or not sample.feature_valid[:, sample.context_frames:].any():
             continue
+        require_feature_kind(payload, sample.metadata["feature_kind"])
         if sample.features.shape[1] != payload["config"]["window_frames"] or sample.context_frames != payload["config"]["context_frames"]:
             raise ValueError("evaluation must retain the registered context and window lengths")
         selected.append(path)
-        tokens.append(encoder(sample.features, sample.feature_valid, sample.frame_times, noise=False))
+        tokens.append(encoder(sample.features, sample.feature_valid, sample.frame_times, noise=False,
+            feature_kind=sample.metadata["feature_kind"], patch_coordinates=sample.patch_coordinates))
     if len(selected) < 2:
         raise ValueError("need at least two held-out windows with valid future features")
     squared_errors = {name: 0. for name in ("correct_z", "zero_z", "shuffled_z")}
@@ -239,7 +261,8 @@ def evaluate_video(args):
                         ("shuffled_z", tokens[(index + 1) % len(tokens)])):
             prediction = predictor(sample.features[:, :past], sample.feature_valid[:, :past], z,
                 sample.frame_times[past:] - sample.frame_times[past - 1], past_times=sample.frame_times[:past],
-                effect_fields=())["features"]
+                effect_fields=(), feature_kind=sample.metadata["feature_kind"],
+                patch_coordinates=sample.patch_coordinates)["features"]
             squared_errors[name] += float(torch.where(valid, (prediction - target).square(), 0).sum())
     report = {"metric": "heldout_multi_time_feature_mse", "split": args.split,
         "windows": len(selected), "valid_feature_values": count,
@@ -258,6 +281,7 @@ def encode_demonstrations(args):
     """Convert an existing labeled robot sample or observed-only input, retaining its labels."""
     from .cli import file_sha256, write_json
     from .data import load_sample, load_observation
+    from .video_data import patch_grid_coordinates, validate_patch_coordinates
     path, output = Path(args.manifest).resolve(), Path(args.output)
     if output.exists() and any(output.iterdir()):
         raise ValueError("demonstration export requires a fresh output directory")
@@ -276,13 +300,37 @@ def encode_demonstrations(args):
     with np.load(array_path, allow_pickle=False) as archive:
         arrays = {key: archive[key].copy() for key in archive.files}
     for index, (demo, layout) in enumerate(zip(sample.demonstrations, layouts)):
+        if not isinstance(layout, dict) or not {"frames", "tokens_per_frame", "frame_times", "feature_kind"} <= layout.keys():
+            raise ValueError("raw demonstrations require explicit feature_kind, frame/patch layout and times")
         frames, patches = layout["frames"], layout["tokens_per_frame"]
         if type(frames) is not int or type(patches) is not int or min(frames, patches) < 1 or frames * patches != demo.shape[1]:
             raise ValueError("demo layout does not match the ordered feature array")
+        kind, coordinates = layout["feature_kind"], None
+        if kind == "patches":
+            if layout.get("token_order") != "time,height,width,channel":
+                raise ValueError("patch demonstrations require canonical time,height,width,channel token_order")
+            coordinates = patch_grid_coordinates(layout.get("patch_grid"))
+            validate_patch_coordinates(coordinates, layout.get("patch_grid"), layout.get("patch_coordinate_system"))
+            if coordinates.shape[0] != patches:
+                raise ValueError("demo patch_grid does not match tokens_per_frame")
+            coordinates = coordinates.to(args.device)
+        elif kind == "tracked_entities":
+            ids = layout.get("entity_ids")
+            if (not isinstance(ids, list) or len(ids) != patches
+                    or any(type(value) is not int or value < 0 for value in ids) or len(set(ids)) != patches):
+                raise ValueError("tracked demonstrations require stable unique nonnegative entity_ids for their columns")
+            if layout.get("token_order") != "time,entity,channel":
+                raise ValueError("tracked demonstrations require time,entity,channel token_order")
+            if any(name in layout for name in ("patch_grid", "patch_coordinate_system")):
+                raise ValueError("tracked entity IDs are not patch coordinates")
+        else:
+            raise ValueError("demo feature_kind must be patches or tracked_entities")
+        require_feature_kind(payload, kind)
         features = demo.reshape(1, frames, patches, demo.shape[-1]).to(args.device)
         times = torch.tensor(layout["frame_times"], dtype=torch.float32, device=args.device)
         tokens = encoder.encode_demo(features, torch.ones_like(features, dtype=torch.bool), times,
-                                     window_frames=payload["config"]["window_frames"])
+                                     window_frames=payload["config"]["window_frames"],
+                                     feature_kind=kind, patch_coordinates=coordinates)
         arrays[f"demo_view_{index}"] = tokens[0].cpu().numpy()
     meta["raw_demonstration_layouts"] = meta.pop("demonstration_layouts")
     meta["demonstration_encoding"] = encoding_metadata(payload, file_sha256(args.artifact))

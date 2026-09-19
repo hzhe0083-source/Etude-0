@@ -9,7 +9,7 @@ loader never manufactures a human/robot pair from task names or filenames.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "kind": "video_pretrain",
   "arrays": "window-001.npz",
   "sample_id": "recording-17-window-001",
@@ -18,6 +18,8 @@ loader never manufactures a human/robot pair from task names or filenames.
   "domain": "human",
   "feature_space_id": "wan-vae-checkpoint-and-preprocessing-v1",
   "feature_kind": "patches",
+  "patch_grid": [20, 30],
+  "patch_coordinate_system": "normalized_xy_patch_centers",
   "context_frames": 4,
   "provenance": {
     "description": "Recorded source identity, encoder hashes and frame sampling belong here."
@@ -36,7 +38,24 @@ VAE, record the actual source timestamps of the encoded endpoints.
 | `features` | floating `[T,N,D]`; N is patches or stable tracked entities |
 | `feature_valid` | Boolean, exactly `[T,N,D]`; data-owned visibility/availability |
 | `frame_times` | floating `[T]`, finite strictly increasing seconds on the recorded source clock |
+| `patch_coordinates` | only for `patches`: required floating `[N,2]`, actual normalized patch-center `(x,y)` coordinates in feature-slot order |
 | `entity_ids` | only for `tracked_entities`: required int64 `[N]`, unique nonnegative stable IDs |
+
+Patch windows declare their actual `patch_grid=[H,W]`, with `N=H*W`, and
+`patch_coordinate_system="normalized_xy_patch_centers"`. Every grid center
+appears exactly once in `patch_coordinates`; a permutation of the full grid is
+allowed when features, masks and coordinates are permuted together. The grid
+is never inferred from `N`. Coordinates are static within a window and enter
+both the encoder and future-feature predictor before spatial aggregation.
+For zero-based row `r` and column `c`, `x=2*(c+0.5)/W-1` and
+`y=2*(r+0.5)/H-1`, both strictly between -1 and 1. Canonical storage visits
+rows before columns; explicit coordinates also permit a different slot order.
+
+Tracked-entity windows do not supply patch-grid metadata or patch coordinates.
+Each slot represents the same entity throughout the window. The encoder first
+encodes each slot's temporal trajectory, then pools the entity set; numeric
+entity IDs are identity checks, not position features. Reordering the entity
+table consistently across frames does not change the operation representation.
 
 `feature_space_id` identifies the fixed encoder and preprocessing convention,
 including feature dimensions and token order. Different identities cannot be
@@ -47,7 +66,7 @@ throughout an individual context/future window.
 
 `load_video_window(path)` returns `VideoWindow` with batch size 1 on feature,
 mask and target tensors; `frame_times` remains `[T]`. Tracked `entity_ids` becomes
-`[1,N]`. Fully invisible windows are accepted. `has_training_signal` is false
+`[1,N]`. Patch coordinates retain their explicit slot order. Fully invisible windows are accepted. `has_training_signal` is false
 if no context element is observed or no future feature/effect target is valid;
 the training caller must skip its optimizer update. An effect label can supply
 a future target when its feature is occluded, provided context is observed.
@@ -144,6 +163,13 @@ and providing all relevant downstream bridge records. An empty bridge list
 does not establish that an unlisted robot benchmark is uncontaminated.
 
 The separate raw single-video preprocessing entry point may produce Wan patch
-windows with just the three required NPZ arrays. No effect annotations or
+windows with the four required NPZ arrays: features, validity, frame times and
+patch coordinates. No effect annotations or
 robot actions are needed for that initial route. These inputs train only the
 authorized video encoder/reader path, not a new action policy or planner.
+
+Window manifests use format v2; index manifests remain format v1. Old v1
+windows must be regenerated with the actual layout, rather than upgraded by
+guessing a grid. Encoder artifacts and exported operation tokens also carry
+version 2; v1 artifacts cannot resume this architecture and require fresh
+pretraining, demonstration export and downstream reader training.

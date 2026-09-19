@@ -9,13 +9,14 @@ R 仍结合机器人当前场景预测 `g_current/g_remaining`；WAM 在机器�
 
 ## 模块与监督
 
-B 读取整个过程窗口的冻结视觉特征和数据有效掩码，经时间编码与固定数量查询聚合为连续 tokens。
-P 只读取过去的逐实体／patch特征、B 输出和未来时间查询；没有干净未来特征或未来缓存的直接入口。
+B 读取整个过程窗口的冻结视觉特征和数据有效掩码。对于规则 patch，B 在聚合前用非线性映射联合编码内容、有效掩码、真实归一化 patch 中心坐标和时间，再经固定数量查询聚合为连续 tokens。先汇总内容再加位置无法恢复对应关系，因此不采用这种顺序。
+对于跟踪实体，B 先用共享 GRU 沿稳定实体槽位编码时间轨迹，再聚合实体集合；实体编号不作为物理位置或输入特征。同步重排特征、掩码和实体表不应改变表示。
+P 只读取过去的逐实体／patch 特征、B 输出和未来时间查询；patch 路径也读取相同的静态空间坐标，明确自己预测的位置。没有干净未来特征或未来缓存的直接入口。
 过去特征承担外观预测的残差基线。每窗至少有一个过去时刻和两个未来时刻，监督中间过程及终点。
 
 基础目标为有效未来特征的均方误差。有可靠标注时，再加几何误差、独立 Bernoulli 关系／事件损失。
 短视频不需要机器人动作、任务要求或完整关系图就能进入预训练。未知字段不生成负标签；全无监督时也不单独训练容量正则。
-连续 tokens 有固定数量与宽度，可加入训练期噪声和小幅能量正则；这些约束不是正式的信息率界，也不保证相机不变性。
+连续 tokens 有固定数量与宽度，可加入训练期噪声和小幅能量正则 `mean(z²)`；这不是 KL 正则或正式的信息率界，也不保证相机不变性。
 
 `effect_fields=()` 的纯视觉窗口不构造实体两两关系张量；patch数量较大时不会为缺失关系标签支付二次规模成本。
 几何标签必须使用共同、经过审核的坐标约定和单位；单目估计不能伪装成精确三维真值。
@@ -24,6 +25,8 @@ P 只读取过去的逐实体／patch特征、B 输出和未来时间查询；�
 ## 输入与预处理
 
 `video_pretrain` 数据格式见 [video_data.md](video_data.md)。它与包含机器人执行监督的 `training_sample` 是独立类型。
+窗口使用 format v2，patch 数据必须保存真实 `patch_grid=[H,W]`、
+`patch_coordinate_system="normalized_xy_patch_centers"` 和逐槽位的 `patch_coordinates[N,2]`；不能从 patch 数量猜测二维布局。索引仍为 format v1。
 
 ```bash
 evo-wam preprocess-video --manifest /server/raw-human-video.json --output /server/windows/human-001
@@ -42,10 +45,16 @@ evo-wam pretrain-video --config configs/video/U2_effect_constraints.json \
 `bridge_sources` 可将有限的人机任务对应数据加入同一来源审计，不会自动生成训练配对。
 检查点保存来源记录、特征版本、窗口策略、各领域实际窗口数和更新数；用于下游审计的训练来源包含已消费域的完整训练来源组件及相关人机桥边，独立未使用域不冒充已训练。只按需读取特征数组，已消费数组的校验值用于续训一致性检查。
 
+artifact 的 `feature_kind_updates` 分别记录 `patches` 和 `tracked_entities` 的成功训练更新数。两条路径含各自的空间位置或轨迹 GRU 参数，因此导出、评估及原始视频预处理均拒绝成功更新数为0的输入类型。U0 仍可只使用机器人数据，但若要导出人类 patch 示范，其机器人回放必须包含 patch 窗口；只训练跟踪实体不能视为已训练的 patch 编码器。
+
 ## 接入现有机器人训练
 
 已有原始 `demo_view_i` 特征需要提供 `demo_feature_space_id` 和
-`demonstration_layouts: [{frames, tokens_per_frame, frame_times}]`。不能从展平序列猜测视频时间轴。
+`demonstration_layouts`。每个视角显式记录 `frames`、`tokens_per_frame`、
+`frame_times`、`feature_kind="patches"`、`patch_grid`、
+`patch_coordinate_system="normalized_xy_patch_centers"` 和
+`token_order="time,height,width,channel"`。
+展平顺序固定为时间、高度、宽度、通道；不能从展平序列猜测视频时间轴或空间布局。
 
 ```bash
 evo-wam encode-demonstrations --artifact /server/runs/video-effects/video_encoder.pt \
@@ -56,9 +65,11 @@ evo-wam train --config /server/audited-robot-config.json --index /server/encoded
 ```
 
 随后按已有 `reader`、`joint` 路线训练，继续提供相同 `--demo-encoder`。
-真实配置的 `dimensions.demo_dim` 必须等于 B 的 `latent_dim`。`raw_features` 与 `video_effect_tokens` 明确区分；后者记录编码器 SHA256、特征空间、token宽度和窗口策略。
+真实配置的 `dimensions.demo_dim` 必须等于 B 的 `latent_dim`。`raw_features` 与 `video_effect_tokens` 明确区分；后者记录 `encoder_version: 2`、编码器 SHA256、特征空间、token宽度和窗口策略。
 机器人训练把该编码器实际训练来源与所有下游划分联查，防止预训练已经读过所谓“未见示范”。
 检查点和运行记录保留同一身份，推理时换错编码器会拒绝。
+
+本次空间／时间对应修复采用 v2 编码器 artifact。旧 v1 artifact 不能续训到新结构，旧导出缓存也不能继续使用：须按新布局预训练 B、重新导出 `Z_D`，再训练读取器及所需 WAM 适配参数。新增坐标只描述视频内部的空间位置，不要求人机相机标定，也不证明跨视角不变性。
 
 从原始视频直接推理可在 `preprocess-visual` 配置中提供 `demo_encoder_artifact`、`demo_feature_space_id`，可另给 `demo_encoder_sha256`。
 原生 WAM 仍读取 R 生成的作用要求；不会把原始示范或 B 输出直接塞给辅助头绕过主干。

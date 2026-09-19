@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from evo_wam.video_data import patch_grid_coordinates
 from evo_wam.vision import encode_rgb, load_vae, preprocess, preprocess_video, read_video, robot_features, sha256
 
 
@@ -321,7 +322,7 @@ class NativeWanVaeTest(unittest.TestCase):
                 writer.release()
             spec = {"format_version": 1, "kind": "raw_video_pretrain", "video": video.name,
                     "vae_path": "unused-injected-test-encoder", "vae_sha256": {"config.json": "0" * 64},
-                    "size": [32, 32], "fps": 5, "domain": "human", "source_id": "human-clip",
+                    "size": [32, 48], "fps": 5, "domain": "human", "source_id": "human-clip",
                     "source_group": "original-human-recording", "feature_space_id": "tiny-wan-2channels-v1",
                     "split": "train", "window_frames": 3, "context_frames": 1,
                     "continuous_segment_verified": True}
@@ -329,7 +330,7 @@ class NativeWanVaeTest(unittest.TestCase):
             path.write_text(json.dumps(spec))
             report = preprocess_video(path, root / "encoded", device="cpu", vae=self.vae)
             self.assertEqual(report["windows"], 2)
-            self.assertEqual(report["tokens_per_frame"], 4)
+            self.assertEqual(report["tokens_per_frame"], 6)
             self.assertEqual(report["feature_dim"], 2)
             self.assertFalse(report["automatic_effect_labels"])
             self.assertFalse(report["released_vae_run"])
@@ -338,7 +339,7 @@ class NativeWanVaeTest(unittest.TestCase):
             self.assertEqual(index["bridge_sources"], [])
             self.assertEqual([row["split"] for row in index["samples"]], ["train", "train"])
             frames, sampling = read_video(video, 5)
-            expected = encode_rgb(self.vae, frames, [32, 32])[0].permute(1, 2, 3, 0).flatten(1, 2)
+            expected = encode_rgb(self.vae, frames, [32, 48])[0].permute(1, 2, 3, 0).flatten(1, 2)
             expected_times = np.asarray(sampling["frame_indices"])[::4] / sampling["source_fps"]
             np.testing.assert_allclose(expected_times, [0, .8, 1.6, 2.4, 3.2, 4, 4.8])
             for i, entry in enumerate(index["samples"]):
@@ -351,12 +352,16 @@ class NativeWanVaeTest(unittest.TestCase):
                 self.assertEqual(window.context_frames, 1)
                 self.assertEqual(window.metadata["source_group"], spec["source_group"])
                 self.assertEqual(window.metadata["feature_kind"], "patches")
+                self.assertEqual(window.metadata["format_version"], 2)
+                self.assertEqual(window.metadata["patch_grid"], [2, 3])
+                self.assertEqual(window.metadata["patch_coordinate_system"], "normalized_xy_patch_centers")
+                torch.testing.assert_close(window.patch_coordinates, patch_grid_coordinates([2, 3]))
                 provenance = window.metadata["provenance"]
                 self.assertTrue(provenance["injected_test_encoder"])
                 self.assertEqual(provenance["source_video_sha256"], sha256(video))
                 self.assertEqual(provenance["window_policy"]["discarded_tail_frames"], 1)
                 with np.load(window_path.with_suffix(".npz"), allow_pickle=False) as arrays:
-                    self.assertEqual(set(arrays.files), {"features", "feature_valid", "frame_times"})
+                    self.assertEqual(set(arrays.files), {"features", "feature_valid", "frame_times", "patch_coordinates"})
             with self.assertRaises(ValueError):
                 preprocess_video(path, root / "encoded", device="cpu", vae=self.vae)
 
@@ -432,8 +437,12 @@ class NativeWanVaeTest(unittest.TestCase):
             self.assertEqual(metadata["view_ids"], ["front", "side"])
             self.assertEqual(metadata["demonstration_encoding"], {"kind": "raw_features"})
             self.assertEqual(metadata["demonstration_layouts"], [
-                {"frames": 3, "tokens_per_frame": 4, "frame_times": [0., .4, .8]},
-                {"frames": 3, "tokens_per_frame": 4, "frame_times": [0., .4, .8]},
+                {"frames": 3, "tokens_per_frame": 4, "frame_times": [0., .4, .8], "feature_kind": "patches",
+                 "patch_grid": [2, 2], "patch_coordinate_system": "normalized_xy_patch_centers",
+                 "token_order": "time,height,width,channel"},
+                {"frames": 3, "tokens_per_frame": 4, "frame_times": [0., .4, .8], "feature_kind": "patches",
+                 "patch_grid": [2, 2], "patch_coordinate_system": "normalized_xy_patch_centers",
+                 "token_order": "time,height,width,channel"},
             ])
             self.assertTrue(provenance["injected_test_encoder"])
             self.assertFalse(report["released_vae_run"])
@@ -484,15 +493,18 @@ class NativeWanVaeTest(unittest.TestCase):
                 feature_window = front.permute(0, 2, 3, 4, 1).flatten(2, 3)
                 valid_window = torch.ones_like(feature_window, dtype=torch.bool)
                 times = torch.tensor([0., .4, .8])
-                z = effect_encoder(feature_window, valid_window, times)
-                prediction = predictor(feature_window[:, :1], valid_window[:, :1], z, times[1:], past_times=times[:1])
+                coordinates = patch_grid_coordinates([2, 2])
+                z = effect_encoder(feature_window, valid_window, times, feature_kind="patches", patch_coordinates=coordinates)
+                prediction = predictor(feature_window[:, :1], valid_window[:, :1], z, times[1:], past_times=times[:1],
+                                       feature_kind="patches", patch_coordinates=coordinates)
                 update_loss = (prediction["features"] - feature_window[:, 1:]).square().mean()
                 update_loss.backward()
                 self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in effect_encoder.parameters()))
                 optimizer.step()
             effect_encoder.eval().requires_grad_(False)
             artifact = root / "synthetic-video-encoder.pt"
-            payload = {"format_version": 1, "kind": "video_effect_pretrain", "updates": 1,
+            payload = {"format_version": 2, "kind": "video_effect_pretrain", "updates": 1,
+                       "feature_kind_updates": {"patches": 1, "tracked_entities": 0},
                        "feature_space_id": "tiny-wan-2channels-v1", "encoder": effect_encoder.state_dict(),
                        "config": {"window_frames": 3, "context_frames": 1,
                                   "model": {"feature_dim": 2, "latent_dim": 4, "num_tokens": 2,
@@ -507,21 +519,28 @@ class NativeWanVaeTest(unittest.TestCase):
             encoded_loaded = load_observation(encoded_report["manifest"])
             encoded_meta = json.loads(Path(encoded_report["manifest"]).read_text())
             self.assertNotIn("demonstration_layouts", encoded_meta)
+            self.assertEqual(encoded_meta["raw_demonstration_layouts"], metadata["demonstration_layouts"])
             self.assertEqual(encoded_meta["demonstration_encoding"], {
-                "kind": "video_effect_tokens", "encoder_sha256": sha256(artifact),
+                "kind": "video_effect_tokens", "encoder_version": 2, "encoder_sha256": sha256(artifact),
                 "feature_space_id": payload["feature_space_id"], "token_dim": 4,
                 "window_frames": 3, "num_tokens": 2})
             self.assertEqual(encoded_meta["visual_provenance"]["demonstration_window_policy"]["stride"], "nonoverlapping")
             for latent, tokens in zip((front, wrist), encoded_loaded.demonstrations):
                 values = latent.permute(0, 2, 3, 4, 1).flatten(2, 3)
                 with torch.no_grad():
-                    expected_tokens = effect_encoder.encode_demo(values, torch.ones_like(values, dtype=torch.bool), times, window_frames=3)
+                    expected_tokens = effect_encoder.encode_demo(values, torch.ones_like(values, dtype=torch.bool), times, window_frames=3,
+                                                                feature_kind="patches", patch_coordinates=coordinates)
                 torch.testing.assert_close(tokens, expected_tokens)
             for mismatch in ({"demo_encoder_sha256": "0" * 64}, {"demo_feature_space_id": "wrong-space"}):
                 encoded_path.write_text(json.dumps({**encoded_spec, **mismatch}))
                 with self.subTest(mismatch=mismatch), self.assertRaises(ValueError):
                     preprocess(encoded_path, root / "rejected-artifact", device="cpu", vae=self.vae)
                 self.assertFalse((root / "rejected-artifact").exists())
+            torch.save({**payload, "feature_kind_updates": {"patches": 0, "tracked_entities": 1}}, artifact)
+            encoded_path.write_text(json.dumps({**encoded_spec, "demo_encoder_sha256": sha256(artifact)}))
+            with patch("evo_wam.vision.encode_rgb", side_effect=AssertionError("untrained patch route must fail before video encoding")):
+                with self.assertRaisesRegex(ValueError, "no successful patches updates"):
+                    preprocess(encoded_path, root / "untrained-patch-route", device="cpu", vae=self.vae)
 
 
 if __name__ == "__main__":

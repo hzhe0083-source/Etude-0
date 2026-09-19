@@ -38,11 +38,27 @@ def _times(times: Tensor, count: int, reference: Tensor, *, future=False) -> Ten
     return times.to(device=reference.device, dtype=reference.dtype)
 
 
+def _positions(feature_kind: str, coordinates: Tensor | None, reference: Tensor) -> Tensor | None:
+    """Patch locations are observed inputs; entity table indices are never locations."""
+    if feature_kind == "tracked_entities":
+        if coordinates is not None:
+            raise ValueError("tracked entities must not use patch coordinates or entity IDs as positions")
+        return None
+    if feature_kind != "patches":
+        raise ValueError("feature_kind must be patches or tracked_entities")
+    if (not isinstance(coordinates, Tensor) or coordinates.shape != (reference.shape[2], 2)
+            or not coordinates.is_floating_point() or not torch.isfinite(coordinates).all()
+            or (coordinates.abs() >= 1).any() or coordinates.unique(dim=0).shape[0] != reference.shape[2]):
+        raise ValueError("patches require unique finite normalized xy patch centers [N,2] in (-1,1)")
+    return coordinates.to(reference)
+
+
 class VideoEffectEncoder(nn.Module):
     """Encode a process-and-result window into fixed K continuous tokens.
 
-    Time is ordered; entity slots form a set. Observed object identity comes
-    from features, not slot IDs. ``feature_valid`` describes visible input data,
+    Patches bind content to explicit image coordinates before pooling. Stable
+    entity trajectories are encoded before set pooling, without ID features.
+    ``feature_valid`` describes visible input data,
     not a model confidence prediction. Tokens are bounded by tanh and optional
     clipped Gaussian perturbation; this is not a formal information-rate bound.
     """
@@ -58,13 +74,17 @@ class VideoEffectEncoder(nn.Module):
         self.num_tokens, self.hidden_dim, self.noise_std = num_tokens, hidden_dim, float(noise_std)
         self.features = nn.Linear(2 * feature_dim, hidden_dim)
         self.time = nn.Sequential(nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.position = nn.Linear(2, hidden_dim, bias=False)
+        self.mix = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+        self.trajectory = nn.GRUCell(hidden_dim, hidden_dim)
         self.queries = nn.Parameter(torch.randn(num_tokens, hidden_dim) / math.sqrt(hidden_dim))
         self.keys = nn.Linear(hidden_dim, hidden_dim)
         self.values = nn.Linear(hidden_dim, hidden_dim)
         self.output = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, latent_dim))
 
     def forward(self, features: Tensor, feature_valid: Tensor, frame_times: Tensor,
-                noise: bool = True) -> Tensor:
+                noise: bool = True, *, feature_kind: str,
+                patch_coordinates: Tensor | None = None) -> Tensor:
         clean = _observed(features, feature_valid, "window")
         if features.shape[-1] != self.feature_dim:
             raise ValueError("window feature dimension differs from encoder")
@@ -75,6 +95,21 @@ class VideoEffectEncoder(nn.Module):
         relative = torch.log1p(times - times[0])
         hidden = self.features(torch.cat((clean, feature_valid.to(clean.dtype)), -1))
         hidden = hidden + self.time(relative[:, None])[None, :, None]
+        coordinates = _positions(feature_kind, patch_coordinates, features)
+        if coordinates is not None:
+            hidden = hidden + self.position(coordinates)[None, None]
+        # A nonlinear content-position-time interaction must precede pooling.
+        hidden = self.mix(hidden)
+        if feature_kind == "tracked_entities":
+            batch, length, entities, width = hidden.shape
+            state = hidden.new_zeros(batch * entities, width)
+            trajectory = []
+            for step in range(length):
+                candidate = self.trajectory(hidden[:, step].reshape(batch * entities, width), state)
+                observed = feature_valid[:, step].any(-1).reshape(-1, 1)
+                state = torch.where(observed, candidate, state)
+                trajectory.append(state.reshape(batch, entities, width))
+            hidden = torch.stack(trajectory, dim=1)
         hidden = hidden.flatten(1, 2)
         scores = torch.einsum("kd,bsd->bks", self.queries, self.keys(hidden)) / math.sqrt(self.hidden_dim)
         scores = scores.masked_fill(~present[:, None], torch.finfo(scores.dtype).min)
@@ -85,7 +120,8 @@ class VideoEffectEncoder(nn.Module):
         return tokens
 
     def encode_demo(self, features: Tensor, feature_valid: Tensor, frame_times: Tensor,
-                    window_frames: int = 5) -> Tensor:
+                    window_frames: int = 5, *, feature_kind: str,
+                    patch_coordinates: Tensor | None = None) -> Tensor:
         """Ordered nonoverlapping windows; preserve every real tail frame.
 
         A short tail repeats the final numeric value but marks padded entries
@@ -109,7 +145,8 @@ class VideoEffectEncoder(nn.Module):
                 valid = torch.cat((valid, torch.zeros_like(valid[:, -1:]).expand(-1, padding, -1, -1)), 1)
                 future_times = window_times[-1] + step * torch.arange(1, padding + 1, device=times.device, dtype=times.dtype)
                 window_times = torch.cat((window_times, future_times))
-            output.append(self(window, valid, window_times, noise=False))
+            output.append(self(window, valid, window_times, noise=False,
+                               feature_kind=feature_kind, patch_coordinates=patch_coordinates))
         return torch.cat(output, 1)
 
 
@@ -132,6 +169,7 @@ class EffectFeaturePredictor(nn.Module):
         self.feature_dim, self.latent_dim, self.hidden_dim = feature_dim, latent_dim, hidden_dim
         self.geometry_dim, self.relation_dim, self.event_dim = geometry_dim, relation_dim, event_dim
         self.history = nn.GRU(2 * feature_dim + 1, hidden_dim, batch_first=True)
+        self.position = nn.Linear(2, hidden_dim, bias=False)
         self.token_keys = nn.Linear(latent_dim, hidden_dim)
         self.token_values = nn.Linear(latent_dim, hidden_dim)
         self.time = nn.Sequential(nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
@@ -143,7 +181,8 @@ class EffectFeaturePredictor(nn.Module):
 
     def forward(self, past: Tensor, past_valid: Tensor, tokens: Tensor, query_times: Tensor,
                 *, past_times: Tensor | None = None,
-                effect_fields: tuple[str, ...] | None = None) -> dict[str, Tensor]:
+                effect_fields: tuple[str, ...] | None = None, feature_kind: str,
+                patch_coordinates: Tensor | None = None) -> dict[str, Tensor]:
         clean = _observed(past, past_valid, "past")
         batch, length, entities, width = past.shape
         if width != self.feature_dim:
@@ -165,6 +204,9 @@ class EffectFeaturePredictor(nn.Module):
         inputs = inputs.transpose(1, 2).reshape(batch * entities, length, -1)
         _, encoded = self.history(inputs)
         state = encoded[-1].reshape(batch, entities, self.hidden_dim)
+        coordinates = _positions(feature_kind, patch_coordinates, past)
+        if coordinates is not None:
+            state = state + self.position(coordinates)[None]
         queries = _times(query_times, query_times.numel(), past, future=True)
         state = state[:, None] + self.time(torch.log1p(queries[:, None]))[None, :, None]
         scores = torch.einsum("bqnd,bkd->bqnk", state, self.token_keys(tokens)) / math.sqrt(self.hidden_dim)

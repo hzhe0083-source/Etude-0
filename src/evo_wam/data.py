@@ -122,7 +122,10 @@ def validate_demo_encoding(meta: Mapping, width: int) -> dict:
         if set(encoding) != {"kind"}:
             raise ValueError("raw_features encoding accepts only its kind")
         return {"kind": "raw_features"}
-    fields = {"kind", "encoder_sha256", "feature_space_id", "token_dim", "window_frames", "num_tokens"}
+    if encoding.get("kind") == "video_effect_tokens" and (
+            type(encoding.get("encoder_version")) is not int or encoding["encoder_version"] != 2):
+        raise ValueError("video_effect_tokens require encoder_version 2; re-pretrain and re-export legacy tokens")
+    fields = {"kind", "encoder_version", "encoder_sha256", "feature_space_id", "token_dim", "window_frames", "num_tokens"}
     if encoding.get("kind") != "video_effect_tokens" or set(encoding) != fields:
         raise ValueError("video_effect_tokens requires exact encoder identity, feature space and token configuration")
     digest = encoding["encoder_sha256"]

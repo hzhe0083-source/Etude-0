@@ -81,8 +81,12 @@ ROI 完全不可见或时间不齐会报错；未来可接已验证的状态估�
 `window_stride_frames`，其值须在 1 到窗口长度之间。不足一个完整窗口的尾部
 丢弃并记录，不能补成虚假的未来监督。机器人视频可另填真实 `trajectory_id`。
 
-输出 `index.json` 与多个 `window_*.json/.npz`。每个 NPZ 仅含
-`features[T,H*W,C]`、同形 Boolean `feature_valid`、`frame_times[T]`。
+输出 format v1 的 `index.json` 与多个 format v2 的 `window_*.json/.npz`。
+窗口元数据记录真实 latent `patch_grid=[H,W]` 和
+`patch_coordinate_system="normalized_xy_patch_centers"`；每个 NPZ 仅含
+`features[T,H*W,C]`、同形 Boolean `feature_valid`、`frame_times[T]` 和
+`patch_coordinates[H*W,2]`。坐标按高度、宽度展开后的槽位顺序保存，不能从 token 数量猜测网格。
+第 `r` 行、第 `c` 列的中心坐标为 `x=2*(c+0.5)/W-1`、`y=2*(r+0.5)/H-1`，行列从0计数。
 时间使用实际采样原始帧索引的编码端点 `frame_indices[::4] / source_fps`，
 保留源视频秒数，不伪装成机器人控制步。先因果编码完整片段，再切分特征窗口；
 每窗保留源文件哈希、VAE 哈希、分辨率、采样率、端点索引和窗口策略。
@@ -96,13 +100,18 @@ ROI 完全不可见或时间不齐会报错；未来可接已验证的状态估�
 原 `raw_visual_observation` 可增加 `demo_encoder_artifact` 本地路径、必填的
 `demo_feature_space_id`，以及可选 `demo_encoder_sha256`。预处理先核对实际 artifact
 哈希与特征空间，再将每段归一化 Wan 特征 `[1,T,H*W,C]`、全有效观测掩码和源视频
-端点秒数送入冻结编码器的 `encode_demo`，按 artifact 的 `window_frames` 生成有序
+端点秒数及真实 patch 布局送入冻结编码器的 `encode_demo`，按 artifact 的 `window_frames` 生成有序
 作用 tokens；无随机扰动，不更新 W。
 
-输出的 `demonstration_encoding` 记录编码器 SHA256、特征空间、token 维度、窗口长度
+输出的 `demonstration_encoding` 记录 `encoder_version: 2`、编码器 SHA256、特征空间、token 维度、窗口长度
 和每窗 token 数，供下游机器人 reader artifact 核对。完整窗口策略另记入视觉来源：
 非重叠分窗，尾部只重复数值并标记为无效，绝不把补齐项当作观测。
 
 未提供 B artifact 时继续输出 `raw_features`，并新增 `demonstration_layouts`，为每个
-视角记录 `frames/tokens_per_frame/frame_times`。转换既有数据时必须使用这些时间和布局，
-不能根据扁平 token 总数猜测帧数。B 已编码模式不会把作用 tokens 冒充原始 patch 布局。
+视角记录 `frames/tokens_per_frame/frame_times`、`feature_kind="patches"`、
+`patch_grid`、`patch_coordinate_system="normalized_xy_patch_centers"` 和
+`token_order="time,height,width,channel"`。
+顺序固定为时间、高度、宽度、通道。转换既有数据时必须使用这些时间和布局，
+不能根据扁平 token 总数猜测帧数或网格。B 已编码模式不会把作用 tokens 冒充原始 patch 布局。
+
+空间／时间对应修复后的 B artifact 为 v2。v1 artifact 和旧作用 token 缓存须重新预训练／导出，再训练对应读取器；不能把旧编码器身份用于新结构或从旧 artifact 续训。

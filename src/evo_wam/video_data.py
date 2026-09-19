@@ -15,10 +15,47 @@ from torch import Tensor
 EFFECT_FIELDS = ("geometry", "relations", "events")
 EFFECT_METADATA = ("effect_schema_id", "geometry_frame", "geometry_units", "evidence_source")
 SPLITS = {"train", "validation", "test"}
+PATCH_COORDINATE_SYSTEM = "normalized_xy_patch_centers"
 _BASE_METADATA = {
     "format_version", "kind", "arrays", "sample_id", "source_id", "source_group",
-    "domain", "feature_space_id", "feature_kind", "context_frames",
+    "domain", "feature_space_id", "feature_kind", "context_frames", "patch_grid",
+    "patch_coordinate_system",
 }
+
+
+def _patch_grid(grid: Sequence[int]) -> tuple[int, int]:
+    if (not isinstance(grid, (list, tuple)) or len(grid) != 2
+            or any(type(size) is not int or size < 1 for size in grid)):
+        raise ValueError("patch_grid must explicitly provide positive integer [height, width]; regenerate from the visual encoder, never infer it from N")
+    return tuple(grid)
+
+
+def patch_grid_coordinates(grid: Sequence[int]) -> Tensor:
+    """Normalized (x,y) patch centers in canonical row-major (y,x) order."""
+    height, width = _patch_grid(grid)
+    y, x = torch.meshgrid((torch.arange(height, dtype=torch.float32) + 0.5) * (2 / height) - 1,
+                          (torch.arange(width, dtype=torch.float32) + 0.5) * (2 / width) - 1,
+                          indexing="ij")
+    return torch.stack((x, y), dim=-1).reshape(-1, 2)
+
+
+def validate_patch_coordinates(coordinates: Tensor, grid: Sequence[int], coordinate_system: str) -> Tensor:
+    """Validate complete grid coverage while preserving the NPZ's storage order."""
+    if coordinate_system != PATCH_COORDINATE_SYSTEM:
+        raise ValueError(f"patch_coordinate_system must be {PATCH_COORDINATE_SYSTEM!r}")
+    height, width = _patch_grid(grid)
+    if (not isinstance(coordinates, Tensor) or not coordinates.is_floating_point()
+            or coordinates.shape != (height * width, 2) or not torch.isfinite(coordinates).all()
+            or (coordinates.abs() >= 1).any()):
+        raise ValueError("patch_coordinates must be finite floating [N,2] centers for the explicit patch_grid")
+    coordinates = coordinates.float()
+    cells = ((coordinates + 1) * coordinates.new_tensor([width, height]) / 2 - 0.5).round().long()
+    indices = cells[:, 1] * width + cells[:, 0]
+    expected = patch_grid_coordinates(grid).to(coordinates.device)
+    if (indices.min() < 0 or indices.max() >= height * width or indices.unique().numel() != height * width
+            or not torch.allclose(coordinates, expected[indices], atol=1e-6, rtol=0)):
+        raise ValueError("patch_coordinates must contain each explicit patch_grid center exactly once")
+    return coordinates
 
 
 def _text(record: Mapping, name: str) -> str:
@@ -39,8 +76,9 @@ def _local_path(parent: Path, name: str, suffix: str) -> Path:
 
 def _metadata(path: Path) -> dict:
     metadata = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(metadata, dict) or metadata.get("format_version") != 1 or metadata.get("kind") != "video_pretrain":
-        raise ValueError("expected a version-1 video_pretrain window")
+    if (not isinstance(metadata, dict) or type(metadata.get("format_version")) is not int
+            or metadata["format_version"] != 2 or metadata.get("kind") != "video_pretrain"):
+        raise ValueError("expected a version-2 video_pretrain window; regenerate old windows from the visual encoder with explicit patch_grid and patch_coordinates (never infer a grid from N)")
     allowed = _BASE_METADATA | set(EFFECT_METADATA) | {"trajectory_id", "provenance"}
     if set(metadata) - allowed:
         raise ValueError("video windows accept only their explicit unpaired schema; put source details in provenance")
@@ -50,6 +88,12 @@ def _metadata(path: Path) -> dict:
         raise ValueError("domain must be human or robot")
     if metadata.get("feature_kind") not in {"patches", "tracked_entities"}:
         raise ValueError("feature_kind must be patches or tracked_entities")
+    if metadata["feature_kind"] == "patches":
+        _patch_grid(metadata.get("patch_grid"))
+        if metadata.get("patch_coordinate_system") != PATCH_COORDINATE_SYSTEM:
+            raise ValueError(f"patch_coordinate_system must explicitly be {PATCH_COORDINATE_SYSTEM!r}")
+    elif {"patch_grid", "patch_coordinate_system"} & set(metadata):
+        raise ValueError("tracked_entities cannot declare patch grid metadata; entity storage IDs are not positions")
     if type(metadata.get("context_frames")) is not int or metadata["context_frames"] < 1:
         raise ValueError("context_frames must be a positive integer")
     if "trajectory_id" in metadata:
@@ -74,6 +118,7 @@ class VideoWindow:
     effect_targets: dict[str, Tensor] # optional geometry [1,T-P,N,G], pairs [1,T-P,N,N,C/E]
     effect_valid: dict[str, Tensor]   # bool, matching each supplied effect target
     entity_ids: Tensor | None = None  # tracked entities only: int64 [1,N]
+    patch_coordinates: Tensor | None = None  # patches only: float [N,2], in storage order
 
     @property
     def has_training_signal(self) -> bool:
@@ -101,9 +146,9 @@ def load_video_window(manifest_path: str | Path) -> VideoWindow:
     with np.load(arrays_path, allow_pickle=False) as archive:
         arrays = {name: torch.from_numpy(archive[name].copy()) for name in archive.files}
     required = {"features", "feature_valid", "frame_times"}
-    allowed = required | {"entity_ids"} | {key for field in EFFECT_FIELDS for key in (field, f"{field}_valid")}
+    allowed = required | {"entity_ids", "patch_coordinates"} | {key for field in EFFECT_FIELDS for key in (field, f"{field}_valid")}
     if not required <= set(arrays) or set(arrays) - allowed:
-        raise ValueError("video NPZ needs features/feature_valid/frame_times and only optional entity/effect fields")
+        raise ValueError("video NPZ needs features/feature_valid/frame_times and only optional patch/entity/effect fields")
     features, valid = arrays["features"], arrays["feature_valid"]
     if features.ndim != 3 or min(features.shape) < 1:
         raise ValueError("features must be nonempty [T,N,D]")
@@ -118,13 +163,20 @@ def load_video_window(manifest_path: str | Path) -> VideoWindow:
         raise ValueError("frame_times must be finite floating [T] strictly increasing seconds")
 
     ids = arrays.get("entity_ids")
+    coordinates = arrays.get("patch_coordinates")
     tracked = metadata["feature_kind"] == "tracked_entities"
     if tracked:
+        if coordinates is not None:
+            raise ValueError("tracked_entities cannot use patch_coordinates; entity storage IDs are not positions")
         if (ids is None or ids.dtype != torch.int64 or ids.shape != (entities,)
                 or (ids < 0).any() or ids.unique().numel() != entities):
             raise ValueError("tracked_entities requires stable unique nonnegative entity_ids [N]")
-    elif ids is not None:
-        raise ValueError("patch indices cannot be presented as tracked entity IDs")
+    else:
+        if ids is not None:
+            raise ValueError("patch indices cannot be presented as tracked entity IDs")
+        coordinates = validate_patch_coordinates(coordinates, metadata["patch_grid"], metadata["patch_coordinate_system"])
+        if coordinates.shape[0] != entities:
+            raise ValueError("patch_grid and patch_coordinates must match the feature patch axis N")
 
     targets, masks = {}, {}
     for field in EFFECT_FIELDS:
@@ -146,7 +198,7 @@ def load_video_window(manifest_path: str | Path) -> VideoWindow:
         for name in EFFECT_METADATA:
             _text(metadata, name)
     return VideoWindow(metadata, features.unsqueeze(0), valid.unsqueeze(0), times, context,
-                       targets, masks, None if ids is None else ids.unsqueeze(0))
+                       targets, masks, None if ids is None else ids.unsqueeze(0), coordinates)
 
 
 def _source_components(records: Sequence[Mapping]) -> list[tuple[int, ...]]:

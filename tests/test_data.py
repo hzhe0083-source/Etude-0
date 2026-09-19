@@ -82,7 +82,7 @@ def write_fixture(directory: Path):
 class DataTests(unittest.TestCase):
     def test_demo_encoding_identity_is_explicit_and_shape_checked(self):
         self.assertEqual(validate_demo_encoding({}, 4), {"kind": "raw_features"})
-        encoding = {"kind": "video_effect_tokens", "encoder_sha256": "AB" * 32,
+        encoding = {"kind": "video_effect_tokens", "encoder_version": 2, "encoder_sha256": "AB" * 32,
                     "feature_space_id": "frozen-visual-v1", "token_dim": 4,
                     "window_frames": 3, "num_tokens": 2}
         normalized = validate_demo_encoding({"demonstration_encoding": encoding}, 4)
@@ -96,6 +96,12 @@ class DataTests(unittest.TestCase):
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_demo_encoding({"demonstration_encoding": value}, 4)
+        for version in (None, 1, True, "2"):
+            legacy = {**encoding, "encoder_version": version}
+            if version is None:
+                legacy.pop("encoder_version")
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, "re-pretrain and re-export"):
+                validate_demo_encoding({"demonstration_encoding": legacy}, 4)
 
     def test_demo_encoding_is_preserved_by_both_loaders_and_widths_must_match(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -103,7 +109,7 @@ class DataTests(unittest.TestCase):
             meta, arrays = write_fixture(root)
             self.assertEqual(load_sample(root / "sample.json").demonstration_encoding, {"kind": "raw_features"})
             meta["demonstration_encoding"] = {
-                "kind": "video_effect_tokens", "encoder_sha256": "cd" * 32,
+                "kind": "video_effect_tokens", "encoder_version": 2, "encoder_sha256": "cd" * 32,
                 "feature_space_id": "frozen-visual-v1", "token_dim": 4,
                 "window_frames": 3, "num_tokens": 2,
             }

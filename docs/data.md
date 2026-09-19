@@ -1,4 +1,4 @@
-# Paired data and experiment inputs
+# Single-view data, optional synchronized pairs, and experiment inputs
 
 `evo_wam.data` owns sampling and validates inputs. It does not infer contacts,
 task necessity, human/robot alignment, or camera calibration from a filename.
@@ -21,6 +21,7 @@ to model tokens or task text.
   "coordinate_frame": "robot_base",
   "control_dt": 0.05,
   "view_ids": ["front", "side"],
+  "pair_kind": "synchronized_views",
   "task_annotation": "audited-requirements-v2",
   "actions_per_frame": 2,
   "action_space": {
@@ -38,9 +39,10 @@ to model tokens or task text.
 }
 ```
 
-The two views must belong to the same original synchronized human execution.
-The manifest identifies exactly one robot history/trajectory/window, so the
-views cannot accidentally refer to different robot futures. `window_start`
+Robot-supervised `training_sample` records accept **one or two** recorded
+demonstration views. The manifest identifies exactly one robot
+history/trajectory/window, so demonstrations cannot accidentally refer to
+different robot targets. `window_start`
 is the absolute control-step index of the current robot state; all offsets
 below are relative to that state. `executed_steps` is the number of actions
 actually executed from the stored plan, excluding any replacement continuation.
@@ -50,6 +52,62 @@ v2 intentionally: missing historical commands or new semantic/evidence labels
 in v1 cannot safely be reconstructed, so the loader rejects v1. Migration must
 return to recorded commands, timing and annotations; never fill missing evidence
 with `True` or copy candidate actions into history.
+
+`pair_kind` is `none` or `synchronized_views`. A synchronized pair needs exactly
+two distinct view IDs and an audited common source execution/time interval;
+only that explicit declaration permits cross-view consistency. Two video
+arrays, the same task label, crops or color augmentations do not establish a
+reliable viewpoint pair. A single view uses `pair_kind="none"` and only its
+own arrays and evidence masks; it is never copied into a second branch.
+
+Existing v2 two-view files without `pair_kind` still load, conservatively as
+`none`: their supervised branches remain available, but CV is disabled until
+sync provenance has been audited and declared. The updated paired fixture
+explicitly declares synchronization. A two-view `none` record does not imply
+matching viewpoints or time; both demonstrations still need the independently
+annotated robot task targets for that record. Different original human source
+recordings should be separate records with their own `source_id`.
+
+An ordinary unpaired video with no robot trajectory, actions or task labels
+is **not** a `training_sample`. It belongs to the separate `video_pretrain`
+data kind and pretraining loader. Do not fabricate a robot example or demand
+a synchronized partner to admit that video into representation pretraining.
+
+## Demonstration encoding identity
+
+Feature width alone does not distinguish visual features from learned effect
+tokens. Both training and observation manifests can carry
+`demonstration_encoding`; omitting it preserves v2 behavior as exactly
+`{"kind":"raw_features"}`. An explicit raw declaration accepts no other keys.
+Learned tokens must declare this exact structure:
+
+```json
+{
+  "demonstration_encoding": {
+    "kind": "video_effect_tokens",
+    "encoder_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "feature_space_id": "audited-frozen-visual-feature-space",
+    "token_dim": 32,
+    "window_frames": 3,
+    "num_tokens": 4
+  }
+}
+```
+
+The digest identifies the actual encoder artifact, not a model nickname; the
+loader normalizes its hex representation to lowercase. `feature_space_id`
+must be nonempty, `token_dim` must match the actual final feature axis,
+`window_frames` must be at least 3, and `num_tokens` must be positive. All views
+in one record must share their feature width and encoding declaration. Unknown
+fields, explicit null metadata or mismatched widths are rejected.
+
+`validate_demo_encoding(manifest, width)` returns the normalized identity.
+`LoadedSample.demonstration_encoding` derives it from metadata, while
+`Observation.demonstration_encoding` carries it into deployment. Training,
+checkpoint loading and policy use must compare this identity with their
+registered encoder; equal dimensions alone never permit raw/token substitution.
+The data loader validates the declaration but does not load encoder weights or
+claim that a digest has been verified against an artifact by itself.
 
 `load_sample(path)` returns a `LoadedSample`, adding batch size 1 to arrays
 except time grids. It calls the semantic contracts' `validate()` methods.
@@ -70,7 +128,7 @@ binary, allowing contact, support, and grasp to coexist.
 | `observed_action_step_offsets` | `[K]`, int64, increasing command-end offsets relative to current observation, all `<=0` |
 | `observed_video_step_offsets` | `[F]`, int64, increasing observed frame offsets, all `<=0` |
 | `actions` | `[H,A]`, finite floating planned actions |
-| `demo_view_0`, `demo_view_1` | finite floating deterministic view inputs, at least two axes |
+| `demo_view_i` | one finite floating deterministic input per declared view; no `demo_view_1` for a single-view record |
 | `outcome_geometry` | `[T,N,Dg]`, floating |
 | `outcome_relations`, `outcome_events` | `[T,N,N,C]`, `[T,N,N,E]`, floating binary labels where valid |
 | `outcome_{field}_valid` | Boolean, exactly the matching outcome shape |
@@ -86,7 +144,7 @@ binary, allowing contact, support, and grasp to coexist.
 | `view{v}_relations_valid`, `view{v}_events_valid` | matching physical relation/event shape, Boolean per-view evidence validity |
 
 Here `part` is `current` or `remaining`, `field` is `geometry`, `relations`,
-or `events`, and `v` is 0 or 1. Requirements may refer beyond the local plan;
+or `events`, and `v` ranges over the one or two recorded views. Requirements may refer beyond the local plan;
 physical outcome offsets may not exceed `H`. Required masks, valid labels,
 and model uncertainty are distinct. Actual trajectory events must not simply
 be copied into necessary-event annotations.
@@ -116,12 +174,12 @@ beyond what has already been executed. An event's absence is valid only when
 its entire annotated interval was observed. The producer must mark missing or
 partially observed intervals invalid; the loader does not manufacture negatives.
 
-`per_view_valid=(left,right)` preserves both independent data-owned evidence
-maps. Keys use dots, e.g. `current.binding`, `remaining.event_windows`; physical
+`per_view_valid=(view0,)` or `(view0,view1)` preserves each independent data-owned
+evidence map. Keys use dots, e.g. `current.binding`, `remaining.event_windows`; physical
 head keys are `relations` and `events`. The loader does not AND the views or
 replace evidence with label availability. Training intersects each view's
-evidence with that field's `label_valid`; CV additionally intersects the two
-views. Prediction confidence never changes these masks. An occluded view's
+evidence with that field's `label_valid`; optional CV additionally intersects
+the two synchronized views. Prediction confidence never changes these masks. An occluded view's
 missing evidence must not delete the other view's valid supervision.
 
 `np.load(..., allow_pickle=False)` rejects objects. Exact NPZ keys, contract
@@ -210,7 +268,8 @@ streams are useful only for deterministic integration/replay checks.
 ## Shared denoising and condition dropping
 
 `prepare_training_input` calls the history encoder once and each target encoder
-once, then shares the resulting `DenoisingInput` objects between branches.
+once for one or two conditional views; two branches share the resulting
+`DenoisingInput` objects.
 Every named target has its own sigma table, query offset, Gaussian draw, and
 time draw. Pass tables from the pinned upstream `FlowMatchScheduler`; the data
 module does not implement another schedule. `time_dim=2` supports native
@@ -219,8 +278,12 @@ noise, time and query offset are identical; across targets they are independent
 draws using the respective tables. Robot augmentations belong before this
 shared encoder call, never independently inside each view branch.
 
-The selector draws a 90% conditional pair or one 10% unconditional branch.
-Conditional pairs retain both demonstrations and use empty task text.
+The selector draws a 90% conditional example or one 10% unconditional branch.
+Conditional examples retain their actual one or two demonstrations and use
+empty task text. Its `pair_kind` argument defaults to `none`; enabled CV still
+requires `synchronized_views` and exactly two views. A nonzero global CV
+coefficient does not turn a single view or unaudited pair into a consistency
+example; those samples keep their supervised losses and skip only CV.
 Unconditional branches carry `TaskCondition()` with demonstration, current,
 remaining and task cache all `None`, and empty text. Their `loss_enabled` map
 allows only next-video and enabled IFP losses. It disables requirement,
@@ -250,14 +313,17 @@ move individual windows to repair split imbalance.
 The seven JSON configurations are matched pilot defaults, not a claimed
 optimal hyperparameter search result. They share seeds `[0,1,2]`, 1,000 update
 steps, batch size 1, LoRA rank/alpha 8, 8 current and 8 remaining tokens, source
-splits, noise configuration, two-view sampling, single-candidate deployment
-and no F ranking. Dimensions are explicitly **synthetic fixture dimensions**;
+splits, noise configuration, the same recorded-view sampling, single-candidate deployment
+and no F ranking. Samples can contain one or two real views; keep the same
+mixture across comparisons and report how many examples have eligible CV pairs.
+Dimensions are explicitly **synthetic fixture dimensions**;
 real robot and checkpoint schemas must be supplied and validated rather than
 guessed. Each token count is roles times its part's query count.
 
 T0/T1/T2 enable recent video / plus IFP / plus interaction supervision. T2 and
 V0 are identical. V0 and V1 differ only in `lambda_cv` (0 vs pilot 0.1). Both
-compute two supervised branches and take their mean. `geometry.json` and
+compute the actual number of supervised view branches and take their mean.
+Only explicitly reliable pairs can contribute the extra CV term. `geometry.json` and
 `full.json` differ only in interface content; both retain the same IFP,
 interaction supervision, CV fields and token capacity. Full-only interface
 control labels must not add extra CV fields relative to geometry.

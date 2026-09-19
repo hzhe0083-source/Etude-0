@@ -5,7 +5,7 @@ Identifiers stay in metadata. Only explicit tensor fields reach model inputs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -101,10 +101,49 @@ class PairedTrainingInput:
     loss_enabled: Mapping[str, bool]
 
 
+def _pair_kind(kind: str, views: int) -> str:
+    if views not in (1, 2):
+        raise ValueError("robot-supervised examples require one or two demonstration views")
+    if kind not in ("none", "synchronized_views"):
+        raise ValueError("pair_kind must be none or synchronized_views")
+    if kind == "synchronized_views" and views != 2:
+        raise ValueError("synchronized_views requires two explicitly recorded views")
+    return kind
+
+
+def validate_demo_encoding(meta: Mapping, width: int) -> dict:
+    """Identify raw features versus learned effect tokens without guessing by shape."""
+    if type(width) is not int or width < 1:
+        raise ValueError("demonstration feature width must be a positive integer")
+    encoding = meta.get("demonstration_encoding", {"kind": "raw_features"})
+    if not isinstance(encoding, dict):
+        raise ValueError("demonstration_encoding must be an explicit encoding object")
+    if encoding.get("kind") == "raw_features":
+        if set(encoding) != {"kind"}:
+            raise ValueError("raw_features encoding accepts only its kind")
+        return {"kind": "raw_features"}
+    fields = {"kind", "encoder_sha256", "feature_space_id", "token_dim", "window_frames", "num_tokens"}
+    if encoding.get("kind") != "video_effect_tokens" or set(encoding) != fields:
+        raise ValueError("video_effect_tokens requires exact encoder identity, feature space and token configuration")
+    digest = encoding["encoder_sha256"]
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in digest):
+        raise ValueError("encoder_sha256 must be a 64-character hexadecimal digest")
+    feature_space = encoding["feature_space_id"]
+    if not isinstance(feature_space, str) or not feature_space.strip():
+        raise ValueError("encoded demonstrations require a nonempty feature_space_id")
+    if type(encoding["token_dim"]) is not int or encoding["token_dim"] != width:
+        raise ValueError("encoded token_dim must match the actual demonstration feature width")
+    if type(encoding["window_frames"]) is not int or encoding["window_frames"] < 3:
+        raise ValueError("effect-token windows must contain at least three frames")
+    if type(encoding["num_tokens"]) is not int or encoding["num_tokens"] < 1:
+        raise ValueError("effect-token num_tokens must be a positive integer")
+    return {**encoding, "encoder_sha256": digest.lower()}
+
+
 def prepare_training_input(
     robot_history: Tensor,
     target_frames: Mapping[str, Tensor],
-    conditions: tuple[TaskCondition, TaskCondition],
+    conditions: tuple[TaskCondition, ...],
     sigma_tables: Mapping[str, Tensor],
     query_steps: Mapping[str, int],
     *,
@@ -116,23 +155,24 @@ def prepare_training_input(
     enable_interaction: bool = True,
     enable_cv: bool = True,
     time_dim: int | None = None,
+    pair_kind: str = "none",
 ) -> PairedTrainingInput:
-    """Encode robot inputs once and produce either two views or one null branch.
+    """Encode robot inputs once for one/two demonstrations or one null branch.
 
     The condition readers are called by the training loop only for conditional
-    samples. A null branch deliberately contains no stored true requirement.
+    samples. CV needs an explicit synchronized pair; a single view is never
+    duplicated. A null branch deliberately contains no stored true requirement.
     """
     if not 0 <= unconditional_probability <= 1:
         raise ValueError("unconditional_probability must be in [0, 1]")
-    if len(conditions) != 2:
-        raise ValueError("a conditional pair requires exactly two views")
+    pair_kind = _pair_kind(pair_kind, len(conditions))
     if any((condition.current is None) != (condition.remaining is None) for condition in conditions):
         raise ValueError("current and remaining task tokens must both be present or both await the reader")
     if any(condition.text for condition in conditions):
         raise ValueError("main ICL experiments require empty task text")
     conditional = bool(torch.rand((), generator=generator, device=generator.device) >= unconditional_probability)
     if conditional and any(condition.demonstration is None for condition in conditions):
-        raise ValueError("both conditional branches must retain demonstration evidence")
+        raise ValueError("every conditional branch must retain demonstration evidence")
     history = history_encoder(robot_history)
     targets = {name: target_encoder(frames) for name, frames in target_frames.items()}
     denoising = shared_denoising_inputs(targets, sigma_tables, query_steps, generator=generator, time_dim=time_dim)
@@ -144,7 +184,7 @@ def prepare_training_input(
         "requirement": conditional,
         "execution": conditional,
         "interaction": conditional and enable_interaction,
-        "cv": conditional and enable_cv,
+        "cv": conditional and enable_cv and pair_kind == "synchronized_views",
     }
     return PairedTrainingInput(branches, conditional, enabled)
 
@@ -335,15 +375,23 @@ class LoadedSample:
     entity_patch_weights: Tensor
     robot_latent: Tensor
     actions: Tensor
-    demonstrations: tuple[Tensor, Tensor]
+    demonstrations: tuple[Tensor, ...]
     outcome: PhysicalOutcome
     requirement: TaskRequirement
-    per_view_valid: tuple[Mapping[str, Tensor], Mapping[str, Tensor]]
+    per_view_valid: tuple[Mapping[str, Tensor], ...]
     native_inputs: Mapping
     observed_action_history: ObservedActionHistory
     observed_video_step_offsets: Tensor
     history_chunks: tuple[Mapping, ...]
     actions_per_frame: int
+    pair_kind: str = "none"
+
+    @property
+    def demonstration_encoding(self) -> dict:
+        widths = {view.shape[-1] for view in self.demonstrations}
+        if len(widths) != 1:
+            raise ValueError("all demonstration views must have the same feature width")
+        return validate_demo_encoding(self.metadata, widths.pop())
 
     def native_history(self, dtype: torch.dtype | None = None) -> tuple:
         return native_history(self, dtype)
@@ -374,15 +422,18 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
         raise ValueError("training observation_step must equal the future window's start")
     if not isinstance(meta.get("control_dt"), (float, int)) or isinstance(meta["control_dt"], bool) or not np.isfinite(meta["control_dt"]) or meta["control_dt"] <= 0:
         raise ValueError("control_dt must be a finite positive number")
-    if not isinstance(meta.get("view_ids"), list) or len(meta["view_ids"]) != 2 or any(not isinstance(v, str) or not v for v in meta["view_ids"]):
-        raise ValueError("view_ids must identify exactly two synchronized views")
+    views = meta.get("view_ids")
+    if not isinstance(views, list) or any(not isinstance(v, str) or not v for v in views) or len(set(views)) != len(views):
+        raise ValueError("view_ids must name the recorded demonstration views without duplicates")
+    pair_kind = _pair_kind(meta.get("pair_kind", "none"), len(views))
+    demo_keys = tuple(f"demo_view_{view}" for view in range(len(views)))
     array_name = meta.get("arrays")
     if not isinstance(array_name, str):
         raise ValueError("arrays must name a relative NPZ file")
     array_path = (path.parent / array_name).resolve()
     if Path(array_name).is_absolute() or not array_path.is_relative_to(path.parent.resolve()) or array_path.suffix != ".npz":
         raise ValueError("array file must be an NPZ within the manifest directory")
-    required = {"entity_ids", "step_offsets", "robot_history", "proprio_history", "embodiment", "entity_patch_weights", "robot_latent", "actions", "demo_view_0", "demo_view_1", "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"}
+    required = {"entity_ids", "step_offsets", "robot_history", "proprio_history", "embodiment", "entity_patch_weights", "robot_latent", "actions", "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets", *demo_keys}
     for field in FIELDS:
         required |= {f"outcome_{field}", f"outcome_{field}_valid"}
         for part in ("current", "remaining"):
@@ -392,7 +443,7 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
         required |= {f"{part}_{field}{suffix}" for field in REQUIREMENT_SEMANTICS for suffix in ("", "_valid")}
     # Visibility/evidence validity is data-owned and separate for each view.
     cv_fields = tuple(f"{part}_{field}" for part in ("current", "remaining") for field in ("binding", *FIELDS, *REQUIREMENT_SEMANTICS)) + ("relations", "events")
-    required |= {f"view{view}_{field}_valid" for view in (0, 1) for field in cv_fields}
+    required |= {f"view{view}_{field}_valid" for view in range(len(views)) for field in cv_fields}
     native_map = meta.get("native_arrays", {})
     if not isinstance(native_map, dict) or set(native_map) - {"latent_dict", "action_dict", "mcp_latent_dicts"}:
         raise ValueError("native_arrays accepts only latent/action/MCP streams, never task conditions")
@@ -447,7 +498,7 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
         ).validate()
     requirement = TaskRequirement(**parts).validate()
     per_view_valid = []
-    for view in (0, 1):
+    for view in range(len(views)):
         evidence = {}
         for part, target in parts.items():
             for field, label_mask in target.label_valid.items():
@@ -461,10 +512,14 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
                 raise ValueError(f"{field}: view evidence must match physical label mask shape and Boolean dtype")
             evidence[field] = mask
         per_view_valid.append(evidence)
-    for name in ("robot_history", "robot_latent", "demo_view_0", "demo_view_1"):
+    for name in ("robot_history", "robot_latent", *demo_keys):
         tensor = arrays[name]
         if tensor.ndim < 2 or not tensor.numel() or not tensor.is_floating_point() or not torch.isfinite(tensor).all():
             raise ValueError(f"{name}: expected nonempty finite floating array with at least two axes")
+    widths = {arrays[name].shape[-1] for name in demo_keys}
+    if len(widths) != 1:
+        raise ValueError("all demonstration views must have the same feature width")
+    validate_demo_encoding(meta, widths.pop())
     history = arrays["robot_history"]
     if history.ndim != 3 or history.shape[1] != entity_ids.shape[1]:
         raise ValueError("robot_history must be [history_steps, scene_entities, entity_features]")
@@ -504,8 +559,8 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
     return LoadedSample(
         meta, history.unsqueeze(0), proprio.unsqueeze(0), embodiment.unsqueeze(0), patches.unsqueeze(0),
         arrays["robot_latent"].unsqueeze(0), actions.unsqueeze(0),
-        (arrays["demo_view_0"].unsqueeze(0), arrays["demo_view_1"].unsqueeze(0)), outcome, requirement,
-        tuple(per_view_valid), native_inputs, observed_actions, observed_video_offsets, history_chunks, per_frame,
+        tuple(arrays[name].unsqueeze(0) for name in demo_keys), outcome, requirement,
+        tuple(per_view_valid), native_inputs, observed_actions, observed_video_offsets, history_chunks, per_frame, pair_kind,
     )
 
 
@@ -631,6 +686,7 @@ class Observation:
     observed_action_history: ObservedActionHistory
     observed_video_step_offsets: Tensor
     history_chunks: tuple[Mapping, ...]
+    demonstration_encoding: dict = field(default_factory=lambda: {"kind": "raw_features"})
 
     def native_history(self, dtype: torch.dtype | None = None) -> tuple:
         return native_history(self, dtype)
@@ -675,7 +731,11 @@ def load_observation(manifest_path: str | Path) -> Observation:
         raise ValueError("embodiment must be [E], observed video latent [C,F,H,W]")
     if any(values[f"demo_view_{i}"].ndim != 2 for i in range(len(views))):
         raise ValueError("demonstrations must be ordered [tokens,features]")
+    widths = {values[f"demo_view_{i}"].shape[-1] for i in range(len(views))}
+    if len(widths) != 1:
+        raise ValueError("all demonstration views must have the same feature width")
+    encoding = validate_demo_encoding(meta, widths.pop())
     observed_actions, video_offsets, history_chunks, per_frame = _history_metadata(meta, values)
     return Observation(ids[None], history[None], proprio[None], values["embodiment"][None],
                        values["robot_latent"][None], tuple(values[f"demo_view_{i}"][None] for i in range(len(views))),
-                       meta["chunk_size"], per_frame, dict(meta["action_space"]), observed_actions, video_offsets, history_chunks)
+                       meta["chunk_size"], per_frame, dict(meta["action_space"]), observed_actions, video_offsets, history_chunks, encoding)

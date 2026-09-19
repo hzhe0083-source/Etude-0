@@ -1,7 +1,7 @@
 """Stage objectives and optimizer steps for the existing Evo-WAM modules.
 
 Robot denoising inputs are constructed once outside the trainer and reused by
-both view branches. Sampling accepts only noise plus actual history, never a
+the optional view pair. Sampling accepts only noise plus actual history, never a
 teacher-forced training dictionary. Native Zero-WAM currently packs B=1.
 """
 
@@ -52,6 +52,7 @@ class TrainingBatch:
     conditional: bool = True
     requirements: TaskRequirement | None = None
     demonstrations: tuple[Tensor, ...] = ()
+    pair_kind: str = "none"                 # optional, explicitly verified pairing
     outcome: PhysicalOutcome | None = None
     physical_actions: Tensor | None = None   # [1,H,Da], actually executed
     entity_patch_weights: Tensor | None = None  # fixed observation-based [1,N,S]
@@ -65,6 +66,10 @@ class TrainingBatch:
     category_groups: Mapping[str, Tensor] = field(default_factory=dict)
 
     def validate(self) -> None:
+        if self.pair_kind not in {"none", "synchronized_views"}:
+            raise ValueError("pair_kind must be none or synchronized_views")
+        if self.conditional and self.pair_kind == "synchronized_views" and len(self.demonstrations) != 2:
+            raise ValueError("synchronized_views requires exactly two actual demonstration views")
         if self.entity_features.ndim != 3 or self.entity_features.shape[0] != 1:
             raise ValueError("native training currently requires entity_features [1,N,D]")
         if self.entity_history.ndim != 4 or self.entity_history.shape[0] != 1:
@@ -427,10 +432,10 @@ class EvoTrainer(nn.Module):
         result = {key: sum(view[key] for view in views) / len(views) for key in views[0]}
         result["cv_coverage"] = zero
         if self.stage == "joint" and self.weights.cv:
-            if len(views) != 2:
-                raise ValueError("nonzero CV weight requires exactly two conditional views")
-            cv = self._cv(predictions[0], predictions[1], batch)
-            result["cv"], result["cv_coverage"] = cv.loss, cv.coverage
+            result["cv"] = zero
+            if batch.pair_kind == "synchronized_views" and len(views) == 2:
+                cv = self._cv(predictions[0], predictions[1], batch)
+                result["cv"], result["cv_coverage"] = cv.loss, cv.coverage
         if self.stage == "interface" and self.weights.physical:
             if batch.outcome is None or batch.physical_actions is None:
                 raise ValueError("interface physical training needs actually executed actions and outcome labels")

@@ -12,7 +12,7 @@ from torch import nn
 from evo_wam.data import (
     TaskCondition, assign_splits, connected_components, executed_prefix_valid,
     load_experiment, load_observation, load_sample, paired_dropout_disabled, prepare_training_input,
-    shared_denoising_inputs, validate_splits,
+    shared_denoising_inputs, validate_demo_encoding, validate_splits,
 )
 
 
@@ -24,6 +24,7 @@ def write_fixture(directory: Path):
         "coordinate_frame": "robot_base", "task_annotation": "audited-required-events-v1",
         "window_start": 12, "observation_step": 12, "executed_steps": 2, "control_dt": 0.05,
         "view_ids": ["front", "side"],
+        "pair_kind": "synchronized_views",
         "actions_per_frame": 2,
         "history_chunks": [
             {"mode": "video", "slice": [0, 2], "frame_id": 0, "rope_offset": 0},
@@ -79,6 +80,53 @@ def write_fixture(directory: Path):
 
 
 class DataTests(unittest.TestCase):
+    def test_demo_encoding_identity_is_explicit_and_shape_checked(self):
+        self.assertEqual(validate_demo_encoding({}, 4), {"kind": "raw_features"})
+        encoding = {"kind": "video_effect_tokens", "encoder_sha256": "AB" * 32,
+                    "feature_space_id": "frozen-visual-v1", "token_dim": 4,
+                    "window_frames": 3, "num_tokens": 2}
+        normalized = validate_demo_encoding({"demonstration_encoding": encoding}, 4)
+        self.assertEqual(normalized["encoder_sha256"], "ab" * 32)
+        self.assertEqual(encoding["encoder_sha256"], "AB" * 32)
+        invalid = [None, {"kind": "raw_features", "encoder_sha256": "a" * 64},
+                   {**encoding, "encoder_sha256": "g" * 64},
+                   {**encoding, "feature_space_id": " "}, {**encoding, "token_dim": 5},
+                   {**encoding, "window_frames": 2}, {**encoding, "num_tokens": 0},
+                   {**encoding, "num_tokens": True}, {**encoding, "unregistered": 1}]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_demo_encoding({"demonstration_encoding": value}, 4)
+
+    def test_demo_encoding_is_preserved_by_both_loaders_and_widths_must_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta, arrays = write_fixture(root)
+            self.assertEqual(load_sample(root / "sample.json").demonstration_encoding, {"kind": "raw_features"})
+            meta["demonstration_encoding"] = {
+                "kind": "video_effect_tokens", "encoder_sha256": "cd" * 32,
+                "feature_space_id": "frozen-visual-v1", "token_dim": 4,
+                "window_frames": 3, "num_tokens": 2,
+            }
+            (root / "sample.json").write_text(json.dumps(meta))
+            self.assertEqual(load_sample(root / "sample.json").demonstration_encoding, meta["demonstration_encoding"])
+            arrays["demo_view_1"] = np.ones((3, 5), dtype=np.float32)
+            np.savez(root / "arrays.npz", **arrays)
+            with self.assertRaisesRegex(ValueError, "same feature width"):
+                load_sample(root / "sample.json")
+            arrays["demo_view_1"] = np.ones((3, 4), dtype=np.float32)
+            keys = {"entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent", "demo_view_0", "demo_view_1",
+                    "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"}
+            observed = {key: arrays[key] for key in keys}
+            meta.update(kind="observation", chunk_size=2)
+            (root / "observation.json").write_text(json.dumps(meta))
+            np.savez(root / "arrays.npz", **observed)
+            loaded = load_observation(root / "observation.json")
+            self.assertEqual(loaded.demonstration_encoding, meta["demonstration_encoding"])
+            observed["demo_view_1"] = np.ones((3, 5), dtype=np.float32)
+            np.savez(root / "arrays.npz", **observed)
+            with self.assertRaisesRegex(ValueError, "same feature width"):
+                load_observation(root / "observation.json")
+
     def test_shared_noise_and_encode_once(self):
         calls = {"history": 0, "target": 0}
 
@@ -97,10 +145,11 @@ class DataTests(unittest.TestCase):
             {"next": torch.tensor([0.25]), "ifp1": torch.tensor([0.75])},
             {"next": 1, "ifp1": 3}, history_encoder=history_encoder,
             target_encoder=target_encoder, generator=torch.Generator().manual_seed(10),
-            unconditional_probability=0,
+            unconditional_probability=0, pair_kind="synchronized_views",
         )
         self.assertEqual(calls, {"history": 1, "target": 2})
         first, second = paired.branches
+        self.assertTrue(paired.loss_enabled["cv"])
         self.assertIs(first.robot_history, second.robot_history)
         self.assertIs(first.denoising, second.denoising)
         self.assertIs(first.denoising["next"].noise, second.denoising["next"].noise)
@@ -144,6 +193,28 @@ class DataTests(unittest.TestCase):
         self.assertEqual({k for k, enabled in pair.loss_enabled.items() if enabled}, {"next_video", "ifp"})
         other = prepare_training_input(torch.zeros(1, 2, 4), {"next": torch.zeros(1, 2, 4)}, (TaskCondition(), TaskCondition()), {"next": torch.tensor([0.5])}, {"next": 1}, generator=torch.Generator().manual_seed(1), **kwargs)
         torch.testing.assert_close(pair.branches[0].denoising["next"].noisy, other.branches[0].denoising["next"].noisy)
+
+    def test_single_view_and_unaudited_pairs_do_not_enable_cv(self):
+        condition = TaskCondition(torch.ones(1, 3, 4))
+        def prepare(count, kind="none"):
+            return prepare_training_input(
+                torch.zeros(1, 2, 4), {"next": torch.zeros(1, 2, 4)},
+                (condition,) * count, {"next": torch.tensor([0.5])}, {"next": 1},
+                history_encoder=lambda value: value, target_encoder=lambda value: value,
+                generator=torch.Generator().manual_seed(3), unconditional_probability=0,
+                enable_cv=True, pair_kind=kind,
+            )
+        single = prepare(1)
+        self.assertEqual(len(single.branches), 1)
+        self.assertIs(single.branches[0].condition, condition)
+        self.assertTrue(single.loss_enabled["requirement"])
+        self.assertFalse(single.loss_enabled["cv"])
+        self.assertFalse(prepare(2).loss_enabled["cv"])
+        self.assertTrue(prepare(2, "synchronized_views").loss_enabled["cv"])
+        with self.assertRaises(ValueError):
+            prepare(1, "synchronized_views")
+        with self.assertRaises(ValueError):
+            prepare(2, "same_task")
 
     def test_dropout_pair_determinism_and_restore(self):
         model = nn.Sequential(nn.Linear(4, 4), nn.Dropout(0.9))
@@ -195,10 +266,55 @@ class DataTests(unittest.TestCase):
             self.assertEqual(sample.requirement.current.event_precedence.tolist(), [[[0, 8], [-1, -1]]])
             self.assertTrue(sample.requirement.remaining.label_valid["geometry"].all())
             self.assertEqual(sample.native_inputs, {})
+            self.assertEqual(sample.pair_kind, "synchronized_views")
             arrays["outcome_relations"] = np.zeros((4, 2, 3), dtype=np.float32)
             np.savez(root / "arrays.npz", **arrays)
             with self.assertRaises(ValueError):
                 load_sample(root / "sample.json")
+
+    def test_single_view_schema_preserves_its_masks_without_a_duplicate_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta, arrays = write_fixture(root)
+            # Legacy v2 files are readable but no longer silently assert sync.
+            del meta["pair_kind"]
+            (root / "sample.json").write_text(json.dumps(meta))
+            old_pair = load_sample(root / "sample.json")
+            self.assertEqual(old_pair.pair_kind, "none")
+            self.assertEqual(len(old_pair.demonstrations), 2)
+            meta["view_ids"] = ["front"]
+            meta["pair_kind"] = "none"
+            arrays = {key: value for key, value in arrays.items()
+                      if key != "demo_view_1" and not key.startswith("view1_")}
+            arrays["view0_remaining_geometry_valid"][0, 0, 0] = False
+            (root / "sample.json").write_text(json.dumps(meta))
+            np.savez(root / "arrays.npz", **arrays)
+            single = load_sample(root / "sample.json")
+            self.assertEqual(len(single.demonstrations), 1)
+            self.assertEqual(len(single.per_view_valid), 1)
+            self.assertFalse(single.per_view_valid[0]["remaining.geometry"][0, 0, 0, 0])
+            self.assertTrue(single.requirement.remaining.label_valid["geometry"].all())
+            self.assertEqual(single.pair_kind, "none")
+            meta["pair_kind"] = "synchronized_views"
+            (root / "sample.json").write_text(json.dumps(meta))
+            with self.assertRaisesRegex(ValueError, "requires two"):
+                load_sample(root / "sample.json")
+            meta["pair_kind"] = "none"
+            (root / "sample.json").write_text(json.dumps(meta))
+            arrays["demo_view_1"] = arrays["demo_view_0"].copy()
+            np.savez(root / "arrays.npz", **arrays)
+            with self.assertRaisesRegex(ValueError, "extra="):
+                load_sample(root / "sample.json")
+
+    def test_video_without_robot_labels_is_not_a_robot_training_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = {"format_version": 2, "kind": "video_pretrain", "arrays": "video.npz",
+                    "source_id": "single-video", "view_ids": ["ego"]}
+            (root / "video.json").write_text(json.dumps(meta))
+            np.savez(root / "video.npz", demo_view_0=np.ones((3, 4), dtype=np.float32))
+            with self.assertRaisesRegex(ValueError, "training_sample"):
+                load_sample(root / "video.json")
 
     def test_loader_rejects_pickle_paths_and_task_bypass(self):
         with tempfile.TemporaryDirectory() as directory:

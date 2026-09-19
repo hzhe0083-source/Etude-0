@@ -112,8 +112,19 @@ loader responsibilities.
 
 ## Pair loss and null examples
 
-Each view's supervised objective is averaged arithmetically; adding a duplicate
-view does not double supervision. `per_view_valid=(view1, view2)` retains each
+One demonstration view is sufficient for robot bridge training. With one view,
+the reader, native training branch and any enabled execution-distillation branch
+run once. A positive global CV coefficient does not require a second view and
+does not cause duplication: the reported CV loss and coverage are both zero.
+
+`pair_kind` defaults to `"none"`. Only an explicitly verified
+`"synchronized_views"` pair with two actual views may receive CV. Merely storing
+two views does not establish reliable correspondence; legacy two-view records
+without this annotation do not silently activate CV. Claiming synchronization
+with only one view is a metadata error. Null examples never run CV.
+
+Each available view's supervised objective is averaged arithmetically; adding a
+second view does not double supervision. `per_view_valid=(view1, view2)` retains each
 view's evidence separately. It must explicitly include `current.<field>` and
 `remaining.<field>` for every requirement `label_valid` field, plus `relations`
 and `events` for physical interaction labels. Masks are Boolean, data-owned and
@@ -170,6 +181,15 @@ measured with `updated=False`. During interface/joint training they can update
 the allowed native video parameters. The loader owns the common 90/10 sampling
 policy; legacy independent `drop_icl` and text-drop entry points must be off.
 
+Unpaired network-video representation learning is a separate upstream objective,
+not a reason to fabricate robot actions or task requirements for those videos.
+When using the offline effect-encoder route, the demonstrations provided here
+are frozen, ordered observed-effect tokens `Z_D`; the reader still produces
+robot-state-dependent `g_current` and `g_remaining`. Encoder/representation
+identity and feature dimensions must match preprocessing and the checkpoint.
+This trainer does not register or update an offline demonstration encoder, and
+its pretraining alone is not evidence that deployed WAM parameters improved.
+
 ## Checks and limits
 
 Run `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_training.py -v`.
@@ -182,6 +202,9 @@ sampler/teacher/student calls throughout warmup and the permanent execution-off
 ablation; per-view occlusion suppresses latent/distillation targets; changing a
 hidden privileged object identity changes neither the uncertain view's loss nor
 its gradient; and geometry controls do not depend on relation-evidence gates.
+Single-view tests also check one forward per branch and zero CV under a nonzero
+CV setting, while unverified two-view data is distinguished from an explicitly
+trusted pair without changing the supervised-loss scale.
 
 Those tests are not native Zero-WAM loading, GPU memory measurements, dataset
 training or robot execution. The adapter's independent native smoke test and

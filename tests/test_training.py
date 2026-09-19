@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -104,6 +105,7 @@ def make_batch():
         proprio_history=torch.randn(1, 2, 2), embodiment=torch.randn(1, 2),
         null_text=torch.zeros(1, 1, 4), native_inputs=native,
         requirements=TaskRequirement(requirement, remaining), demonstrations=(demo, demo.clone()),
+        pair_kind="synchronized_views",
         outcome=outcome, physical_actions=torch.randn(1, 2, 4),
         entity_patch_weights=torch.eye(2)[None], sample_noise=torch.randn(1, 4, 1, 1, 2),
         noisy_actions=torch.randn(1, 4, 1, 1, 2), action_timestep=torch.tensor(500.),
@@ -179,7 +181,7 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(len(model.adapter.action_calls), 2)
         model.adapter.sample_calls.clear()
         model.adapter.action_calls.clear()
-        hidden = replace(batch, demonstrations=batch.demonstrations[1:], per_view_valid=(second,))
+        hidden = replace(batch, demonstrations=batch.demonstrations[1:], per_view_valid=(second,), pair_kind="none")
         losses = model.objective(hidden)
         self.assertEqual(float(losses["latent"]), 0)
         self.assertEqual(float(losses["execution"]), 0)
@@ -189,7 +191,7 @@ class TrainingTests(unittest.TestCase):
     def test_hidden_binding_truth_cannot_change_uncertain_view_loss_or_gradient(self):
         model, batch = trainer("reader"), make_batch()
         hidden = {name: torch.zeros_like(value) for name, value in batch.per_view_valid[0].items()}
-        batch = replace(batch, demonstrations=batch.demonstrations[:1], per_view_valid=(hidden,))
+        batch = replace(batch, demonstrations=batch.demonstrations[:1], per_view_valid=(hidden,), pair_kind="none")
 
         def forbidden_goal(*args):
             raise AssertionError("a view without unique task evidence must not construct a privileged latent target")
@@ -242,7 +244,7 @@ class TrainingTests(unittest.TestCase):
             model, batch = trainer("reader"), make_batch()
             evidence = {name: value.clone() for name, value in batch.per_view_valid[0].items()}
             evidence[key].flatten()[0] = False
-            batch = replace(batch, demonstrations=batch.demonstrations[:1], per_view_valid=(evidence,))
+            batch = replace(batch, demonstrations=batch.demonstrations[:1], per_view_valid=(evidence,), pair_kind="none")
             losses = model.objective(batch)
             self.assertEqual(float(losses["latent"]), 0)
             self.assertEqual(float(losses["execution"]), 0)
@@ -356,10 +358,46 @@ class TrainingTests(unittest.TestCase):
         model.weights = replace(model.weights, cv=0)
         v0 = model.objective(batch)
         single = model.objective(replace(batch, demonstrations=batch.demonstrations[:1],
-                                         per_view_valid=batch.per_view_valid[:1]))
+                                         per_view_valid=batch.per_view_valid[:1], pair_kind="none"))
         self.assertTrue(torch.allclose(v0["total"], single["total"], atol=1e-6))
         self.assertTrue(torch.allclose(pair["total"], v0["total"], atol=1e-6))
         self.assertTrue(model.adapter.dropout.training)  # scoped dropout override restored
+
+    def test_single_view_with_cv_config_runs_once_and_skips_pair_loss(self):
+        model, batch = trainer(weights=LossWeights(cv=0.5)), make_batch()
+        batch = replace(batch, demonstrations=batch.demonstrations[:1],
+                        per_view_valid=batch.per_view_valid[:1], pair_kind="none")
+        with patch.object(model.reader, "forward", wraps=model.reader.forward) as read:
+            active = model.objective(batch)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(len(model.adapter.forward_inputs), 1)
+        self.assertEqual(len(model.adapter.sample_calls), 1)
+        self.assertEqual(float(active["cv"]), 0)
+        self.assertEqual(float(active["cv_coverage"]), 0)
+        model.weights = replace(model.weights, cv=0)
+        baseline = model.objective(batch)
+        torch.testing.assert_close(active["total"], baseline["total"])
+
+    def test_two_views_without_verified_pairing_do_not_imply_cv(self):
+        model, batch = trainer(weights=LossWeights(cv=0.5)), make_batch()
+        # Different views would have a nonzero paired loss if falsely paired.
+        batch = replace(batch, demonstrations=(batch.demonstrations[0], batch.demonstrations[1] + 3),
+                        pair_kind="none")
+        unpaired = model.objective(batch)
+        self.assertEqual(float(unpaired["cv"]), 0)
+        self.assertEqual(float(unpaired["cv_coverage"]), 0)
+        trusted = model.objective(replace(batch, pair_kind="synchronized_views"))
+        self.assertGreater(float(trusted["cv"].detach()), 0)
+        self.assertEqual(float(trusted["cv_coverage"]), 1)
+        for name in unpaired:
+            if name not in {"cv", "cv_coverage", "total"}:
+                torch.testing.assert_close(unpaired[name], trusted[name])
+
+    def test_single_view_cannot_claim_synchronized_pair_metadata(self):
+        model, batch = trainer(), make_batch()
+        with self.assertRaisesRegex(ValueError, "exactly two actual"):
+            model.objective(replace(batch, demonstrations=batch.demonstrations[:1],
+                                    per_view_valid=batch.per_view_valid[:1]))
 
     def test_unconditional_never_calls_task_or_true_goal_paths(self):
         model, batch = trainer(weights=LossWeights(cv=0.5)), make_batch()

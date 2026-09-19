@@ -62,13 +62,29 @@ fusion where enabled; clean-prefix and raw demonstration tokens are excluded.
 `sample_video(initial_noise, conditions, history=..., steps=4, shift=5)` starts
 only from the supplied noise and invokes the native flow scheduler and video
 forward under `no_grad`. It does not accept the supervised training dictionary.
-History is a chronological list of `(video_or_action, actual_observed_tensor,
-frame_id)`; use interleaved video/action frame IDs, for example 0/1 followed by
-future video/action 2/3. History chunks are real past observations/actions, never
-the recorded future. Native video tensors are `[1,C,F,H,W]`; actions are
+History is an ordered list of
+`NativeHistoryChunk(mode, latent, frame_id, rope_offset, token_valid=None)`.
+Native attention chunk IDs and temporal RoPE positions are distinct: a two-frame
+chunk `i` uses video/action IDs `2*i`/`2*i+1`, but RoPE starts at `2*i`. Thus after
+history IDs 0/1 with RoPE frames 0–1, call `sample_video(..., frame_id=2,
+rope_offset=2)`; its action uses ID 3 and the same RoPE offset 2. Explicit video
+grids must agree with the declared offset. History frame IDs increase strictly;
+within each modality, RoPE intervals cannot overlap.
+
+History chunks are real past observations/actions, never the recorded future.
+Physical command end timestamps must be checked against the current observation
+by the data loader; attention IDs are not timestamps. Native video tensors are
+`[1,C,F,H,W]`; actions are
 `[1,A,F,N,1]`. Explicit video grids can be supplied for non-default layouts.
 Stream tensors and explicit grids are moved to the native model's device, and
 stream values use its parameter dtype; sampling returns native-device tensors.
+`token_valid` is a flat boolean mask over native patch tokens (action: `F*N`),
+not a channel mask. Incomplete action tails are packed with false padding tokens:
+their values are cleared before embedding and sequence/frame IDs become `-1`,
+so real queries cannot read them and native cache counts exclude them. Completely
+empty action history is an empty list, not a synthetic zero command. Invalid
+prefill clears partial caches before raising. Three-tuples remain deprecated
+compatibility for old one-frame examples; audited data must use explicit chunks.
 
 The returned `GeneratedFuture` holds detached generated latents, their grid/frame
 and the fixed task conditions used to generate/encode them. Pass this same object

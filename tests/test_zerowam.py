@@ -5,7 +5,7 @@ import sys
 import torch
 from torch import nn
 
-from evo_wam.zerowam import (NativeDependencyError, TaskConditions, VideoLoRA, ZeroWAMAdapter,
+from evo_wam.zerowam import (NativeDependencyError, NativeHistoryChunk, TaskConditions, VideoLoRA, ZeroWAMAdapter,
                              load_native_class,
                              optional_flash_source, _LEGACY_FLASH_IMPORT, _OptionalFlashFinder,
                              route_allowed, tiny_native_smoke, unpack_velocity,
@@ -86,6 +86,18 @@ class ZeroWAMStructureTests(unittest.TestCase):
             with self.subTest(mask=mask), self.assertRaises(ValueError):
                 action_mask_for(mask, sample)
 
+    def test_history_chunk_metadata_validation(self):
+        latent = torch.zeros(1, 3, 2, 2, 1)
+        chunk = NativeHistoryChunk("action", latent, frame_id=3, rope_offset=2,
+                                   token_valid=torch.tensor([True, True, True, False]))
+        self.assertEqual((chunk.frame_id, chunk.rope_offset), (3, 2))
+        for mode, frame_id, offset in [("other", 0, 0), ("video", 1, 0),
+                                       ("action", 2, 0), ("video", 0, -1)]:
+            with self.assertRaises(ValueError):
+                NativeHistoryChunk(mode, latent, frame_id, offset)
+        with self.assertRaises(ValueError):
+            NativeHistoryChunk("action", latent, 1, 0, torch.ones(4))
+
 
 class ZeroWAMNativeTests(unittest.TestCase):
     def test_native_cpu_parameter_isolation(self):
@@ -117,6 +129,16 @@ class ZeroWAMNativeTests(unittest.TestCase):
         self.assertFalse(adapter.condition_types.requires_grad)
         self.assertFalse(attention.to_k.weight.requires_grad)
         self.assertTrue(any(p.requires_grad for p in model.mcp_blocks.parameters()))
+        stream = adapter._stream(torch.ones(1, 3, 2, 2, 1), "action", 0, frame_id=3,
+            rope_offset=2, token_valid=torch.tensor([True, True, True, False]))
+        self.assertEqual(stream["action_grid_id"][0].tolist(), [2, 2, 3, 3])
+        self.assertEqual(stream["current_frame_ids"].tolist(), [3, 3, 3, -1])
+        self.assertEqual(stream["current_seq_ids"].tolist(), [0, 0, 0, -1])
+        self.assertFalse(stream["action_res_lst"]["noisy_latents"][:, :, -1, -1].any())
+        for mask in [torch.ones(3, dtype=torch.bool), torch.zeros(4, dtype=torch.bool)]:
+            with self.assertRaises(ValueError):
+                adapter._stream(torch.ones(1, 3, 2, 2, 1), "action", 0, 3,
+                                rope_offset=2, token_valid=mask)
 
     def test_tiny_native_cuda(self):
         try:
@@ -128,6 +150,9 @@ class ZeroWAMNativeTests(unittest.TestCase):
         self.assertTrue(result["mcp_phi_only_task_path"])
         self.assertTrue(result["current_remaining_types"])
         self.assertTrue(result["inactive_action_channels_zero_each_step"])
+        self.assertTrue(result["observed_action_history"])
+        self.assertTrue(result["history_padding_excluded"])
+        self.assertTrue(result["independent_rope_offset"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import warnings
 from typing import Sequence
 
 import torch
@@ -138,6 +139,50 @@ class GeneratedFuture:
     conditions: TaskConditions
     grid_id: Tensor
     frame_id: int
+    rope_offset: int | None = None
+
+
+@dataclass(frozen=True)
+class NativeHistoryChunk:
+    """One observed native chunk; physical timestamps are checked by the loader.
+
+    frame_id is an attention chunk ID (video even, action odd), while rope_offset
+    is an independent latent-frame position. token_valid refers to patch tokens,
+    not channels: padded/unexecuted action positions are false.
+    """
+    mode: str
+    latent: Tensor
+    frame_id: int
+    rope_offset: int
+    token_valid: Tensor | None = None
+
+    def __post_init__(self):
+        if self.mode not in {"video", "action"}:
+            raise ValueError("History mode must be video or action")
+        if type(self.frame_id) is not int or self.frame_id < 0 or self.frame_id % 2 != (self.mode == "action"):
+            raise ValueError("History frame_id must be nonnegative, video even/action odd")
+        if type(self.rope_offset) is not int or self.rope_offset < 0:
+            raise ValueError("History rope_offset must be a nonnegative integer")
+        if not torch.is_tensor(self.latent) or self.latent.ndim != 5 or self.latent.shape[0] != 1 or not self.latent.numel():
+            raise ValueError("History latent must be nonempty native [1,C,F,H,W]")
+        if self.token_valid is not None and (
+            not torch.is_tensor(self.token_valid) or self.token_valid.dtype != torch.bool
+            or self.token_valid.ndim != 1 or self.token_valid.requires_grad
+        ):
+            raise ValueError("History token_valid must be a flat, data-owned boolean mask")
+
+
+def _history_chunk(value) -> NativeHistoryChunk:
+    if isinstance(value, NativeHistoryChunk):
+        return value
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise ValueError("Use NativeHistoryChunk with an explicit RoPE offset")
+    warnings.warn("Three-tuple history assumes one-frame chunk positions; use NativeHistoryChunk",
+                  DeprecationWarning, stacklevel=3)
+    mode, latent, frame_id = value
+    if type(frame_id) is not int:
+        raise ValueError("Legacy history frame_id must be an integer")
+    return NativeHistoryChunk(mode, latent, frame_id, frame_id // 2)
 
 
 class VideoLoRA(nn.Module):
@@ -400,12 +445,17 @@ class ZeroWAMAdapter(nn.Module):
             self.clear_cache()
 
     def _stream(self, data: Tensor, mode: str, timestep, frame_id: int,
-                grid_id: Tensor | None = None, cache_type=1) -> dict:
+                grid_id: Tensor | None = None, cache_type=1, *,
+                rope_offset: int | None = None, token_valid: Tensor | None = None) -> dict:
         from wan_va.utils import get_mesh_id
         if data.ndim != 5 or data.shape[0] != 1:
             raise ValueError("Native streams require [1,C,F,H,W]")
         if mode not in {"video", "action"}:
             raise ValueError("History stream mode must be video or action")
+        if type(frame_id) is not int or frame_id < 0 or frame_id % 2 != (mode == "action"):
+            raise ValueError("Stream frame_id must be nonnegative, video even/action odd")
+        if rope_offset is not None and (type(rope_offset) is not int or rope_offset < 0):
+            raise ValueError("rope_offset must be a nonnegative integer")
         data = data.to(self.native.patch_embedding_mlp.weight if mode == "video"
                        else self.native.action_embedder.weight)
         patch = self.native.patch_size if mode == "video" else (1, 1, 1)
@@ -413,11 +463,29 @@ class ZeroWAMAdapter(nn.Module):
             raise ValueError("Stream shape is not patch aligned")
         if grid_id is None:
             f, h, w = (n // p for n, p in zip(data.shape[-3:], patch))
-            grid_id = get_mesh_id(f, h, w, int(mode == "action"), f_shift=frame_id // 2).to(data.device)
+            offset = frame_id // 2 if rope_offset is None else rope_offset
+            grid_id = get_mesh_id(f, h, w, int(mode == "action"), f_shift=offset).to(data.device)
         if grid_id.ndim == 3:
             grid_id = grid_id[0]
         grid_id = grid_id.to(data.device)
+        expected_count = (data.shape[2] // patch[0]) * (data.shape[3] // patch[1]) * (data.shape[4] // patch[2])
+        if grid_id.ndim != 2 or grid_id.shape != (4, expected_count):
+            raise ValueError("Grid must have shape [4, native patch-token count]")
+        if rope_offset is not None and not (grid_id[0].min() == rope_offset):
+            raise ValueError("Explicit grid and rope_offset disagree")
         count = grid_id.shape[1]
+        if token_valid is None:
+            valid = torch.ones(count, device=data.device, dtype=torch.bool)
+        else:
+            if token_valid.dtype != torch.bool or token_valid.shape != (count,) or token_valid.requires_grad:
+                raise ValueError("token_valid must be a flat boolean mask matching native tokens")
+            valid = token_valid.to(device=data.device)
+            if not valid.any():
+                raise ValueError("Omit empty history chunks instead of caching only padding")
+            pixels = valid.reshape(*(n // p for n, p in zip(data.shape[-3:], patch)))
+            for axis, repeats in enumerate(patch):
+                pixels = pixels.repeat_interleave(repeats, dim=axis)
+            data = torch.where(pixels[None, None], data, 0)
         t = torch.as_tensor(timestep, device=data.device, dtype=torch.float32).reshape(-1)
         frames = data.shape[2] // patch[0]
         if t.numel() not in (1, frames):
@@ -428,31 +496,44 @@ class ZeroWAMAdapter(nn.Module):
                   "cache_type_ids": torch.full((count,), cache_type, device=data.device, dtype=torch.int)}
         key = "latent" if mode == "video" else "action"
         return {f"{key}_res_lst": stream, f"{key}_grid_id": grid_id,
-                "current_seq_ids": torch.zeros(count, device=data.device, dtype=torch.int),
-                "current_frame_ids": torch.full((count,), frame_id, device=data.device, dtype=torch.int)}
+                "current_seq_ids": torch.zeros(count, device=data.device, dtype=torch.int).masked_fill(~valid, -1),
+                "current_frame_ids": torch.full((count,), frame_id, device=data.device, dtype=torch.int).masked_fill(~valid, -1)}
 
     @torch.no_grad()
-    def prefill_history(self, history: Sequence[tuple[str, Tensor, int]],
+    def prefill_history(self, history: Sequence[NativeHistoryChunk | tuple[str, Tensor, int]],
                         conditions: TaskConditions) -> None:
         """Clear and replay only actual observed video/action chunks in time order."""
         self.clear_cache()
         previous = -1
-        for mode, observed, frame_id in history:
-            if frame_id <= previous:
-                raise ValueError("History frame IDs must be strictly increasing")
-            previous = frame_id
-            payload = self._stream(observed.detach(), mode, 0, frame_id, cache_type=0)
-            self.native(self._condition_input(payload, conditions.detached()),
-                        mode=f"forward_{'latent' if mode == 'video' else 'action'}_only", update_cache=1)
+        ends = {"video": -1, "action": -1}
+        try:
+            for item in history:
+                chunk = _history_chunk(item)
+                if chunk.frame_id <= previous:
+                    raise ValueError("History frame IDs must be strictly increasing")
+                if chunk.rope_offset < ends[chunk.mode]:
+                    raise ValueError("History RoPE intervals overlap within a modality")
+                previous = chunk.frame_id
+                pt = self.native.patch_size[0] if chunk.mode == "video" else 1
+                ends[chunk.mode] = chunk.rope_offset + chunk.latent.shape[2] // pt
+                payload = self._stream(chunk.latent.detach(), chunk.mode, 0, chunk.frame_id,
+                                       cache_type=0, rope_offset=chunk.rope_offset,
+                                       token_valid=chunk.token_valid)
+                self.native(self._condition_input(payload, conditions.detached()),
+                            mode=f"forward_{'latent' if chunk.mode == 'video' else 'action'}_only", update_cache=1)
+        except Exception:
+            self.clear_cache()
+            raise
 
     @torch.no_grad()
     def sample_video(self, initial_noise: Tensor, conditions: TaskConditions, *,
-                     history=(), steps=4, shift=5.0, frame_id=2, grid_id=None) -> GeneratedFuture:
+                     history=(), steps=4, shift=5.0, frame_id=2, grid_id=None,
+                     rope_offset: int | None = None) -> GeneratedFuture:
         """From noise only; ground-truth future/training dictionaries are not inputs."""
         from wan_va.utils import FlowMatchScheduler
         if steps < 1:
             raise ValueError("Sampling steps must be positive")
-        if history and frame_id <= history[-1][2]:
+        if history and frame_id <= _history_chunk(history[-1]).frame_id:
             raise ValueError("Future must follow the actual history")
         conditions = conditions.detached()
         scheduler = FlowMatchScheduler(shift=shift, sigma_min=0.0, extra_one_step=True)
@@ -461,13 +542,15 @@ class ZeroWAMAdapter(nn.Module):
         sample = initial_noise.detach().to(self.native.patch_embedding_mlp.weight).clone()
         try:
             for timestep in scheduler.timesteps:
-                payload = self._stream(sample, "video", timestep, frame_id, grid_id)
+                payload = self._stream(sample, "video", timestep, frame_id, grid_id,
+                                       rope_offset=rope_offset)
                 velocity = self.native(self._condition_input(payload, conditions),
                                        mode="forward_latent_only", update_cache=0)
                 velocity = unpack_velocity(velocity, sample.shape, self.native.patch_size)
                 sample = scheduler.step(velocity, timestep, sample)
             return GeneratedFuture(sample.detach(), conditions,
-                                   payload["latent_grid_id"].detach(), frame_id)
+                                   payload["latent_grid_id"].detach(), frame_id,
+                                   int(payload["latent_grid_id"][0].min().item()))
         finally:
             self.clear_cache()
 
@@ -476,16 +559,20 @@ class ZeroWAMAdapter(nn.Module):
         """Frozen action parameters still transmit gradients to current task tokens."""
         if not isinstance(future, GeneratedFuture) or future.latents.requires_grad:
             raise ValueError("Action decoding requires a detached GeneratedFuture")
-        if history and future.frame_id <= history[-1][2]:
+        if history and future.frame_id <= _history_chunk(history[-1]).frame_id:
             raise ValueError("Generated future must follow the actual history")
         self.prefill_history(history, future.conditions)
         try:
             with torch.no_grad():
                 video = self._stream(future.latents, "video", 0, future.frame_id,
-                                     future.grid_id, cache_type=1)
+                                     future.grid_id, cache_type=1, rope_offset=future.rope_offset)
                 self.native(self._condition_input(video, future.conditions),
                             mode="forward_latent_only", update_cache=1)
-            action = self._stream(noisy_action, "action", timestep, future.frame_id + 1)
+            offset = future.rope_offset
+            if offset is None:
+                offset = int(future.grid_id[0].min().item())
+            action = self._stream(noisy_action, "action", timestep, future.frame_id + 1,
+                                  rope_offset=offset)
             result = self.native(self._condition_input(action, conditions),
                                  mode="forward_action_only", update_cache=0)
             return unpack_velocity(result, noisy_action.shape)
@@ -588,9 +675,24 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     # Keep W LoRA trainable here: absence of W gradients must come from the
     # stopped sampling/encoding path, not merely from freezing every parameter.
     adapter.set_stage("joint")
-    history = [("video", video[:, :, :1].detach(), 0)]
+    past_actions = action.detach().clone()
+    past_actions[:, :, -1, -1] = 100
+    history = [NativeHistoryChunk("video", video.detach(), 0, 0),
+               NativeHistoryChunk("action", past_actions, 1, 0,
+                                  torch.tensor([True, True, True, False]))]
+    adapter.prefill_history(history, conditions)
+    assert adapter.native.cache_counts()[0] == 7  # Four video + three executed action tokens.
+    assert adapter.native.seq_ids_cache[128 + 3] == -1
+    assert adapter.native.frame_ids_cache[128 + 3] == -1
+    original_action_keys = model.blocks[0].attn1.attn_caches["pos"]["k"][:, 128:131].clone()
+    changed_actions = past_actions.clone()
+    changed_actions[:, :, 0, 0] += 3
+    adapter.prefill_history([history[0], NativeHistoryChunk("action", changed_actions, 1, 0,
+        torch.tensor([True, True, True, False]))], conditions)
+    assert not torch.equal(original_action_keys, model.blocks[0].attn1.attn_caches["pos"]["k"][:, 128:131])
     future = adapter.sample_video(torch.randn_like(video[:, :, :1]).float().cpu(), conditions,
-                                  history=history, steps=2)
+                                  history=history, steps=2, frame_id=2, rope_offset=2)
+    assert future.rope_offset == 2 and future.grid_id[0].min() == 2
     assert not future.latents.requires_grad and future.latents.grad_fn is None
     velocity = adapter.action_velocity(action[:, :, :1].float().cpu(), torch.tensor([[500.]]), conditions,
                                        future, history=history)
@@ -601,7 +703,9 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     seen_actions = []
 
     def capture_sample_input(module, args):
-        seen_actions.append(args[0].detach().clone())
+        # History has four tokens; the sampled one-frame action has two.
+        if args[0].shape[1] == 2:
+            seen_actions.append(args[0].detach().clone())
 
     sample_hook = model.action_embedder.register_forward_pre_hook(capture_sample_input)
     action_noise = torch.randn_like(action[:, :, :1]).float().cpu()
@@ -620,4 +724,6 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     return {"native": True, "device": device, "mcp_heads": len(result.mcp),
             "phi_shape": list(result.phi.shape), "direct_condition_gradient": True,
             "mcp_phi_only_task_path": True, "current_remaining_types": True,
-            "inactive_action_channels_zero_each_step": True}
+            "inactive_action_channels_zero_each_step": True,
+            "observed_action_history": True, "history_padding_excluded": True,
+            "independent_rope_offset": True}

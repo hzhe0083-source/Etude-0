@@ -153,6 +153,9 @@ class ZeroWAMNativeTests(unittest.TestCase):
         self.assertTrue(result["observed_action_history"])
         self.assertTrue(result["history_padding_excluded"])
         self.assertTrue(result["independent_rope_offset"])
+        self.assertTrue(result["training_observed_history"])
+        self.assertTrue(result["differentiable_history_prefix"])
+        self.assertTrue(result["paired_training_grids_unchanged"])
 
 
 if __name__ == "__main__":

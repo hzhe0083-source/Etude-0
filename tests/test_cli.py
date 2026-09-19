@@ -207,7 +207,7 @@ class CliTests(unittest.TestCase):
             path = Path(directory) / "artifact.pt"
             cli.save_run(path, trainer, config, torch.Generator(), 1, True)
             saved = torch.load(path, map_location="cpu", weights_only=True)
-            for field, invalid in (("upstream_commit", "wrong-source"), ("format_version", 2)):
+            for field, invalid in (("upstream_commit", "wrong-source"), ("format_version", 1)):
                 corrupted = dict(saved, **{field: invalid})
                 bad = Path(directory) / f"bad-{field}.pt"
                 torch.save(corrupted, bad)

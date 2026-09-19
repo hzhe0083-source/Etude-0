@@ -138,6 +138,15 @@ class ModelTests(unittest.TestCase):
         decoded.binding_logits.data[:] = torch.tensor([.65, .30, .0125, .0125, .0125, .0125]).log()
         self.assertTrue((decoded.materialize().binding == 0).all())
 
+    def test_nonfinite_predictions_cannot_become_empty_order_or_valid_windows(self):
+        req, entities = requirement(batch=1), torch.randn(1, 3, 5)
+        codec = RequirementCodec(5, 3, 2, 1, 2, 12)
+        for field in ("event_windows", "precedence_presence_logits", "binding_logits"):
+            decoded = codec(req, entities)
+            getattr(decoded, field).data.fill_(float("nan"))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "non-finite"):
+                decoded.materialize()
+
     def test_status_labels_and_view_evidence_supervise_uncertainty(self):
         req, entities = requirement(batch=1), torch.randn(1, 3, 5)
         req.binding[0, 0] = BINDING_UNMATCHED

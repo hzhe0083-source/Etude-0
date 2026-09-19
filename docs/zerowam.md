@@ -51,13 +51,29 @@ and `from_checkpoint` rather than silently ignoring configuration values.
 
 ## Training and generated-future paths
 
-`forward_train(native_input_dict, conditions)` preserves native inputs including
+`forward_train(native_input_dict, conditions, history=observed_chunks)` preserves native inputs including
 `latent_dict`, `action_dict`, `mcp_latent_dicts`, their timesteps, grids and clean
 teacher-forcing streams. It returns native flattened video/action/MCP velocities
 and current noisy-video `phi` for the shared time-query head. The wrapper does not
 sample new noise or compute losses: paired-view noise, schedules, targets and MCP
 tail masks remain the caller's responsibility. Phi uses native multi-layer MCP
 fusion where enabled; clean-prefix and raw demonstration tokens are excluded.
+
+Training uses the same explicit observed video/action history as deployment.
+It builds fresh, **differentiable** native history KV, then extends the main
+teacher-forcing mask with clean past keys. Padding remains unreadable. Future
+video/action/MCP grids are rebased after history on shallow-copied stream dicts;
+independent attention frame IDs use the next recorded chunk ID. Future target,
+noise, prediction and Phi lengths stay unchanged: past actions are context, never
+additional target labels or loss entries. Both view passes retain the identical
+original grids and noise. The temporary mask-builder hook is restored and every
+cache cleared in `finally`. MCP keeps its native fused-Phi path and its original
+square auxiliary mask; no history KV is injected directly into the auxiliary
+blocks. Sampling's history prefill remains under `no_grad` separately.
+Native calls allow up to 32 Dynamo specializations (or a larger explicitly set
+limit) for the distinct history/training/sampling signatures, and fail when that
+limit is exhausted. They must not silently switch to unfused dense attention on
+full-length robot video. The temporary compiler configuration is scoped to calls.
 
 `sample_video(initial_noise, conditions, history=..., steps=4, shift=5)` starts
 only from the supplied noise and invokes the native flow scheduler and video

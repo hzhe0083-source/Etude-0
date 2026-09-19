@@ -117,6 +117,11 @@ class DecodedRequirement:
             raise ValueError("mask threshold must be in (0,1)")
         if interface not in {"geometry", "full"}:
             raise ValueError("interface must be geometry or full")
+        for name, value in vars(self).items():
+            if isinstance(value, Tensor) and value.is_floating_point():
+                _finite(name, value)
+        for name, value in self.requirement_mask_logits.items():
+            _finite(f"{name} requirement mask", value)
         if (not math.isfinite(min_binding_confidence) or not 0 < min_binding_confidence < 1
                 or not math.isfinite(min_binding_margin) or not 0 < min_binding_margin < 1):
             raise ValueError("binding confidence and margin must be finite and in (0,1)")

@@ -104,6 +104,9 @@ def make_fixture(directory):
         "embodiment": np.zeros(2, dtype="float32"),
         "entity_patch_weights": np.zeros((n, f * 2), dtype="float32"),
         "robot_latent": rng.normal(size=(4, 1, 1, 2)).astype("float32"),
+        "observed_action_history": np.empty((0, 3), dtype="float32"),
+        "observed_action_step_offsets": np.empty((0,), dtype="int64"),
+        "observed_video_step_offsets": np.array([0], dtype="int64"),
         "actions": rng.normal(size=(horizon, 3)).astype("float32"),
         "demo_view_0": rng.normal(size=(6, 4)).astype("float32"),
         "demo_view_1": rng.normal(size=(6, 4)).astype("float32"),
@@ -126,30 +129,44 @@ def make_fixture(directory):
             arrays[f"{part}_{field}"] = np.zeros(shape, dtype="float32")
             arrays[f"{part}_{field}_valid"] = np.ones(shape, dtype="bool")
             arrays[f"{part}_{field}_required"] = np.ones(shape, dtype="bool")
+        arrays[f"{part}_geometry_tolerance"] = np.full_like(arrays[f"{part}_geometry"], 0.01)
+        arrays[f"{part}_geometry_tolerance_valid"] = np.ones_like(arrays[f"{part}_geometry"], dtype="bool")
+        event_shape = arrays[f"{part}_events"].shape
+        arrays[f"{part}_event_windows"] = np.broadcast_to(np.asarray(offsets)[:, None, None, None, None], (*event_shape, 2)).copy()
+        arrays[f"{part}_event_windows_valid"] = np.ones(event_shape, dtype="bool")
+        arrays[f"{part}_event_precedence"] = np.full((4, 2), -1, dtype="int64")
+        arrays[f"{part}_event_precedence_valid"] = np.ones(4, dtype="bool")
     for view in (0, 1):
-        for field in ("current_binding", "remaining_binding"):
-            arrays[f"view{view}_{field}_valid"] = np.ones(roles, dtype="bool")
+        for part in ("current", "remaining"):
+            for field in ("binding", "geometry", "relations", "events", "geometry_tolerance", "event_windows", "event_precedence"):
+                arrays[f"view{view}_{part}_{field}_valid"] = arrays[f"{part}_{field}_valid"].copy()
         for field in ("relations", "events"):
             arrays[f"view{view}_{field}_valid"] = np.ones_like(arrays[f"outcome_{field}"], dtype="bool")
-    meta = {"format_version": 1, "arrays": "arrays.npz", "source_id": "synthetic-human-0",
+    meta = {"format_version": 2, "kind": "training_sample", "arrays": "arrays.npz", "source_id": "synthetic-human-0",
             "trajectory_id": "synthetic-robot-0", "history_id": "synthetic-state-0",
             "coordinate_frame": "synthetic_robot_frame", "task_annotation": "synthetic-contract-fixture",
-            "window_start": 0, "executed_steps": horizon, "control_dt": 0.05,
+            "window_start": 0, "observation_step": 0, "executed_steps": horizon, "control_dt": 0.05,
+            "actions_per_frame": 2,
+            "history_chunks": [{"mode": "video", "slice": [0, 1], "frame_id": 0, "rope_offset": 0}],
             "view_ids": ["synthetic-front", "synthetic-side"], "provenance": "synthetic",
             "native_arrays": {name + "_dict": {"latent": f"native_{name}_clean", "grid_id": f"native_{name}_grid"}
                               for name in ("latent", "action")},
             "native_scalars": {"chunk_size": 2, "max_frame_chunk_size": 4, "window_size": 32}}
     meta["action_space"] = {"representation": "zero-wam-normalized", "normalization_id": "synthetic-v1",
                             "dimension": 3, "valid_channels": [True, True, True]}
+    meta["observed_action_space"] = dict(meta["action_space"])
     meta["native_arrays"]["latent_dict"] = {"latent": "native_video_clean", "grid_id": "native_video_grid"}
     np.savez_compressed(directory / "arrays.npz", **arrays)
     write_json(directory / "sample.json", meta)
     write_json(directory / "index.json", {"samples": [{"manifest": "sample.json", "split": "train"}]})
-    observation_keys = ["entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent", "demo_view_0", "demo_view_1"]
+    observation_keys = ["entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent", "demo_view_0", "demo_view_1",
+                        "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"]
     np.savez_compressed(directory / "observation.npz", **{key: arrays[key] for key in observation_keys})
-    write_json(directory / "observation.json", {"format_version": 1, "kind": "observation", "arrays": "observation.npz",
+    write_json(directory / "observation.json", {"format_version": 2, "kind": "observation", "arrays": "observation.npz",
         "view_ids": meta["view_ids"], "chunk_size": 2, "actions_per_frame": 2,
-        "action_space": meta["action_space"], "provenance": "synthetic"})
+        "action_space": meta["action_space"], "observed_action_space": meta["observed_action_space"],
+        "observation_step": 0, "control_dt": meta["control_dt"], "history_chunks": meta["history_chunks"],
+        "provenance": "synthetic"})
     return {"manifest": str(directory / "sample.json"), "index": str(directory / "index.json"),
             "provenance": "synthetic; validates data/compute paths only"}
 
@@ -279,14 +296,16 @@ def build_trainer(config, *, checkpoint=None, tiny_native=False, device="cuda", 
             if actual != expected:
                 raise ValueError(f"native checkpoint {name} differs from the registered configuration")
     codec = RequirementCodec(dims["entity_dim"], dims["geometry_dim"], dims["relation_dim"], dims["event_dim"],
-                             dims["roles"], dims["token_dim"], config["interface"]).to(device)
+                             dims["roles"], dims["token_dim"], config["interface"],
+                             max_precedence_edges=dims["max_precedence_edges"]).to(device)
     reader = EffectReader(dims["demo_dim"], dims["entity_dim"], dims["proprio_dim"], dims["embodiment_dim"],
                           dims["roles"], dims["token_dim"]).to(device)
     physical = CausalEffectPredictor(dims["entity_dim"], dims["proprio_dim"], dims["action_dim"], dims["embodiment_dim"],
                                      dims["geometry_dim"], dims["relation_dim"], dims["event_dim"]).to(device)
     interaction = TemporalInteractionHead(adapter.native.inner_dim, dims["relation_dim"], dims["event_dim"]).to(device)
     trainer = EvoTrainer(adapter, codec, reader, physical, interaction, stage=stage,
-                         weights=LossWeights(cv=config["lambda_cv"]), enable_ifp=config["ifp"]["enabled"],
+                         weights=LossWeights(**config["training"]["loss_weights"]),
+                         exec_start_step=config["training"]["exec_start_step"], enable_ifp=config["ifp"]["enabled"],
                          enable_interaction=config["interaction_supervision"],
                          ifp_weights=tuple(config["ifp"]["mcp_loss_weights"]),
                          learning_rate=config["training"]["learning_rate"])
@@ -325,8 +344,7 @@ def build_batch(sample, config, trainer, null, generator, *, conditional=None):
     sample_noise = torch.randn(video_shape, generator=generator).to(device=device, dtype=native_dtype)
     action = native["action_dict"]
     action_times = action["timesteps"][:, :chunk].reshape(-1)
-    common = {key.replace("_binding", ".binding"): value for key, value in sample.common_valid.items()}
-    history = (("video", sample.robot_latent.to(dtype=native_dtype), 0),)
+    history = sample.native_history(dtype=native_dtype)
     execution_valid = torch.ones_like(action["noisy_latents"][:, :, :chunk], dtype=torch.bool)
     for key in ("actions_mask", "valid_mask"):
         if key in action:
@@ -341,8 +359,8 @@ def build_batch(sample, config, trainer, null, generator, *, conditional=None):
         sample_noise=sample_noise, noisy_actions=action["noisy_latents"][:, :, :chunk],
         action_timestep=action_times, execution_valid=execution_valid,
         sample_kwargs={"history": history, "steps": 4, "shift": config["video_snr_shift"],
-                       "frame_id": 2 * sample.robot_latent.shape[2]},
-        pair_valid=(common, common))
+                       **sample.sampling_position()},
+        per_view_valid=sample.per_view_valid if conditional else None)
 
 
 def adapter_state(trainer):
@@ -356,7 +374,7 @@ def save_run(path, trainer, config, generator, attempted_steps, tiny_native):
     from .zerowam import ZERO_WAM_COMMIT
     path = Path(path)
     temporary = path.with_name(path.name + ".tmp")
-    payload = {"format_version": 1, "upstream_commit": ZERO_WAM_COMMIT, "config": config,
+    payload = {"format_version": 2, "upstream_commit": ZERO_WAM_COMMIT, "config": config,
                "stage": trainer.stage, "model": adapter_state(trainer), "optimizer": trainer.optimizer.state_dict(),
                "updates": trainer.updates, "attempted_steps": attempted_steps, "rng": generator.get_state(),
                "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
@@ -366,18 +384,24 @@ def save_run(path, trainer, config, generator, attempted_steps, tiny_native):
     temporary.replace(path)
 
 
-def restore_run(path, trainer, config, generator, *, resume):
+def load_run(path, *, mmap=False):
     from .zerowam import ZERO_WAM_COMMIT
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint["format_version"] != 1 or checkpoint["upstream_commit"] != ZERO_WAM_COMMIT:
-        raise ValueError("artifact source/schema differs")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=mmap)
+    if (not isinstance(checkpoint, dict) or checkpoint.get("format_version") != 2
+            or checkpoint.get("upstream_commit") != ZERO_WAM_COMMIT):
+        raise ValueError("artifact source/schema differs; v2 requires retraining the effect interface")
+    return checkpoint
+
+
+def restore_run(path, trainer, config, generator, *, resume):
+    checkpoint = load_run(path)
     if checkpoint["tiny_native"] != trainer.tiny_native or checkpoint["base_identity"] != trainer.base_identity:
         raise ValueError("artifact frozen base identity or tiny/native mode differs")
     if resume and (checkpoint["stage"] != trainer.stage or checkpoint["config"] != config):
         raise ValueError("resume requires the same stage and full config; use initialize for stage transitions")
     if getattr(trainer, "action_spaces", {}) and checkpoint.get("action_spaces", {}) != trainer.action_spaces:
         raise ValueError("action normalization registry differs from the learned interface")
-    for key in ("dimensions", "interface", "tokens", "current_offsets", "remaining_offsets", "lora"):
+    for key in ("dimensions", "interface", "tokens", "current_offsets", "remaining_offsets", "lora", "binding_policy"):
         if checkpoint["config"][key] != config[key]:
             raise ValueError(f"artifact {key} differs; do not mix interface controls or token contracts")
     expected = adapter_state(trainer)
@@ -405,7 +429,7 @@ def train(args):
     if args.stage != "interface" and not (args.resume or args.initialize):
         raise ValueError("reader/joint stages require the validated preceding stage artifact")
     if args.resume or args.initialize:
-        header = torch.load(args.resume or args.initialize, map_location="cpu", weights_only=True, mmap=True)
+        header = load_run(args.resume or args.initialize, mmap=True)
         if header.get("physical_calibration"):
             raise ValueError("candidate-calibrated policy is locked; continue training from its pre-calibration artifact")
         del header
@@ -475,7 +499,7 @@ def calibrate_physical(args):
     from .data import load_sample
     from .models import CausalEffectPredictor, physical_prediction_loss
     from .zerowam import ZERO_WAM_COMMIT
-    artifact = torch.load(args.artifact, map_location="cpu", weights_only=True)
+    artifact = load_run(args.artifact)
     if artifact["upstream_commit"] != ZERO_WAM_COMMIT or artifact.get("physical_calibration"):
         raise ValueError("use a matching artifact that has not already had its F calibration pass")
     if artifact["stage"] not in {"reader", "joint"}:
@@ -542,7 +566,7 @@ def predict(args):
     from .data import load_observation
     from .models import effect_cost
     from .zerowam import TaskConditions
-    artifact = torch.load(args.artifact, map_location="cpu", weights_only=True)
+    artifact = load_run(args.artifact)
     config = artifact["config"]
     if artifact["stage"] not in {"reader", "joint"}:
         raise ValueError("demonstration inference requires a trained reader artifact")
@@ -550,6 +574,8 @@ def predict(args):
         raise ValueError("formal prediction/evaluation needs a validation-locked config; use diagnostic for interface checks")
     if args.candidates == 4 and not artifact.get("physical_calibration"):
         raise ValueError("four-candidate F ranking requires the bounded candidate-distribution calibration")
+    if not args.diagnostic and not config["binding_policy"]["validation_locked"]:
+        raise ValueError("formal inference requires validation-locked binding thresholds")
     output = Path(args.output)
     if output.exists() and any(output.iterdir()):
         raise ValueError("prediction output must be a fresh directory")
@@ -563,34 +589,9 @@ def predict(args):
     space = action_space({"action_space": sample.action_space}, config["dimensions"]["action_dim"])
     if trainer.action_spaces.get(space["normalization_id"]) != space:
         raise ValueError("observation action normalization differs from the trained interface")
-    ids = sample.entity_ids
-    if args.view >= len(sample.demonstrations):
-        raise ValueError("requested demonstration view is absent")
-    current = torch.tensor(config["current_offsets"], device=args.device, dtype=torch.int64)
-    remaining = torch.tensor(config["remaining_offsets"], device=args.device, dtype=torch.int64)
-    goals = trainer.reader(sample.demonstrations[args.view], sample.robot_history, sample.proprio_history,
-                           sample.embodiment, current, remaining, entity_present=ids >= 0)
-    conditions = TaskConditions(goals.current, goals.remaining, null)
-    dtype = next(trainer.adapter.native.parameters()).dtype
-    observed = sample.robot_latent.to(dtype=dtype)
-    chunk = sample.chunk_size
-    frame_id = 2 * observed.shape[2]
-    history = (("video", observed, 0),)
-    shape = (1, observed.shape[1], chunk, *observed.shape[-2:])
-    noise = torch.randn(shape, generator=generator).to(device=args.device, dtype=dtype)
-    future = trainer.adapter.sample_video(noise, conditions, history=history, steps=args.sampling_steps,
-                                          shift=config["video_snr_shift"], frame_id=frame_id)
-    action_shape = (1, trainer.adapter.native.config.action_dim, chunk, sample.actions_per_frame, 1)
-    if max(config["current_offsets"]) > chunk * sample.actions_per_frame:
-        raise ValueError("candidate action horizon cannot cover the current requirement time grid")
-    requirement = trainer.codec.decode(goals.current, sample.robot_history[:, -1], current, ids).materialize(interface=config["interface"])
-    if not bool(requirement.has_requirement.all()):
-        output.mkdir(parents=True, exist_ok=True)
-        report = {"status": "rejected", "reason": "empty_current_requirement", "selected_index": None,
-                  "commands_sent": 0, "diagnostic": args.diagnostic}
-        write_json(output / "prediction.json", report)
-        return report
-    channel_mask = torch.tensor(space["valid_channels"], device=args.device)[None, :, None, None, None]
+    from .inference import NativePolicy, RequirementRejected
+    policy = NativePolicy(trainer, null, config, sampling_steps=args.sampling_steps, view=args.view,
+                          diagnostic=args.diagnostic)
     scoring = {}
     if args.candidates == 4 and not args.diagnostic:
         if not args.scoring_config:
@@ -606,21 +607,31 @@ def predict(args):
         weights = scoring.get("field_weights", {})
         if set(weights) != {"geometry", "relations", "events"} or any(not isinstance(v, (int, float)) or not np.isfinite(v) or v <= 0 for v in weights.values()):
             raise ValueError("locked scoring must explicitly state every finite positive field weight")
+        event_threshold = scoring.get("event_threshold")
+        if not isinstance(event_threshold, (int, float)) or not np.isfinite(event_threshold) or not 0 < event_threshold < 1:
+            raise ValueError("locked scoring must state its event-occurrence threshold in (0,1)")
         uncertainty = scoring.get("uncertainty_weight")
         if not isinstance(uncertainty, (int, float)) or not np.isfinite(uncertainty) or uncertainty < 0:
             raise ValueError("locked scoring must explicitly state its nonnegative uncertainty weight")
-    actions, costs = [], []
-    for _ in range(args.candidates):
-        initial = torch.randn(action_shape, generator=generator).to(device=args.device, dtype=dtype)
-        action = trainer.adapter.sample_actions(initial, conditions, future, history=history, steps=args.sampling_steps,
-                                                action_mask=channel_mask)
-        physical_action = action.float().permute(0, 2, 3, 4, 1).reshape(1, -1, action.shape[1])
-        actions.append(physical_action[0].cpu().numpy())
-        if args.candidates == 4:
+    try:
+        candidates, requirements = policy.candidates(sample, None, random.Random(args.seed), count=args.candidates)
+    except RequirementRejected as error:
+        output.mkdir(parents=True, exist_ok=True)
+        report = {"status": "rejected", "reason": str(error), "selected_index": None,
+                  "commands_sent": 0, "diagnostic": args.diagnostic}
+        write_json(output / "prediction.json", report)
+        return report
+    requirement = requirements.current
+    actions = [np.asarray(candidate.actions, dtype=np.float32) for candidate in candidates]
+    costs = []
+    if args.candidates == 4:
+        for array in actions:
+            physical_action = torch.from_numpy(array).to(args.device)[None]
             outcome = trainer.physical(sample.robot_history, sample.proprio_history, physical_action,
-                                        sample.embodiment, entity_present=ids >= 0)
+                                        sample.embodiment, entity_present=sample.entity_ids >= 0)
             costs.append(float(effect_cost(outcome, requirement, field_weights=scoring.get("field_weights"),
-                                           uncertainty_weight=scoring.get("uncertainty_weight", 1.0))[0]))
+                                           uncertainty_weight=scoring.get("uncertainty_weight", 1.0),
+                                           event_threshold=scoring.get("event_threshold", 0.5))[0]))
     from .evaluation import Candidate, rank_candidates
     chosen, status = 0, "selected"
     if costs:
@@ -632,7 +643,7 @@ def predict(args):
     np.savez_compressed(output / "candidates.npz", **{f"candidate_{i}": array for i, array in enumerate(actions)})
     report = {"status": status, "selected_index": chosen, "candidate_count": len(actions),
               "costs": [value if np.isfinite(value) else None for value in costs],
-              "current_binding_slots": requirement.binding[0].tolist(), "entity_ids": ids[0].tolist(),
+              "current_binding_slots": requirement.binding[0].tolist(), "entity_ids": sample.entity_ids[0].tolist(),
               "prefix_steps": max(1, actions[0].shape[0] // 4), "normalized_actions": True,
               "action_space": space,
               "commands_sent": 0, "diagnostic": args.diagnostic,
@@ -647,6 +658,10 @@ def main(argv=None):
     commands.add_parser("doctor")
     commands.add_parser("check-native")
     commands.add_parser("check")
+    visual = commands.add_parser("preprocess-visual")
+    visual.add_argument("--manifest", required=True)
+    visual.add_argument("--output", required=True)
+    visual.add_argument("--device", default="cuda")
     fixture = commands.add_parser("make-fixture")
     fixture.add_argument("--output", required=True)
     validate = commands.add_parser("validate-data")
@@ -691,6 +706,9 @@ def main(argv=None):
             result = doctor()
         elif args.command == "make-fixture":
             result = make_fixture(args.output)
+        elif args.command == "preprocess-visual":
+            from .vision import preprocess
+            result = preprocess(args.manifest, args.output, device=args.device)
         elif args.command == "validate-data":
             from .data import load_sample
             samples, records = load_index(args.index)

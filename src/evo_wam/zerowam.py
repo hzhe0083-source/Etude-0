@@ -421,16 +421,94 @@ class ZeroWAMAdapter(nn.Module):
         self._fused = None
         self._physical_actions = None
 
-    def forward_train(self, inputs: dict, conditions: TaskConditions) -> NativeOutput:
+    def _call_native(self, *args, **kwargs):
+        # History, training and sampling have distinct native Flex signatures.
+        # Do not silently fall back to a dense score matrix at Dynamo's default
+        # eight-specialization limit; a real capacity failure must be visible.
+        import torch._dynamo.config as compiler_config
+        with compiler_config.patch(recompile_limit=max(32, compiler_config.recompile_limit),
+                                   fail_on_recompile_limit_hit=True):
+            return self.native(*args, **kwargs)
+
+    def _history_training_inputs(self, inputs: dict, history) -> tuple[dict, Tensor, Tensor]:
+        """Rebase future grids after past context without changing targets/noise."""
+        chunks = tuple(_history_chunk(item) for item in history)
+        frame_start = 2 * (max(chunk.frame_id for chunk in chunks) // 2 + 1)
+        rope_start = max(chunk.rope_offset + chunk.latent.shape[2] // (
+            self.native.patch_size[0] if chunk.mode == "video" else 1) for chunk in chunks)
+        base = inputs["latent_dict"]["grid_id"][0, 0].min()
+        if inputs["action_dict"]["grid_id"][0, 0].min() != base:
+            raise ValueError("Future video/action training grids must share a window origin")
+
+        def shifted(stream):
+            grid = stream["grid_id"].clone()
+            grid[:, 0] += rope_start - base
+            return {**stream, "grid_id": grid}
+
+        result = {**inputs, "latent_dict": shifted(inputs["latent_dict"]),
+                  "action_dict": shifted(inputs["action_dict"]),
+                  "mcp_latent_dicts": [shifted(s) for s in inputs.get("mcp_latent_dicts", [])]}
+        size = int(inputs["chunk_size"])
+        if size < 1:
+            raise ValueError("Training chunk_size must be positive")
+        video_frames = ((result["latent_dict"]["grid_id"][0, 0] - rope_start) // size * 2 + frame_start).to(torch.int)
+        action_frames = ((result["action_dict"]["grid_id"][0, 0] - rope_start) // size * 2 + frame_start + 1).to(torch.int)
+        return result, video_frames, action_frames
+
+    def _history_training_masks(self, original, prefix_seq, prefix_frame,
+                                video_frames, action_frames):
+        """Extend native teacher forcing with clean, observed prefix KV keys."""
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        def prepare(seq_ids, frame_ids, noise_ids, type_ids, icl_ids,
+                    cross_seq_ids, encoder_seq_ids, window_size, blocks):
+            frames = torch.cat([video_frames, video_frames, action_frames, action_frames])
+            frames = torch.cat([frames, frames.new_full((frame_ids.numel() - frames.numel(),), -1)])
+            original(seq_ids, frames, noise_ids, type_ids, icl_ids,
+                     cross_seq_ids, encoder_seq_ids, window_size, blocks)
+            # MCP has its own blocks and no prefix KV. Its only task-bearing
+            # source remains the native fused main-branch Phi.
+            if blocks is not self.native.blocks:
+                return
+            key_seq = torch.cat([prefix_seq, seq_ids])
+            key_frame = torch.cat([prefix_frame, frames])
+            key_noise = torch.cat([torch.ones_like(prefix_seq), noise_ids])
+            window = torch.tensor(window_size, device=seq_ids.device, dtype=torch.int)
+
+            def mask(b, h, q, k):
+                valid = (seq_ids[q] >= 0) & (seq_ids[q] == key_seq[k])
+                in_window = (window == -1) | ((frames[q] - key_frame[k]).abs() <= window)
+                clean = (noise_ids[q] == 1) & (key_noise[k] == 1) & (key_frame[k] <= frames[q])
+                past = (noise_ids[q] == 0) & (key_noise[k] == 1) & (key_frame[k] < frames[q])
+                same_noisy = (noise_ids[q] == 0) & (key_noise[k] == 0) & (key_frame[k] == frames[q])
+                return valid & in_window & (clean | past | same_noisy)
+
+            self_mask = create_block_mask(mask, 1, 1, seq_ids.numel(), key_seq.numel(),
+                                          device=seq_ids.device, _compile=False)
+            for block in blocks:
+                block.attn1.set_block_masks(self_mask=self_mask)
+        return prepare
+
+    def forward_train(self, inputs: dict, conditions: TaskConditions, *, history=()) -> NativeOutput:
         self.clear_cache()
+        original_masks = self.native._build_training_masks
+        had_override = "_build_training_masks" in self.native.__dict__
         try:
+            if history:
+                inputs, video_frames, action_frames = self._history_training_inputs(inputs, history)
+                # Unlike deployment prefill, training context stays differentiable
+                # through native W. Only the observed data tensors are detached.
+                self._prefill_history(history, conditions)
+                self.native._build_training_masks = self._history_training_masks(
+                    original_masks, self.native.seq_ids_cache, self.native.frame_ids_cache,
+                    video_frames, action_frames)
             if getattr(self.native, "enable_mcp", False):
                 action = inputs["action_dict"]
                 self._physical_actions = torch.cat([
                     self.native._training_embed(action["noisy_latents"], action["timesteps"], "action")[0],
                     self.native._training_embed(action["latent"], action["cond_timesteps"], "action")[0],
                 ], dim=1)
-            result = self.native(self._condition_input(inputs, conditions), train_mode=True)
+            result = self._call_native(self._condition_input(inputs, conditions), train_mode=True)
             video, action = result[:2]
             count = video.shape[1] // int(torch.tensor(self.native.patch_size).prod())
             if self._fused is not None:
@@ -442,6 +520,10 @@ class ZeroWAMAdapter(nn.Module):
                 phi = self._hidden[len(self.native.blocks) - 1][:, :count]
             return NativeOutput(video, action, list(result[2]) if len(result) == 3 else [], phi)
         finally:
+            if had_override:
+                self.native._build_training_masks = original_masks
+            elif "_build_training_masks" in self.native.__dict__:
+                del self.native._build_training_masks
             self.clear_cache()
 
     def _stream(self, data: Tensor, mode: str, timestep, frame_id: int,
@@ -503,6 +585,9 @@ class ZeroWAMAdapter(nn.Module):
     def prefill_history(self, history: Sequence[NativeHistoryChunk | tuple[str, Tensor, int]],
                         conditions: TaskConditions) -> None:
         """Clear and replay only actual observed video/action chunks in time order."""
+        self._prefill_history(history, conditions.detached())
+
+    def _prefill_history(self, history, conditions) -> None:
         self.clear_cache()
         previous = -1
         ends = {"video": -1, "action": -1}
@@ -519,7 +604,7 @@ class ZeroWAMAdapter(nn.Module):
                 payload = self._stream(chunk.latent.detach(), chunk.mode, 0, chunk.frame_id,
                                        cache_type=0, rope_offset=chunk.rope_offset,
                                        token_valid=chunk.token_valid)
-                self.native(self._condition_input(payload, conditions.detached()),
+                self._call_native(self._condition_input(payload, conditions),
                             mode=f"forward_{'latent' if chunk.mode == 'video' else 'action'}_only", update_cache=1)
         except Exception:
             self.clear_cache()
@@ -544,7 +629,7 @@ class ZeroWAMAdapter(nn.Module):
             for timestep in scheduler.timesteps:
                 payload = self._stream(sample, "video", timestep, frame_id, grid_id,
                                        rope_offset=rope_offset)
-                velocity = self.native(self._condition_input(payload, conditions),
+                velocity = self._call_native(self._condition_input(payload, conditions),
                                        mode="forward_latent_only", update_cache=0)
                 velocity = unpack_velocity(velocity, sample.shape, self.native.patch_size)
                 sample = scheduler.step(velocity, timestep, sample)
@@ -566,14 +651,14 @@ class ZeroWAMAdapter(nn.Module):
             with torch.no_grad():
                 video = self._stream(future.latents, "video", 0, future.frame_id,
                                      future.grid_id, cache_type=1, rope_offset=future.rope_offset)
-                self.native(self._condition_input(video, future.conditions),
+                self._call_native(self._condition_input(video, future.conditions),
                             mode="forward_latent_only", update_cache=1)
             offset = future.rope_offset
             if offset is None:
                 offset = int(future.grid_id[0].min().item())
             action = self._stream(noisy_action, "action", timestep, future.frame_id + 1,
                                   rope_offset=offset)
-            result = self.native(self._condition_input(action, conditions),
+            result = self._call_native(self._condition_input(action, conditions),
                                  mode="forward_action_only", update_cache=0)
             return unpack_velocity(result, noisy_action.shape)
         finally:
@@ -610,9 +695,9 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     model = native_cls(patch_size=(1, 1, 1), num_attention_heads=2,
                       attention_head_dim=18, in_channels=4, out_channels=4,
                       action_dim=3, text_dim=8, freq_dim=4, ffn_dim=16,
-                      num_layers=1, rope_max_seq_len=32, action_inner_dim=36,
+                      num_layers=2, rope_max_seq_len=32, action_inner_dim=36,
                       action_ffn_dim=16, attn_window=8, enable_mcp=True,
-                      num_mcp_modules=1, mcp_hidden_collect_layers=(0,))
+                      num_mcp_modules=1, mcp_hidden_collect_layers=(0, 1))
     adapter = ZeroWAMAdapter(model.to(device="cuda", dtype=torch.bfloat16), 8, lora_rank=2)
     adapter.eval().set_stage("joint")
     device, dtype = "cuda", torch.bfloat16
@@ -669,6 +754,50 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
     shortcut = torch.autograd.grad(blocked.mcp[0].float().square().mean(),
                                    alternate_current, allow_unused=True)[0]
     assert shortcut is None or not shortcut.any()
+
+    # A real training-history check, independent of future targets: changing
+    # observed commands changes main W/Phi; changing invalid padding does not.
+    historical_video = torch.randn_like(video).detach()
+    historical_action = torch.randn_like(action).detach()
+    history_valid = torch.tensor([True, True, True, False])
+    train_history = [NativeHistoryChunk("video", historical_video, 4, 10),
+                     NativeHistoryChunk("action", historical_action, 5, 10, history_valid)]
+    saved_grids = [inputs["latent_dict"]["grid_id"].clone(), inputs["action_dict"]["grid_id"].clone(),
+                   inputs["mcp_latent_dicts"][0]["grid_id"].clone()]
+    prefix_keys = []
+
+    def capture_training_prefix(module, args):
+        if args[0] is not None and args[1] is not None:
+            key = module.attn_caches["pos"]["k"]
+            assert key.requires_grad, "Training history was detached/no_grad"
+            key.retain_grad()
+            prefix_keys.append(key)
+
+    history_hook = model.blocks[1].attn1.register_forward_pre_hook(capture_training_prefix)
+    contextual = adapter.forward_train(inputs, conditions, history=train_history)
+    history_hook.remove()
+    changed = historical_action.clone()
+    changed[:, :, 0, 0] += 3
+    different = adapter.forward_train(inputs, conditions, history=[train_history[0],
+        NativeHistoryChunk("action", changed, 5, 10, history_valid)])
+    assert not torch.equal(contextual.video, different.video)
+    assert not torch.equal(contextual.phi, different.phi)
+    padding_only = historical_action.clone()
+    padding_only[:, :, -1, -1] = 999
+    padded = adapter.forward_train(inputs, conditions, history=[train_history[0],
+        NativeHistoryChunk("action", padding_only, 5, 10, history_valid)])
+    replay = adapter.forward_train(inputs, conditions, history=train_history)
+    for output in (padded, replay):
+        torch.testing.assert_close(contextual.video, output.video, rtol=0, atol=0)
+        torch.testing.assert_close(contextual.phi, output.phi, rtol=0, atol=0)
+    assert contextual.video.shape == result.video.shape and contextual.phi.shape == result.phi.shape
+    for before, after in zip(saved_grids, [inputs["latent_dict"]["grid_id"], inputs["action_dict"]["grid_id"],
+                                          inputs["mcp_latent_dicts"][0]["grid_id"]]):
+        assert torch.equal(before, after), "A paired view mutated the shared future grid"
+    (contextual.video.float().square().mean() + contextual.mcp[0].float().square().mean()).backward()
+    assert prefix_keys and all(key.grad is not None and torch.isfinite(key.grad).all()
+                               and key.grad.abs().sum() > 0 for key in prefix_keys)
+    assert "_build_training_masks" not in model.__dict__ and model.seq_ids_cache is None
     adapter.zero_grad(set_to_none=True)
     current.grad = None
     remaining.grad = None
@@ -726,4 +855,5 @@ def tiny_native_smoke(source=DEFAULT_SOURCE) -> dict:
             "mcp_phi_only_task_path": True, "current_remaining_types": True,
             "inactive_action_channels_zero_each_step": True,
             "observed_action_history": True, "history_padding_excluded": True,
-            "independent_rope_offset": True}
+            "independent_rope_offset": True, "training_observed_history": True,
+            "differentiable_history_prefix": True, "paired_training_grids_unchanged": True}

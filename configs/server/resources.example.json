@@ -1,0 +1,17 @@
+{
+  "zero_wam_checkpoint": null,
+  "wan_vae_directory": null,
+  "wan_vae_sha256": {},
+  "dataset_index": null,
+  "audited_experiment_config": null,
+  "trained_evo_artifact": null,
+  "robotwin_root": null,
+  "robotwin_revision": "2eeec322",
+  "robotwin_task_config": null,
+  "robotwin_normalization_stats": null,
+  "robotwin_normalization_sha256": null,
+  "visual_track_provider": null,
+  "original_success_predicate": null,
+  "zero_wam_success_predicate": null,
+  "control_dt": null
+}

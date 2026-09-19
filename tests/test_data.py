@@ -1,4 +1,5 @@
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -10,7 +11,7 @@ from torch import nn
 
 from evo_wam.data import (
     TaskCondition, assign_splits, connected_components, executed_prefix_valid,
-    load_experiment, load_sample, paired_dropout_disabled, prepare_training_input,
+    load_experiment, load_observation, load_sample, paired_dropout_disabled, prepare_training_input,
     shared_denoising_inputs, validate_splits,
 )
 
@@ -18,12 +19,19 @@ from evo_wam.data import (
 def write_fixture(directory: Path):
     """Small numeric fixture: two entities, a partially executed eight-step plan."""
     meta = {
-        "format_version": 1, "arrays": "arrays.npz", "source_id": "human-1",
+        "format_version": 2, "kind": "training_sample", "arrays": "arrays.npz", "source_id": "human-1",
         "trajectory_id": "robot-1", "history_id": "robot-1-at-12",
         "coordinate_frame": "robot_base", "task_annotation": "audited-required-events-v1",
-        "window_start": 12, "executed_steps": 2, "control_dt": 0.05,
+        "window_start": 12, "observation_step": 12, "executed_steps": 2, "control_dt": 0.05,
         "view_ids": ["front", "side"],
+        "actions_per_frame": 2,
+        "history_chunks": [
+            {"mode": "video", "slice": [0, 2], "frame_id": 0, "rope_offset": 0},
+            {"mode": "action", "slice": [0, 3], "frame_id": 1, "rope_offset": 0},
+        ],
     }
+    meta["action_space"] = {"representation": "zero-wam-normalized", "normalization_id": "test-v2", "dimension": 3, "valid_channels": [True, True, True]}
+    meta["observed_action_space"] = dict(meta["action_space"])
     arrays = {
         "entity_ids": np.array([11, 22], dtype=np.int64),
         "step_offsets": np.array([1, 2, 4, 8], dtype=np.int64),
@@ -32,6 +40,9 @@ def write_fixture(directory: Path):
         "embodiment": np.zeros(2, dtype=np.float32),
         "entity_patch_weights": np.ones((2, 8), dtype=np.float32) / 8,
         "robot_latent": np.zeros((4, 2, 2, 2), dtype=np.float32),
+        "observed_action_history": np.arange(9, dtype=np.float32).reshape(3, 3) / 10,
+        "observed_action_step_offsets": np.array([-2, -1, 0], dtype=np.int64),
+        "observed_video_step_offsets": np.array([-2, 0], dtype=np.int64),
         "actions": np.zeros((8, 3), dtype=np.float32),
         "demo_view_0": np.zeros((3, 4), dtype=np.float32),
         "demo_view_1": np.ones((3, 4), dtype=np.float32),
@@ -47,9 +58,18 @@ def write_fixture(directory: Path):
             arrays[f"{part}_{field}"] = np.zeros(shape, dtype=np.float32)
             arrays[f"{part}_{field}_valid"] = np.ones(shape, dtype=np.bool_)
             arrays[f"{part}_{field}_required"] = np.ones(shape, dtype=np.bool_)
+        arrays[f"{part}_geometry_tolerance"] = np.full((2, 2, 3), .25, dtype=np.float32)
+        arrays[f"{part}_geometry_tolerance_valid"] = np.ones((2, 2, 3), dtype=np.bool_)
+        windows = np.array(offsets, dtype=np.int64).reshape(2, 1, 1, 1, 1)
+        arrays[f"{part}_event_windows"] = np.broadcast_to(windows, (2, 2, 2, 2, 2)).copy()
+        arrays[f"{part}_event_windows_valid"] = np.ones((2, 2, 2, 2), dtype=np.bool_)
+        arrays[f"{part}_events"].flat[[0, 8]] = 1
+        arrays[f"{part}_event_precedence"] = np.array([[0, 8], [-1, -1]], dtype=np.int64)
+        arrays[f"{part}_event_precedence_valid"] = np.ones(2, dtype=np.bool_)
     for view in (0, 1):
-        for field in ("current_binding", "remaining_binding"):
-            arrays[f"view{view}_{field}_valid"] = np.ones(2, dtype=np.bool_)
+        for part in ("current", "remaining"):
+            for field in ("binding", "geometry", "relations", "events", "geometry_tolerance", "event_windows", "event_precedence"):
+                arrays[f"view{view}_{part}_{field}_valid"] = np.ones_like(arrays[f"{part}_{field}_valid"])
         for field in ("relations", "events"):
             arrays[f"view{view}_{field}_valid"] = np.ones_like(arrays[f"outcome_{field}"], dtype=np.bool_)
     arrays["view1_current_binding_valid"][0] = False
@@ -169,7 +189,10 @@ class DataTests(unittest.TestCase):
             self.assertEqual(sample.requirement.remaining.step_offsets.tolist(), [4, 8])
             self.assertTrue(sample.outcome.label_valid["geometry"][:, :2].all())
             self.assertFalse(sample.outcome.label_valid["geometry"][:, 2:].any())
-            self.assertFalse(sample.common_valid["current_binding"][0, 0])
+            self.assertTrue(sample.per_view_valid[0]["current.binding"][0, 0])
+            self.assertFalse(sample.per_view_valid[1]["current.binding"][0, 0])
+            torch.testing.assert_close(sample.requirement.current.geometry_tolerance, torch.full((1, 2, 2, 3), .25))
+            self.assertEqual(sample.requirement.current.event_precedence.tolist(), [[[0, 8], [-1, -1]]])
             self.assertTrue(sample.requirement.remaining.label_valid["geometry"].all())
             self.assertEqual(sample.native_inputs, {})
             arrays["outcome_relations"] = np.zeros((4, 2, 3), dtype=np.float32)
@@ -185,15 +208,103 @@ class DataTests(unittest.TestCase):
             np.savez(root / "arrays.npz", **arrays)
             with self.assertRaises(ValueError):
                 load_sample(root / "sample.json")
+            meta, arrays = write_fixture(root)
             meta["arrays"] = "../arrays.npz"
             (root / "sample.json").write_text(json.dumps(meta))
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "within the manifest directory"):
                 load_sample(root / "sample.json")
             meta["arrays"] = "arrays.npz"
             meta["native_arrays"] = {"text_emb": {"target": "native_answer"}}
             (root / "sample.json").write_text(json.dumps(meta))
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "never task conditions"):
                 load_sample(root / "sample.json")
+
+    def test_observed_action_prefix_has_time_format_and_padding_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta, arrays = write_fixture(root)
+            # Computational positions are deliberately not inferred from length.
+            meta["history_chunks"][0].update(frame_id=8, rope_offset=13)
+            meta["history_chunks"][1].update(frame_id=9, rope_offset=13)
+            (root / "sample.json").write_text(json.dumps(meta))
+            sample = load_sample(root / "sample.json")
+            history = sample.native_history(dtype=torch.bfloat16)
+            self.assertEqual([chunk.mode for chunk in history], ["video", "action"])
+            action = history[1]
+            self.assertEqual(action.latent.shape, (1, 3, 2, 2, 1))
+            self.assertEqual(action.latent.dtype, torch.bfloat16)
+            self.assertEqual(action.token_valid.tolist(), [True, True, True, False])
+            actual = action.latent.permute(0, 2, 3, 4, 1).reshape(1, 4, 3)
+            torch.testing.assert_close(actual[:, :3].float(), sample.observed_action_history.commands,
+                                       rtol=0.01, atol=0.01)
+            self.assertFalse(actual[:, 3].any())
+            sample.actions.fill_(999)
+            torch.testing.assert_close(sample.native_history(dtype=torch.bfloat16)[1].latent, action.latent)
+            self.assertEqual(sample.sampling_position(), {"frame_id": 10, "rope_offset": 15})
+            self.assertEqual(sample.observed_action_history.step_offsets.tolist(), [-2, -1, 0])
+            forged = replace(sample, observed_action_history=replace(
+                sample.observed_action_history, step_offsets=torch.tensor([-2, -1, 1])))
+            with self.assertRaisesRegex(ValueError, "never future"):
+                forged.native_history()
+            with self.assertRaisesRegex(ValueError, "never future"):
+                forged.sampling_position()
+
+    def test_v2_rejects_future_unsorted_or_misnormalized_history_and_missing_semantics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta, arrays = write_fixture(root)
+            for case in ("future_action", "future_video", "unsorted", "format", "source", "missing_history", "missing_semantics", "legacy"):
+                changed_meta, changed_arrays = copy.deepcopy(meta), {key: value.copy() for key, value in arrays.items()}
+                if case == "future_action":
+                    changed_arrays["observed_action_step_offsets"][-1] = 1
+                elif case == "future_video":
+                    changed_arrays["observed_video_step_offsets"][-1] = 1
+                elif case == "unsorted":
+                    changed_arrays["observed_action_step_offsets"][:] = [0, -1, -2]
+                elif case == "format":
+                    changed_meta["observed_action_space"]["normalization_id"] = "other-robot"
+                elif case == "source":
+                    changed_meta["history_chunks"][1]["source"] = "actions"
+                elif case == "missing_history":
+                    del changed_arrays["observed_action_history"]
+                elif case == "missing_semantics":
+                    del changed_arrays["current_event_windows_valid"]
+                else:
+                    changed_meta["format_version"] = 1
+                (root / "sample.json").write_text(json.dumps(changed_meta))
+                np.savez(root / "arrays.npz", **changed_arrays)
+                with self.subTest(case=case), self.assertRaises(ValueError):
+                    load_sample(root / "sample.json")
+
+    def test_observation_keeps_only_past_commands_and_accepts_explicit_empty_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta, arrays = write_fixture(root)
+            keys = {"entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent", "demo_view_0", "demo_view_1",
+                    "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"}
+            observed = {key: arrays[key] for key in keys}
+            meta.update(kind="observation", chunk_size=2)
+            path = root / "observation.json"
+            path.write_text(json.dumps(meta))
+            np.savez(root / "arrays.npz", **observed)
+            sample = load_observation(path)
+            self.assertFalse(hasattr(sample, "actions"))
+            self.assertEqual(sample.observed_action_history.commands.shape, (1, 3, 3))
+            self.assertEqual(len(sample.native_history()), 2)
+            forged = replace(sample, observed_action_history=replace(
+                sample.observed_action_history, step_offsets=torch.tensor([-2, -1, 1])))
+            with self.assertRaisesRegex(ValueError, "never future"):
+                forged.native_history()
+            observed["observed_action_history"] = np.empty((0, 3), dtype=np.float32)
+            observed["observed_action_step_offsets"] = np.empty(0, dtype=np.int64)
+            meta["history_chunks"] = meta["history_chunks"][:1]
+            path.write_text(json.dumps(meta))
+            np.savez(root / "arrays.npz", **observed)
+            self.assertEqual(len(load_observation(path).native_history()), 1)
+            observed["actions"] = arrays["actions"]
+            np.savez(root / "arrays.npz", **observed)
+            with self.assertRaises(ValueError):
+                load_observation(path)
 
     def test_native_numeric_streams_remain_separate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -215,6 +326,8 @@ class DataTests(unittest.TestCase):
         v0, v1 = copy.deepcopy(configs["V0"]), copy.deepcopy(configs["V1"])
         self.assertEqual(v0.pop("lambda_cv"), 0)
         self.assertGreater(v1.pop("lambda_cv"), 0)
+        self.assertEqual(v0["training"]["loss_weights"].pop("cv"), 0)
+        self.assertGreater(v1["training"]["loss_weights"].pop("cv"), 0)
         self.assertEqual(v0, v1)
         geo, full = copy.deepcopy(configs["geometry"]), copy.deepcopy(configs["full"])
         self.assertEqual(geo.pop("interface"), "geometry")
@@ -228,6 +341,15 @@ class DataTests(unittest.TestCase):
         self.assertEqual(load_experiment(directory / "V0.json"), configs["V0"])
         with self.assertRaises(ValueError):
             load_experiment(directory / "V1.json", for_test=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "experiment.json"
+            for field in ("confidence_threshold", "margin_threshold"):
+                for endpoint in (0, 1):
+                    invalid = copy.deepcopy(configs["V1"])
+                    invalid["binding_policy"][field] = endpoint
+                    path.write_text(json.dumps(invalid))
+                    with self.subTest(field=field, endpoint=endpoint), self.assertRaises(ValueError):
+                        load_experiment(path)
 
 
 if __name__ == "__main__":

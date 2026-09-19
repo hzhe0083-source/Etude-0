@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from .contracts import EffectRequirement, FIELDS, PhysicalOutcome, TaskRequirement
+from .contracts import EffectRequirement, FIELDS, REQUIREMENT_SEMANTICS, PhysicalOutcome, TaskRequirement
 from .losses import paired_dropout_disabled
 
 
@@ -174,6 +174,159 @@ def executed_prefix_valid(
 
 
 @dataclass(frozen=True)
+class ObservedActionHistory:
+    """Only commands confirmed executed before the current observation."""
+    commands: Tensor                         # [1,K,A], K may explicitly be zero
+    step_offsets: Tensor                     # int64 [K], command end offsets <= 0
+    action_space: Mapping
+    observation_step: int
+    control_dt: float
+
+
+def _action_space(space, dimension: int) -> dict:
+    if (not isinstance(space, dict) or space.get("representation") != "zero-wam-normalized"
+            or not isinstance(space.get("normalization_id"), str) or not space["normalization_id"]
+            or type(space.get("dimension")) is not int or space["dimension"] != dimension):
+        raise ValueError("observed action space requires normalized format, normalization ID and matching dimension")
+    valid = space.get("valid_channels")
+    if not isinstance(valid, list) or len(valid) != dimension or any(type(value) is not bool for value in valid) or not any(valid):
+        raise ValueError("action valid_channels must explicitly identify every channel")
+    return space
+
+
+def _past_offsets(value: Tensor, count: int, name: str, observation_step: int) -> None:
+    if value.dtype != torch.int64 or value.shape != (count,):
+        raise ValueError(f"{name} must be int64 with one end offset per observed item")
+    if (value > 0).any() or (value < -observation_step).any() or (value[1:] <= value[:-1]).any():
+        raise ValueError(f"{name} must be increasing executed/observed offsets, never future or before episode start")
+
+
+def _history_metadata(meta: Mapping, values: Mapping[str, Tensor]):
+    step = meta.get("observation_step")
+    if type(step) is not int or step < 0:
+        raise ValueError("observation_step must identify the current absolute control step")
+    dt = meta.get("control_dt")
+    if type(dt) not in (int, float) or not np.isfinite(dt) or dt <= 0:
+        raise ValueError("control_dt must be finite and positive")
+    per_frame = meta.get("actions_per_frame")
+    if type(per_frame) is not int or per_frame < 1:
+        raise ValueError("actions_per_frame must be a positive integer")
+    commands = values["observed_action_history"]
+    if commands.ndim != 2 or not commands.shape[1] or not commands.is_floating_point() or not torch.isfinite(commands).all():
+        raise ValueError("observed_action_history must be finite floating [executed_steps,A]")
+    space = _action_space(meta.get("observed_action_space"), commands.shape[1])
+    if space != _action_space(meta.get("action_space"), commands.shape[1]):
+        raise ValueError("observed history and current action space / normalization must agree")
+    active = torch.tensor(space["valid_channels"], device=commands.device)
+    if (commands[:, ~active] != 0).any():
+        raise ValueError("unused observed action channels must be zero")
+    offsets = values["observed_action_step_offsets"]
+    video = values["robot_latent"]
+    if video.ndim != 4 or not video.numel() or not video.is_floating_point() or not torch.isfinite(video).all():
+        raise ValueError("observed robot_latent must be finite [C,F,H,W]")
+    video_offsets = values["observed_video_step_offsets"]
+    _past_offsets(offsets, len(commands), "observed_action_step_offsets", step)
+    _past_offsets(video_offsets, video.shape[1], "observed_video_step_offsets", step)
+    descriptors = meta.get("history_chunks")
+    if not isinstance(descriptors, list) or not descriptors:
+        raise ValueError("history_chunks must explicitly describe the observed streams")
+    coverage = {"video": 0, "action": 0}
+    lengths = {"video": video.shape[1], "action": len(commands)}
+    previous_id = -1
+    rope_ends = {"video": 0, "action": 0}
+    chunk_rope = {}
+    for chunk in descriptors:
+        if not isinstance(chunk, dict) or set(chunk) != {"mode", "slice", "frame_id", "rope_offset"}:
+            raise ValueError("history descriptors must contain only mode/slice/frame_id/rope_offset")
+        mode = chunk["mode"]
+        bounds = chunk["slice"]
+        if mode not in coverage or not isinstance(bounds, list) or len(bounds) != 2 or any(type(v) is not int for v in bounds):
+            raise ValueError("invalid observed history mode or slice")
+        start, end = bounds
+        if start != coverage[mode] or not start < end <= lengths[mode]:
+            raise ValueError("history slices must cover each stored observed item once, in order")
+        frame_id, rope = chunk["frame_id"], chunk["rope_offset"]
+        if type(frame_id) is not int or frame_id <= previous_id or frame_id % 2 != int(mode == "action"):
+            raise ValueError("history frame IDs must increase, with video even and action odd")
+        if type(rope) is not int or rope < rope_ends[mode]:
+            raise ValueError("history RoPE offsets must be nonnegative and nonoverlapping within each stream")
+        chunk_index = frame_id // 2
+        if chunk_index in chunk_rope and chunk_rope[chunk_index] != rope:
+            raise ValueError("aligned video/action chunks must share a RoPE origin")
+        chunk_rope[chunk_index] = rope
+        count = end - start
+        rope_ends[mode] = rope + (count if mode == "video" else (count + per_frame - 1) // per_frame)
+        previous_id, coverage[mode] = frame_id, end
+    if coverage != lengths:
+        raise ValueError("history descriptors must include all stored observed video and executed commands")
+    observed = ObservedActionHistory(commands[None], offsets, dict(space), step, float(dt))
+    return observed, video_offsets, tuple(dict(chunk) for chunk in descriptors), per_frame
+
+
+def _validate_sample_history(sample) -> None:
+    """The in-memory provider path must enforce the same rules as file loading."""
+    history = sample.observed_action_history
+    video = sample.robot_latent
+    if video.ndim != 5 or video.shape[0] != 1:
+        raise ValueError("observed robot video must have native batch size one")
+    if history.commands.ndim != 3 or history.commands.shape[0] != 1:
+        raise ValueError("observed commands must have explicit batch size one")
+    if hasattr(sample, "metadata"):
+        space = sample.metadata.get("action_space")
+        if sample.metadata.get("observation_step") != history.observation_step:
+            raise ValueError("history timestamps differ from the training observation")
+    else:
+        space = sample.action_space
+    meta = {"observation_step": history.observation_step, "control_dt": history.control_dt,
+            "actions_per_frame": sample.actions_per_frame, "action_space": space,
+            "observed_action_space": history.action_space, "history_chunks": list(sample.history_chunks)}
+    _history_metadata(meta, {"robot_latent": video[0], "observed_video_step_offsets": sample.observed_video_step_offsets,
+                             "observed_action_history": history.commands[0], "observed_action_step_offsets": history.step_offsets})
+
+
+def native_history(sample, dtype: torch.dtype | None = None) -> tuple:
+    """Pack only explicit past observations, preserving partial action prefixes.
+
+    Native frame IDs are computational order, not physical timestamps. RoPE
+    offsets remain independently recorded. Unexecuted rectangle padding has
+    token_valid=False; it never becomes a command or readable history token.
+    """
+    from .zerowam import NativeHistoryChunk
+    _validate_sample_history(sample)
+    result = []
+    for chunk in sample.history_chunks:
+        start, end = chunk["slice"]
+        if chunk["mode"] == "video":
+            latent = sample.robot_latent[:, :, start:end]
+            valid = None
+        else:
+            commands = sample.observed_action_history.commands[:, start:end]
+            batch, count, channels = commands.shape
+            per_frame = sample.actions_per_frame
+            frames = (count + per_frame - 1) // per_frame
+            padded = commands.new_zeros(batch, frames * per_frame, channels)
+            padded[:, :count] = commands
+            latent = padded.reshape(batch, frames, per_frame, channels).permute(0, 3, 1, 2).unsqueeze(-1)
+            valid = torch.arange(frames * per_frame, device=commands.device) < count
+        if dtype is not None:
+            latent = latent.to(dtype=dtype)
+        result.append(NativeHistoryChunk(chunk["mode"], latent, chunk["frame_id"], chunk["rope_offset"], valid))
+    return tuple(result)
+
+
+def sampling_position(sample) -> dict[str, int]:
+    """Next native video position after explicitly recorded computational chunks."""
+    _validate_sample_history(sample)
+    rope_ends = []
+    for chunk in sample.history_chunks:
+        count = chunk["slice"][1] - chunk["slice"][0]
+        frames = count if chunk["mode"] == "video" else (count + sample.actions_per_frame - 1) // sample.actions_per_frame
+        rope_ends.append(chunk["rope_offset"] + frames)
+    return {"frame_id": 2 * (max(chunk["frame_id"] for chunk in sample.history_chunks) // 2 + 1),
+            "rope_offset": max(rope_ends)}
+
+
+@dataclass(frozen=True)
 class LoadedSample:
     metadata: Mapping
     robot_history: Tensor
@@ -185,8 +338,18 @@ class LoadedSample:
     demonstrations: tuple[Tensor, Tensor]
     outcome: PhysicalOutcome
     requirement: TaskRequirement
-    common_valid: Mapping[str, Tensor]
+    per_view_valid: tuple[Mapping[str, Tensor], Mapping[str, Tensor]]
     native_inputs: Mapping
+    observed_action_history: ObservedActionHistory
+    observed_video_step_offsets: Tensor
+    history_chunks: tuple[Mapping, ...]
+    actions_per_frame: int
+
+    def native_history(self, dtype: torch.dtype | None = None) -> tuple:
+        return native_history(self, dtype)
+
+    def sampling_position(self) -> dict[str, int]:
+        return sampling_position(self)
 
 
 def load_sample(manifest_path: str | Path) -> LoadedSample:
@@ -199,14 +362,16 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
     path = Path(manifest_path)
     with path.open(encoding="utf-8") as stream:
         meta = json.load(stream)
-    if not isinstance(meta, dict) or type(meta.get("format_version")) is not int or meta["format_version"] != 1:
-        raise ValueError("manifest must be a version-1 JSON object")
+    if not isinstance(meta, dict) or type(meta.get("format_version")) is not int or meta["format_version"] != 2 or meta.get("kind") != "training_sample":
+        raise ValueError("training requires an explicit version-2 training_sample manifest; v1 history/evidence cannot be inferred")
     for name in ("source_id", "trajectory_id", "history_id", "coordinate_frame", "task_annotation"):
         if not isinstance(meta.get(name), str) or not meta[name]:
             raise ValueError(f"manifest requires nonempty {name}")
     for name in ("window_start", "executed_steps"):
         if type(meta.get(name)) is not int or meta[name] < 0:
             raise ValueError(f"{name} must be a nonnegative integer")
+    if meta.get("observation_step") != meta["window_start"]:
+        raise ValueError("training observation_step must equal the future window's start")
     if not isinstance(meta.get("control_dt"), (float, int)) or isinstance(meta["control_dt"], bool) or not np.isfinite(meta["control_dt"]) or meta["control_dt"] <= 0:
         raise ValueError("control_dt must be a finite positive number")
     if not isinstance(meta.get("view_ids"), list) or len(meta["view_ids"]) != 2 or any(not isinstance(v, str) or not v for v in meta["view_ids"]):
@@ -217,15 +382,16 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
     array_path = (path.parent / array_name).resolve()
     if Path(array_name).is_absolute() or not array_path.is_relative_to(path.parent.resolve()) or array_path.suffix != ".npz":
         raise ValueError("array file must be an NPZ within the manifest directory")
-    required = {"entity_ids", "step_offsets", "robot_history", "proprio_history", "embodiment", "entity_patch_weights", "robot_latent", "actions", "demo_view_0", "demo_view_1"}
+    required = {"entity_ids", "step_offsets", "robot_history", "proprio_history", "embodiment", "entity_patch_weights", "robot_latent", "actions", "demo_view_0", "demo_view_1", "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"}
     for field in FIELDS:
         required |= {f"outcome_{field}", f"outcome_{field}_valid"}
         for part in ("current", "remaining"):
             required |= {f"{part}_{field}", f"{part}_{field}_valid", f"{part}_{field}_required"}
     for part in ("current", "remaining"):
         required |= {f"{part}_binding", f"{part}_binding_valid", f"{part}_step_offsets"}
+        required |= {f"{part}_{field}{suffix}" for field in REQUIREMENT_SEMANTICS for suffix in ("", "_valid")}
     # Visibility/evidence validity is data-owned and separate for each view.
-    cv_fields = ("current_binding", "remaining_binding", "relations", "events")
+    cv_fields = tuple(f"{part}_{field}" for part in ("current", "remaining") for field in ("binding", *FIELDS, *REQUIREMENT_SEMANTICS)) + ("relations", "events")
     required |= {f"view{view}_{field}_valid" for view in (0, 1) for field in cv_fields}
     native_map = meta.get("native_arrays", {})
     if not isinstance(native_map, dict) or set(native_map) - {"latent_dict", "action_dict", "mcp_latent_dicts"}:
@@ -276,22 +442,25 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
             entity_ids, arrays[f"{part}_step_offsets"], arrays[f"{part}_binding"].unsqueeze(0),
             **{field: arrays[f"{part}_{field}"].unsqueeze(0) for field in FIELDS},
             requirement_mask={field: arrays[f"{part}_{field}_required"].unsqueeze(0) for field in FIELDS},
-            label_valid={field: arrays[f"{part}_{field}_valid"].unsqueeze(0) for field in (*FIELDS, "binding")},
+            label_valid={field: arrays[f"{part}_{field}_valid"].unsqueeze(0) for field in (*FIELDS, "binding", *REQUIREMENT_SEMANTICS)},
+            **{field: arrays[f"{part}_{field}"].unsqueeze(0) for field in REQUIREMENT_SEMANTICS},
         ).validate()
     requirement = TaskRequirement(**parts).validate()
-    expected_cv_shapes = {
-        "current_binding": parts["current"].binding.shape,
-        "remaining_binding": parts["remaining"].binding.shape,
-        "relations": outcome.relations.shape,
-        "events": outcome.events.shape,
-    }
-    common_valid = {}
-    for field, shape in expected_cv_shapes.items():
-        masks = [arrays[f"view{view}_{field}_valid"].unsqueeze(0) for view in (0, 1)]
-        if any(mask.dtype != torch.bool or mask.shape != shape for mask in masks):
-            raise ValueError(f"{field}: per-view evidence masks must be bool with shape {shape}")
-        base = parts[field.split("_")[0]].label_valid["binding"] if field.endswith("_binding") else outcome.label_valid[field]
-        common_valid[field] = masks[0] & masks[1] & base
+    per_view_valid = []
+    for view in (0, 1):
+        evidence = {}
+        for part, target in parts.items():
+            for field, label_mask in target.label_valid.items():
+                mask = arrays[f"view{view}_{part}_{field}_valid"].unsqueeze(0)
+                if mask.dtype != torch.bool or mask.shape != label_mask.shape:
+                    raise ValueError(f"{part}.{field}: view evidence must match label mask shape and Boolean dtype")
+                evidence[f"{part}.{field}"] = mask
+        for field in ("relations", "events"):
+            mask = arrays[f"view{view}_{field}_valid"].unsqueeze(0)
+            if mask.dtype != torch.bool or mask.shape != outcome.label_valid[field].shape:
+                raise ValueError(f"{field}: view evidence must match physical label mask shape and Boolean dtype")
+            evidence[field] = mask
+        per_view_valid.append(evidence)
     for name in ("robot_history", "robot_latent", "demo_view_0", "demo_view_1"):
         tensor = arrays[name]
         if tensor.ndim < 2 or not tensor.numel() or not tensor.is_floating_point() or not torch.isfinite(tensor).all():
@@ -329,10 +498,14 @@ def load_sample(manifest_path: str | Path) -> LoadedSample:
     if any(type(value) is not int or value < 0 for value in scalars.values()):
         raise ValueError("native chunk/window scalars must be nonnegative integers")
     native_inputs.update(scalars)
+    observed_actions, observed_video_offsets, history_chunks, per_frame = _history_metadata(meta, arrays)
+    if observed_actions.commands.shape[-1] != actions.shape[-1]:
+        raise ValueError("observed commands and future action labels must use one action dimension")
     return LoadedSample(
         meta, history.unsqueeze(0), proprio.unsqueeze(0), embodiment.unsqueeze(0), patches.unsqueeze(0),
         arrays["robot_latent"].unsqueeze(0), actions.unsqueeze(0),
-        (arrays["demo_view_0"].unsqueeze(0), arrays["demo_view_1"].unsqueeze(0)), outcome, requirement, common_valid, native_inputs,
+        (arrays["demo_view_0"].unsqueeze(0), arrays["demo_view_1"].unsqueeze(0)), outcome, requirement,
+        tuple(per_view_valid), native_inputs, observed_actions, observed_video_offsets, history_chunks, per_frame,
     )
 
 
@@ -399,7 +572,7 @@ def load_experiment(path: str | Path, *, for_test: bool = False) -> dict:
     from .zerowam import ZERO_WAM_COMMIT
     if config.get("upstream_commit") != ZERO_WAM_COMMIT:
         raise ValueError("experiment must use the pinned Zero-WAM source revision")
-    if config.get("schema_version") != 1 or config.get("interface") not in {"geometry", "full"}:
+    if config.get("schema_version") != 2 or config.get("interface") not in {"geometry", "full"}:
         raise ValueError("unsupported experiment schema or interface")
     condition = config["conditioning"]
     if condition["unconditional_probability"] != 0.1 or condition["drop_icl"] != 0 or condition["droptext_target"] != 0 or condition["task_text"] != "" or condition["pair_dropout"] != 0:
@@ -408,6 +581,28 @@ def load_experiment(path: str | Path, *, for_test: bool = False) -> dict:
         raise ValueError("representation experiments require averaged pairs and one unsorted candidate")
     if not np.isfinite(config["lambda_cv"]) or config["lambda_cv"] < 0:
         raise ValueError("lambda_cv must be finite and nonnegative")
+    weights = config["training"].get("loss_weights")
+    expected_weights = {"requirement", "latent", "execution", "next_video", "native_action", "ifp", "interaction", "cv", "physical"}
+    if not isinstance(weights, dict) or set(weights) != expected_weights:
+        raise ValueError("training.loss_weights must explicitly configure every objective")
+    if any(type(value) not in (int, float) or not np.isfinite(value) or value < 0 for value in weights.values()):
+        raise ValueError("loss weights must be finite and nonnegative")
+    if weights["cv"] != config["lambda_cv"]:
+        raise ValueError("loss_weights.cv and the registered lambda_cv must agree")
+    start = config["training"].get("exec_start_step")
+    if type(start) is not int or not 0 <= start <= config["training"]["max_steps"]:
+        raise ValueError("exec_start_step must be an explicit warmup boundary within the training budget")
+    capacity = config["dimensions"].get("max_precedence_edges")
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("max_precedence_edges must be an explicit positive capacity")
+    policy = config.get("binding_policy")
+    if not isinstance(policy, dict) or set(policy) != {"confidence_threshold", "margin_threshold", "validation_locked"}:
+        raise ValueError("binding_policy must specify confidence, margin and validation lock")
+    for name in ("confidence_threshold", "margin_threshold"):
+        if type(policy[name]) not in (int, float) or not np.isfinite(policy[name]) or not 0 < policy[name] < 1:
+            raise ValueError("binding thresholds must be finite in (0,1)")
+    if type(policy["validation_locked"]) is not bool:
+        raise ValueError("binding policy validation lock must be Boolean")
     for part in ("current", "remaining"):
         offsets = config[f"{part}_offsets"]
         if not offsets or any(type(v) is not int or v <= 0 for v in offsets) or offsets != sorted(set(offsets)):
@@ -416,12 +611,14 @@ def load_experiment(path: str | Path, *, for_test: bool = False) -> dict:
             raise ValueError("token budget must equal role count times query times")
     if for_test and not config.get("validation_locked", False):
         raise ValueError("lock the common configuration on validation data before test evaluation")
+    if for_test and not policy["validation_locked"]:
+        raise ValueError("lock binding refusal thresholds on validation data before test evaluation")
     return config
 
 
 @dataclass(frozen=True)
 class Observation:
-    """Deployment inputs: no future outcomes, true requirements or actions."""
+    """Deployment input: actual past actions allowed; future actions/labels forbidden."""
     entity_ids: Tensor
     robot_history: Tensor
     proprio_history: Tensor
@@ -431,13 +628,22 @@ class Observation:
     chunk_size: int
     actions_per_frame: int
     action_space: dict
+    observed_action_history: ObservedActionHistory
+    observed_video_step_offsets: Tensor
+    history_chunks: tuple[Mapping, ...]
+
+    def native_history(self, dtype: torch.dtype | None = None) -> tuple:
+        return native_history(self, dtype)
+
+    def sampling_position(self) -> dict[str, int]:
+        return sampling_position(self)
 
 
 def load_observation(manifest_path: str | Path) -> Observation:
     path = Path(manifest_path)
     meta = json.loads(path.read_text())
-    if meta.get("format_version") != 1 or meta.get("kind") != "observation":
-        raise ValueError("inference requires a version-1 observation manifest, not a labeled training sample")
+    if not isinstance(meta, dict) or meta.get("format_version") != 2 or meta.get("kind") != "observation":
+        raise ValueError("inference requires an explicit version-2 observation manifest, never future labels or inferred v1 history")
     for key in ("chunk_size", "actions_per_frame"):
         if type(meta.get(key)) is not int or meta[key] < 1:
             raise ValueError(f"observation requires positive {key}")
@@ -450,7 +656,7 @@ def load_observation(manifest_path: str | Path) -> Observation:
     arrays_path = (path.parent / name).resolve()
     if Path(name).is_absolute() or not arrays_path.is_relative_to(path.parent.resolve()) or arrays_path.suffix != ".npz":
         raise ValueError("observation arrays must remain inside the manifest directory")
-    required = {"entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent"}
+    required = {"entity_ids", "robot_history", "proprio_history", "embodiment", "robot_latent", "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"}
     required |= {f"demo_view_{i}" for i in range(len(views))}
     with np.load(arrays_path, allow_pickle=False) as arrays:
         if set(arrays.files) != required:
@@ -460,7 +666,7 @@ def load_observation(manifest_path: str | Path) -> Observation:
     if ids.dtype != torch.int64 or ids.ndim != 1 or not (ids >= 0).any() or (ids < -1).any() or ids[ids >= 0].unique().numel() != (ids >= 0).sum():
         raise ValueError("observation entity IDs must be unique nonnegative integers or -1 padding")
     for key, value in values.items():
-        if key != "entity_ids" and (not value.is_floating_point() or not torch.isfinite(value).all() or not value.numel()):
+        if key not in {"entity_ids", "observed_action_history", "observed_action_step_offsets", "observed_video_step_offsets"} and (not value.is_floating_point() or not torch.isfinite(value).all() or not value.numel()):
             raise ValueError("observation features must be nonempty finite floating tensors")
     history, proprio = values["robot_history"], values["proprio_history"]
     if history.ndim != 3 or history.shape[1] != len(ids) or proprio.ndim != 2 or proprio.shape[0] != history.shape[0]:
@@ -469,6 +675,7 @@ def load_observation(manifest_path: str | Path) -> Observation:
         raise ValueError("embodiment must be [E], observed video latent [C,F,H,W]")
     if any(values[f"demo_view_{i}"].ndim != 2 for i in range(len(views))):
         raise ValueError("demonstrations must be ordered [tokens,features]")
+    observed_actions, video_offsets, history_chunks, per_frame = _history_metadata(meta, values)
     return Observation(ids[None], history[None], proprio[None], values["embodiment"][None],
                        values["robot_latent"][None], tuple(values[f"demo_view_{i}"][None] for i in range(len(views))),
-                       meta["chunk_size"], meta["actions_per_frame"], meta.get("action_space", {}))
+                       meta["chunk_size"], per_frame, dict(meta["action_space"]), observed_actions, video_offsets, history_chunks)

@@ -17,6 +17,20 @@ codec and F remain frozen in stage two. A stage switch clears old gradients and
 creates a fresh AdamW optimizer; it does not carry stage-one moments into a new
 optimization problem. Resume the saved optimizer only for the same stage.
 
+`exec_start_step` is the number of **successful optimizer updates in the current
+stage** before execution distillation is enabled (default 100). Before that
+boundary, the reader still receives requirement/latent supervision, but the
+trainer does not invoke the video sampler, execution teacher or execution
+student. Merely setting a loss coefficient to zero after performing sampling
+would not implement this warmup. `weights.execution=0` is a separate permanent
+ablation: it never calls any of those three paths, even beyond the boundary.
+
+Null examples with no trainable path and failed finite checks do not advance
+the counter. A stage switch resets `updates` to zero. A same-stage resume must
+restore the checkpoint's successful-update counter after construction, together
+with optimizer and RNG state; it must not recompute the phase from attempted
+batch count. `execution_enabled` exposes the schedule decision for diagnostics.
+
 `LossWeights` names each objective explicitly. T0/T1/T2 use `enable_ifp` and
 `enable_interaction`; V0/V1 differ only in `weights.cv`. A zero coefficient does
 not imply a different trainable parameter set. Native action label regression
@@ -72,7 +86,7 @@ The auxiliary heads do not receive demonstration tokens or goal tokens directly.
 
 Execution consistency uses `sample_noise`, `noisy_actions`, `action_timestep`
 and optional Boolean `execution_valid`. `sample_kwargs` permits only actual
-`history`, sampler `steps`/`shift`, `frame_id` and `grid_id`. It cannot contain
+`history`, sampler `steps`/`shift`, `frame_id`, `grid_id` and `rope_offset`. It cannot contain
 training dictionaries or teacher-forced caches.
 
 For each view:
@@ -99,10 +113,39 @@ loader responsibilities.
 ## Pair loss and null examples
 
 Each view's supervised objective is averaged arithmetically; adding a duplicate
-view does not double supervision. CV requires `pair_valid=(view1, view2)`, with
-data-side masks for `current.binding`, `remaining.binding`, `relations` and
-`events`. Each is intersected with authoritative target `label_valid`, never
-with predicted requirement masks or uncertainty.
+view does not double supervision. `per_view_valid=(view1, view2)` retains each
+view's evidence separately. It must explicitly include `current.<field>` and
+`remaining.<field>` for every requirement `label_valid` field, plus `relations`
+and `events` for physical interaction labels. Masks are Boolean, data-owned and
+have the corresponding label-validity shape. Single-view training uses a
+one-element tuple. Missing fields are rejected rather than assumed observable.
+Requirement fields include binding, geometry, relations, events, geometry
+tolerance, event windows and precedence slots. Window evidence uses the event
+label shape, while precedence evidence is `[B,P]`; a padding slot known to mean
+"no edge" is valid, while an unknown slot is not proof that order is irrelevant.
+
+The decoded requirement loss receives each view's own evidence. An unidentified
+binding is supervised as UNCERTAIN, not as the globally known object; other
+requirement values and requirement-mask targets are supervised only where the
+view provides evidence. Interaction-label supervision also intersects that
+view's evidence with `label_valid`. This policy does not use privileged hidden
+identities to teach a deterministic answer to an unidentifiable demonstration.
+
+Latent alignment and execution consistency require a uniquely identifiable
+current **and** remaining condition. The gate uses annotated evidence, resolved
+required bindings and reliable required labels, never model confidence. If the
+gate fails for one view, both losses are zero for that view and its sampler,
+teacher and execution student are not called. Its available decoded labels,
+including the UNCERTAIN binding category, still train the reader. A missing
+remaining destination blocks distillation even when the immediate grasp is
+visible. Geometry controls inspect only their own explicit geometry interface
+content (including tolerance) for this gate, not hidden control-relation labels.
+Full interfaces also require identifiable event windows and precedence. When no
+view qualifies, the trainer never constructs the privileged G target at all.
+
+CV takes the two evidence masks' intersection only when computing the pair
+loss. It never substitutes that common mask for either view's individual
+supervision. Predicted requirement masks and uncertainty cannot remove labels.
 
 The common CV field set consists of current/remaining **binding** logits and
 the auxiliary physical interaction head's relation/event logits. Interface
@@ -134,7 +177,11 @@ The CPU tests execute small real torch graphs and check stage ownership,
 optimizer switching, shared robot inputs, exact teacher/student conditions,
 sampler detachment, the direct-goal gradient (and its removal), repeated-view
 zero JS, supervision scale, null-branch isolation, empty masks, observation
-boundaries and rejection of nonfinite gradients.
+boundaries and rejection of nonfinite gradients. Additional checks verify zero
+sampler/teacher/student calls throughout warmup and the permanent execution-off
+ablation; per-view occlusion suppresses latent/distillation targets; changing a
+hidden privileged object identity changes neither the uncertain view's loss nor
+its gradient; and geometry controls do not depend on relation-evidence gates.
 
 Those tests are not native Zero-WAM loading, GPU memory measurements, dataset
 training or robot execution. The adapter's independent native smoke test and

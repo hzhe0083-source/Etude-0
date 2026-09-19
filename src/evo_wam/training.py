@@ -60,8 +60,8 @@ class TrainingBatch:
     action_timestep: Tensor | float | None = None
     execution_valid: Tensor | None = None    # bool, exactly noisy_actions shape
     sample_kwargs: dict = field(default_factory=dict)
-    # Data-side visibility per view, additional to authoritative label_valid.
-    pair_valid: tuple[Mapping[str, Tensor], Mapping[str, Tensor]] | None = None
+    # Independent evidence per view; never replace these by their intersection.
+    per_view_valid: tuple[Mapping[str, Tensor], ...] | None = None
     category_groups: Mapping[str, Tensor] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -82,7 +82,7 @@ class TrainingBatch:
         # No caller-supplied text may bypass the explicit empty/goal conditions.
         if "text_emb" in self.native_inputs or "encoder_seq_ids" in self.native_inputs:
             raise ValueError("native text conditions are installed only by the adapter")
-        if set(self.sample_kwargs) - {"history", "steps", "shift", "frame_id", "grid_id"}:
+        if set(self.sample_kwargs) - {"history", "steps", "shift", "frame_id", "grid_id", "rope_offset"}:
             raise ValueError("sampling accepts only actual history and sampler configuration")
         for name in ("sample_noise", "noisy_actions"):
             value = getattr(self, name)
@@ -92,6 +92,21 @@ class TrainingBatch:
             self.requirements.validate()
             if self.requirements.current.entity_ids.shape != self.entity_features.shape[:2]:
                 raise ValueError("requirements and pure observation entity table differ")
+        if self.per_view_valid is not None:
+            if self.requirements is None or len(self.per_view_valid) != len(self.demonstrations):
+                raise ValueError("per_view_valid must match demonstrations with requirement labels")
+            shapes = {f"{part}.{name}": getattr(self.requirements, part).label_valid[name]
+                      for part in ("current", "remaining")
+                      for name in getattr(self.requirements, part).label_valid}
+            if self.outcome is not None:
+                shapes.update({name: self.outcome.label_valid[name] for name in ("relations", "events")})
+            for evidence in self.per_view_valid:
+                if set(evidence) != set(shapes):
+                    raise ValueError("per_view_valid must explicitly annotate every requirement and interaction field")
+                for name, reference in shapes.items():
+                    value = evidence[name]
+                    if value.dtype != torch.bool or value.shape != reference.shape or value.device != reference.device:
+                        raise ValueError(f"per_view_valid[{name}] must be a data-side bool mask with the label shape/device")
         if self.outcome is not None:
             self.outcome.validate()
             if self.outcome.entity_ids.shape != self.entity_features.shape[:2]:
@@ -142,7 +157,7 @@ class EvoTrainer(nn.Module):
                  ifp_weights: tuple[float, ...] | None = None,
                  cv_field_weights: Mapping[str, float] | None = None,
                  learning_rate: float = 1e-4, weight_decay: float = 0.0,
-                 max_grad_norm: float = 1.0):
+                 max_grad_norm: float = 1.0, exec_start_step: int = 100):
         super().__init__()
         self.adapter, self.codec, self.reader = adapter, codec, reader
         self.physical, self.interaction = physical, interaction
@@ -160,7 +175,10 @@ class EvoTrainer(nn.Module):
             raise ValueError("weight decay must be finite and nonnegative")
         if not math.isfinite(max_grad_norm) or max_grad_norm <= 0:
             raise ValueError("gradient clipping norm must be finite and positive")
+        if type(exec_start_step) is not int or exec_start_step < 0:
+            raise ValueError("exec_start_step must be a nonnegative integer of successful stage updates")
         self.learning_rate, self.weight_decay = learning_rate, weight_decay
+        self.exec_start_step = exec_start_step
         self.max_grad_norm, self.updates = max_grad_norm, 0
         self.set_stage(stage)
 
@@ -176,11 +194,18 @@ class EvoTrainer(nn.Module):
         if self.interaction is not None:
             self.interaction.requires_grad_(stage == "joint" and self.enable_interaction)
         self.stage = stage
+        self.updates = 0
         parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
         if not parameters:
             raise ValueError("stage has no trainable parameters")
         self.optimizer = torch.optim.AdamW(parameters, lr=self.learning_rate,
                                           weight_decay=self.weight_decay)
+
+    @property
+    def execution_enabled(self) -> bool:
+        """Count successful stage updates; reader-only null batches do not update."""
+        return (self.stage != "interface" and self.weights.execution > 0
+                and self.updates >= self.exec_start_step)
 
     def _true_goals(self, batch: TrainingBatch) -> GoalTokens:
         if batch.requirements is None:
@@ -195,13 +220,51 @@ class EvoTrainer(nn.Module):
                      for tokens, requirement in zip((goals.current, goals.remaining),
                          (batch.requirements.current, batch.requirements.remaining)))
 
+    def _view_identifiable(self, batch: TrainingBatch, evidence: Mapping[str, Tensor]) -> bool:
+        """Conservative data-only gate for a unique latent/execution target.
+
+        A physical future is conditioned on current *and* remaining goals, so
+        an identifiable local grasp cannot authorize a hidden destination.
+        Geometry controls use only their own explicit interface content.
+        """
+        names = ("geometry",) if self.codec.interface == "geometry" else ("geometry", "relations", "events")
+        for part in ("current", "remaining"):
+            target = getattr(batch.requirements, part)
+            if self.codec.interface == "full" and not bool(target.semantics_known.all()):
+                return False
+            used = torch.zeros_like(target.binding, dtype=torch.bool)
+            for name in names:
+                mask = target.requirement_mask[name]
+                used |= (mask.any((1, 3)) if name == "geometry" else
+                         mask.any((1, 3, 4)) | mask.any((1, 2, 4)))
+            if (used & ((target.binding < 0) | ~target.label_valid["binding"]
+                        | ~evidence[f"{part}.binding"])).any():
+                return False
+            value_fields = {"geometry": "geometry", "geometry_tolerance": "geometry"}
+            if self.codec.interface == "full":
+                value_fields.update({"relations": "relations", "events": "events", "event_windows": "events"})
+            for name, mask_name in value_fields.items():
+                # Mask existence itself is part of G's input: evidence must
+                # identify it for active roles, even where the target is false.
+                support = (used[:, None, :, None] if mask_name == "geometry" else
+                           used[:, None, :, None, None] & used[:, None, None, :, None])
+                if (support & ~evidence[f"{part}.{name}"]).any():
+                    return False
+                if (target.requirement_mask[mask_name] & ~target.label_valid[name]).any():
+                    return False
+            if self.codec.interface == "full" and not bool(evidence[f"{part}.event_precedence"].all()):
+                return False
+        return True
+
     def _native(self, batch: TrainingBatch, conditions: TaskConditions,
-                *, include_action: bool, include_interaction: bool):
+                *, include_action: bool, include_interaction: bool,
+                interaction_valid: Mapping[str, Tensor] | None = None):
         # Do not mutate the shared robot payload or noise between view calls.
         inputs = dict(batch.native_inputs)
         if not self.enable_ifp:
             inputs["mcp_latent_dicts"] = []
-        output = self.adapter.forward_train(inputs, conditions)
+        output = self.adapter.forward_train(inputs, conditions,
+                                            history=batch.sample_kwargs.get("history", ()))
         terms = {}
         if self.weights.next_video:
             terms["next_video"] = _native_loss(output.video, inputs["latent_dict"],
@@ -219,8 +282,8 @@ class EvoTrainer(nn.Module):
                                for weight, pred, stream in zip(weights, output.mcp, streams))
         interaction = None
         if include_interaction:
-            if batch.outcome is None or batch.entity_patch_weights is None:
-                raise ValueError("interaction supervision needs physical labels and observation patch weights")
+            if batch.outcome is None or batch.entity_patch_weights is None or interaction_valid is None:
+                raise ValueError("interaction supervision needs physical labels, per-view evidence and observation patch weights")
             pool = batch.entity_patch_weights
             expected = (1, batch.entity_features.shape[1], output.phi.shape[1])
             present = batch.outcome.entity_ids >= 0
@@ -244,7 +307,8 @@ class EvoTrainer(nn.Module):
             # FP32; this differentiable cast must not detach the deployed Phi.
             interaction = self.interaction(phi.to(next(self.interaction.parameters())), batch.outcome.step_offsets)
             terms["interaction"] = aggregate_fields({
-                name: masked_bce(interaction[key], getattr(batch.outcome, name), batch.outcome.label_valid[name])
+                name: masked_bce(interaction[key], getattr(batch.outcome, name),
+                                 batch.outcome.label_valid[name] & interaction_valid[name])
                 for name, key in (("relations", "relation_logits"), ("events", "event_logits"))
             }).loss
         return terms, interaction
@@ -273,9 +337,9 @@ class EvoTrainer(nn.Module):
         return masked_mean(error, valid).loss
 
     def _cv(self, first, second, batch: TrainingBatch):
-        if batch.pair_valid is None or len(batch.pair_valid) != 2:
+        if batch.per_view_valid is None or len(batch.per_view_valid) != 2:
             raise ValueError("CV requires explicit data-side visibility for both demonstration views")
-        left, right = batch.pair_valid
+        left, right = batch.per_view_valid
         fields = {}
         for index, name in enumerate(("current", "remaining")):
             key = f"{name}.binding"
@@ -310,36 +374,52 @@ class EvoTrainer(nn.Module):
         if self.stage == "interface":
             truth = self._true_goals(batch)
             goals_by_view = (truth,)
+            identifiable_by_view = (True,)
         else:
-            with torch.no_grad():
-                truth = self._true_goals(batch)
+            if batch.requirements is None:
+                raise ValueError("conditional training requires current and remaining labels")
             if len(batch.demonstrations) not in (1, 2):
                 raise ValueError("reader/joint conditional training expects one or two demonstration views")
+            if batch.per_view_valid is None:
+                raise ValueError("reader/joint supervision requires independent per_view_valid annotations")
+            identifiable_by_view = tuple(self._view_identifiable(batch, evidence)
+                                         for evidence in batch.per_view_valid)
+            truth = None
+            if any(identifiable_by_view) and (self.weights.latent or self.execution_enabled):
+                with torch.no_grad():
+                    truth = self._true_goals(batch)
             goals_by_view = tuple(self.reader(demo, batch.entity_history, batch.proprio_history,
                                               batch.embodiment, batch.requirements.current.step_offsets,
                                               batch.requirements.remaining.step_offsets,
                                               entity_present=batch.requirements.current.entity_ids >= 0)
                                   for demo in batch.demonstrations)
-        truth_condition = TaskConditions(truth.current, truth.remaining, batch.null_text)
+        truth_condition = None if truth is None else TaskConditions(truth.current, truth.remaining, batch.null_text)
         views, predictions = [], []
-        for goals in goals_by_view:
+        for index, goals in enumerate(goals_by_view):
             conditions = TaskConditions(goals.current, goals.remaining, batch.null_text)
             decoded = self._decode(goals, batch)
+            evidence = None if self.stage == "interface" else batch.per_view_valid[index]
+            identifiable = identifiable_by_view[index]
             terms = {}
             if self.weights.requirement:
-                terms["requirement"] = sum(decoded_requirement_loss(pred, target, self.codec.interface)
-                    for pred, target in zip(decoded, (batch.requirements.current, batch.requirements.remaining))) / 2
+                terms["requirement"] = sum(decoded_requirement_loss(
+                    pred, getattr(batch.requirements, part), self.codec.interface,
+                    evidence_valid=None if evidence is None else {
+                        name: evidence[f"{part}.{name}"] for name in getattr(batch.requirements, part).label_valid})
+                    for part, pred in zip(("current", "remaining"), decoded)) / 2
             if self.stage != "interface" and self.weights.latent:
-                terms["latent"] = ((goals.current.float() - truth.current.float()).square().mean()
-                                  + (goals.remaining.float() - truth.remaining.float()).square().mean()) / 2
+                terms["latent"] = (((goals.current.float() - truth.current.float()).square().mean()
+                                   + (goals.remaining.float() - truth.remaining.float()).square().mean()) / 2
+                                  if identifiable else zero)
             interaction = None
             if self.stage != "reader":
                 use_interaction = self.stage == "joint" and self.enable_interaction
                 native_terms, interaction = self._native(batch, conditions,
-                    include_action=self.stage == "interface", include_interaction=use_interaction)
+                    include_action=self.stage == "interface", include_interaction=use_interaction,
+                    interaction_valid=evidence)
                 terms.update(native_terms)
-            if self.stage != "interface" and self.weights.execution:
-                terms["execution"] = self._execution(batch, conditions, truth_condition)
+            if self.execution_enabled:
+                terms["execution"] = self._execution(batch, conditions, truth_condition) if identifiable else zero
             views.append(terms)
             predictions.append((decoded, interaction))
 

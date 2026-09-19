@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "upstream_commit": "08e2c4ae41e2b63573a299825cebe6753481407c",
   "initialization": "zero-wam-pretrain",
   "interface": "geometry",
@@ -13,7 +13,8 @@
     "demo_dim": 4,
     "action_dim": 3,
     "token_dim": 32,
-    "roles": 2
+    "roles": 2,
+    "max_precedence_edges": 4
   },
   "synthetic_dimensions_only": true,
   "current_offsets": [
@@ -48,7 +49,19 @@
       1,
       2
     ],
-    "record_gpu_seconds": true
+    "record_gpu_seconds": true,
+    "exec_start_step": 100,
+    "loss_weights": {
+      "requirement": 1.0,
+      "latent": 1.0,
+      "execution": 1.0,
+      "next_video": 1.0,
+      "native_action": 1.0,
+      "ifp": 1.0,
+      "interaction": 1.0,
+      "physical": 1.0,
+      "cv": 0.1
+    }
   },
   "conditioning": {
     "unconditional_probability": 0.1,
@@ -100,5 +113,10 @@
     ]
   },
   "validation_locked": false,
-  "require_validation_lock_for_test": true
+  "require_validation_lock_for_test": true,
+  "binding_policy": {
+    "confidence_threshold": 0.5,
+    "margin_threshold": 0.1,
+    "validation_locked": false
+  }
 }

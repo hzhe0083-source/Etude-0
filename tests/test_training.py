@@ -30,6 +30,7 @@ class TinyAdapter(nn.Module):
         self.condition_projection = nn.Linear(4, 4)
         self.dropout = nn.Dropout(0.9)
         self.forward_inputs = []
+        self.forward_histories = []
         self.action_calls = []
         self.sample_calls = []
         self.detach_current = False
@@ -50,8 +51,9 @@ class TinyAdapter(nn.Module):
             current = current + self.condition_projection(conditions.remaining).mean(1, keepdim=True)
         return current
 
-    def forward_train(self, inputs, conditions):
+    def forward_train(self, inputs, conditions, *, history=()):
         self.forward_inputs.append(inputs)
+        self.forward_histories.append(history)
         phi = self.dropout(self.native.video(sequence(inputs["latent_dict"]["noisy_latents"])
                                               + self.task(conditions, remaining=True)))
         action = self.native.action(sequence(inputs["action_dict"]["noisy_latents"])
@@ -94,9 +96,9 @@ def make_batch():
 
     native = {"latent_dict": stream(), "action_dict": stream(), "mcp_latent_dicts": [stream()]}
     demo = torch.randn(1, 3, 5)
-    valid = {"current.binding": torch.ones(1, 2, dtype=torch.bool),
-             "remaining.binding": torch.ones(1, 2, dtype=torch.bool),
-             "relations": masks["relations"], "events": masks["events"]}
+    valid = {f"{part}.{name}": torch.ones_like(value, dtype=torch.bool)
+             for part in ("current", "remaining") for name, value in requirement.label_valid.items()}
+    valid.update({"relations": masks["relations"], "events": masks["events"]})
     return TrainingBatch(
         entity_features=torch.randn(1, 2, 3), entity_history=torch.randn(1, 2, 2, 3),
         proprio_history=torch.randn(1, 2, 2), embodiment=torch.randn(1, 2),
@@ -105,15 +107,16 @@ def make_batch():
         outcome=outcome, physical_actions=torch.randn(1, 2, 4),
         entity_patch_weights=torch.eye(2)[None], sample_noise=torch.randn(1, 4, 1, 1, 2),
         noisy_actions=torch.randn(1, 4, 1, 1, 2), action_timestep=torch.tensor(500.),
-        pair_valid=(valid, {name: value.clone() for name, value in valid.items()}))
+        per_view_valid=(valid, {name: value.clone() for name, value in valid.items()}))
 
 
-def trainer(stage="joint", weights=None):
+def trainer(stage="joint", weights=None, exec_start_step=0):
     return EvoTrainer(TinyAdapter(), RequirementCodec(3, 2, 2, 1, roles=2, token_dim=4),
                       EffectReader(5, 3, 2, 2, roles=2, token_dim=4),
                       CausalEffectPredictor(3, 2, 4, 2, 2, 2, 1, hidden_dim=4),
                       TemporalInteractionHead(4, 2, 1, hidden_dim=4),
-                      stage=stage, weights=weights, learning_rate=0.01)
+                      stage=stage, weights=weights, learning_rate=0.01,
+                      exec_start_step=exec_start_step)
 
 
 def has_gradient(module):
@@ -124,6 +127,126 @@ def has_gradient(module):
 class TrainingTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
+
+    def test_reader_warmup_skips_entire_execution_graph_until_successful_updates(self):
+        model, batch = trainer("reader", exec_start_step=2), make_batch()
+        self.assertFalse(model.execution_enabled)
+        for expected_updates in (1, 2):
+            report = model.train_step(batch)
+            self.assertTrue(report["updated"])
+            self.assertNotIn("execution", report)
+            self.assertTrue(has_gradient(model.reader))
+            self.assertEqual(model.updates, expected_updates)
+            self.assertEqual(model.adapter.sample_calls, [])
+            self.assertEqual(model.adapter.action_calls, [])
+        self.assertTrue(model.execution_enabled)
+        self.assertIn("execution", model.train_step(batch))
+        self.assertEqual(len(model.adapter.sample_calls), 2)
+        self.assertEqual(len(model.adapter.action_calls), 4)
+
+    def test_warmup_ignores_null_attempts_and_phase_switch_resets_counter(self):
+        model, batch = trainer("reader", exec_start_step=1), make_batch()
+        self.assertFalse(model.train_step(replace(batch, conditional=False))["updated"])
+        self.assertEqual(model.updates, 0)
+        model.train_step(batch)
+        self.assertTrue(model.execution_enabled)
+        model.set_stage("joint")
+        self.assertEqual(model.updates, 0)
+        self.assertFalse(model.execution_enabled)
+        # Same-stage resume restores this recorded successful-update counter.
+        model.updates = 1
+        self.assertTrue(model.execution_enabled)
+
+    def test_execution_zero_ablation_never_samples_after_warmup(self):
+        model, batch = trainer("reader", LossWeights(execution=0), exec_start_step=0), make_batch()
+        model.updates = 10000
+        report = model.train_step(batch)
+        self.assertNotIn("execution", report)
+        self.assertTrue(report["updated"])
+        self.assertEqual(model.adapter.sample_calls, [])
+        self.assertEqual(model.adapter.action_calls, [])
+
+    def test_occluded_view_skips_unique_latent_and_execution_targets(self):
+        model, batch = trainer("reader"), make_batch()
+        first, second = batch.per_view_valid
+        second = {name: value.clone() for name, value in second.items()}
+        second["remaining.binding"][0, 0] = False
+        paired = replace(batch, per_view_valid=(first, second))
+        report = model.train_step(paired)
+        self.assertGreater(report["requirement"], 0)
+        self.assertTrue(has_gradient(model.reader))
+        self.assertEqual(len(model.adapter.sample_calls), 1)
+        self.assertEqual(len(model.adapter.action_calls), 2)
+        model.adapter.sample_calls.clear()
+        model.adapter.action_calls.clear()
+        hidden = replace(batch, demonstrations=batch.demonstrations[1:], per_view_valid=(second,))
+        losses = model.objective(hidden)
+        self.assertEqual(float(losses["latent"]), 0)
+        self.assertEqual(float(losses["execution"]), 0)
+        self.assertEqual(model.adapter.sample_calls, [])
+        self.assertEqual(model.adapter.action_calls, [])
+
+    def test_hidden_binding_truth_cannot_change_uncertain_view_loss_or_gradient(self):
+        model, batch = trainer("reader"), make_batch()
+        hidden = {name: torch.zeros_like(value) for name, value in batch.per_view_valid[0].items()}
+        batch = replace(batch, demonstrations=batch.demonstrations[:1], per_view_valid=(hidden,))
+
+        def forbidden_goal(*args):
+            raise AssertionError("a view without unique task evidence must not construct a privileged latent target")
+
+        model.codec.encode = forbidden_goal
+        first = model.objective(batch)
+        first["total"].backward()
+        gradients = [None if p.grad is None else p.grad.clone() for p in model.reader.parameters()]
+        model.zero_grad(set_to_none=True)
+        changed = TaskRequirement(
+            replace(batch.requirements.current, binding=batch.requirements.current.binding.flip(1)),
+            replace(batch.requirements.remaining, binding=batch.requirements.remaining.binding.flip(1)))
+        second = model.objective(replace(batch, requirements=changed))
+        second["total"].backward()
+        self.assertTrue(torch.allclose(first["total"], second["total"]))
+        for before, parameter in zip(gradients, model.reader.parameters()):
+            self.assertTrue(before is None and parameter.grad is None or
+                            before is not None and torch.allclose(before, parameter.grad))
+        self.assertEqual(model.adapter.sample_calls, [])
+
+    def test_reader_rejects_missing_per_view_evidence(self):
+        model, batch = trainer("reader"), make_batch()
+        with self.assertRaisesRegex(ValueError, "per_view_valid"):
+            model.objective(replace(batch, per_view_valid=None))
+        incomplete = dict(batch.per_view_valid[0])
+        incomplete.pop("current.geometry")
+        with self.assertRaisesRegex(ValueError, "every requirement"):
+            model.objective(replace(batch, per_view_valid=(incomplete, incomplete)))
+
+    def test_geometry_control_does_not_gate_on_unavailable_control_relation_evidence(self):
+        model, batch = trainer("reader"), make_batch()
+        evidence = []
+        for view in batch.per_view_valid:
+            masked = {name: value.clone() for name, value in view.items()}
+            for part in ("current", "remaining"):
+                for name in ("relations", "events"):
+                    masked[f"{part}.{name}"][:] = False
+            evidence.append(masked)
+        batch = replace(batch, per_view_valid=tuple(evidence))
+        full = model.objective(batch)
+        self.assertEqual(float(full["execution"]), 0)
+        self.assertEqual(model.adapter.sample_calls, [])
+        model.codec.interface = "geometry"
+        geometry = model.objective(batch)
+        self.assertGreater(float(geometry["execution"].detach()), 0)
+        self.assertEqual(len(model.adapter.sample_calls), 2)
+
+    def test_missing_tolerance_or_event_window_evidence_blocks_unique_targets(self):
+        for key in ("current.geometry_tolerance", "remaining.event_windows"):
+            model, batch = trainer("reader"), make_batch()
+            evidence = {name: value.clone() for name, value in batch.per_view_valid[0].items()}
+            evidence[key].flatten()[0] = False
+            batch = replace(batch, demonstrations=batch.demonstrations[:1], per_view_valid=(evidence,))
+            losses = model.objective(batch)
+            self.assertEqual(float(losses["latent"]), 0)
+            self.assertEqual(float(losses["execution"]), 0)
+            self.assertEqual(model.adapter.sample_calls, [])
 
     def test_interaction_head_cannot_pool_later_teacher_forced_chunks(self):
         model = trainer(weights=LossWeights(next_video=0, ifp=0))
@@ -138,11 +261,14 @@ class TrainingTests(unittest.TestCase):
         from evo_wam.zerowam import TaskConditions
         conditions = TaskConditions(torch.ones(1, 2, 4), torch.ones(1, 2, 4), batch.null_text)
         with self.assertRaises(ValueError):
-            model._native(batch, conditions, include_action=False, include_interaction=True)
+            model._native(batch, conditions, include_action=False, include_interaction=True,
+                          interaction_valid=batch.per_view_valid[0])
         batch.entity_patch_weights[..., 2:] = 0
-        _, first = model._native(batch, conditions, include_action=False, include_interaction=True)
+        _, first = model._native(batch, conditions, include_action=False, include_interaction=True,
+                                 interaction_valid=batch.per_view_valid[0])
         stream["noisy_latents"][:, :, 1:] += 100
-        _, second = model._native(batch, conditions, include_action=False, include_interaction=True)
+        _, second = model._native(batch, conditions, include_action=False, include_interaction=True,
+                                  interaction_valid=batch.per_view_valid[0])
         torch.testing.assert_close(first["relation_logits"], second["relation_logits"])
         torch.testing.assert_close(first["event_logits"], second["event_logits"])
 
@@ -199,6 +325,21 @@ class TrainingTests(unittest.TestCase):
         self.assertIs(first["latent_dict"], second["latent_dict"])
         self.assertIs(first["mcp_latent_dicts"][0], second["mcp_latent_dicts"][0])
 
+    def test_native_training_receives_same_observed_history_for_pairs_and_null_examples(self):
+        from evo_wam.zerowam import NativeHistoryChunk
+        model, batch = trainer(weights=LossWeights(execution=0)), make_batch()
+        history = (NativeHistoryChunk("video", torch.ones(1, 4, 1, 1, 2), 0, 0),
+                   NativeHistoryChunk("action", torch.zeros(1, 4, 1, 2, 1), 1, 0))
+        batch = replace(batch, sample_kwargs={"history": history})
+        model.objective(batch)
+        self.assertEqual(len(model.adapter.forward_histories), 2)
+        self.assertTrue(all(actual is history for actual in model.adapter.forward_histories))
+        model.objective(replace(batch, conditional=False))
+        self.assertIs(model.adapter.forward_histories[-1], history)
+        # The future-only payload is unchanged; prepending belongs to the
+        # native adapter and must not duplicate observed frames in the trainer.
+        self.assertEqual(batch.native_inputs["latent_dict"]["noisy_latents"].shape[2], 1)
+
     def test_cutting_direct_goal_path_removes_execution_gradient(self):
         weights = LossWeights(requirement=0, latent=0, execution=1, next_video=0,
                               native_action=0, ifp=0, interaction=0, cv=0, physical=0)
@@ -214,7 +355,8 @@ class TrainingTests(unittest.TestCase):
         self.assertLess(abs(float(pair["cv"].detach())), 1e-7)
         model.weights = replace(model.weights, cv=0)
         v0 = model.objective(batch)
-        single = model.objective(replace(batch, demonstrations=batch.demonstrations[:1]))
+        single = model.objective(replace(batch, demonstrations=batch.demonstrations[:1],
+                                         per_view_valid=batch.per_view_valid[:1]))
         self.assertTrue(torch.allclose(v0["total"], single["total"], atol=1e-6))
         self.assertTrue(torch.allclose(pair["total"], v0["total"], atol=1e-6))
         self.assertTrue(model.adapter.dropout.training)  # scoped dropout override restored
@@ -239,8 +381,8 @@ class TrainingTests(unittest.TestCase):
 
     def test_empty_common_mask_retains_supervision_and_has_zero_coverage(self):
         model, batch = trainer(weights=LossWeights(cv=1)), make_batch()
-        empty = {name: torch.zeros_like(value) for name, value in batch.pair_valid[0].items()}
-        losses = model.objective(replace(batch, pair_valid=(empty, empty)))
+        empty = {name: torch.zeros_like(value) for name, value in batch.per_view_valid[0].items()}
+        losses = model.objective(replace(batch, per_view_valid=(empty, empty)))
         self.assertEqual(float(losses["cv_coverage"]), 0)
         self.assertEqual(float(losses["cv"].detach()), 0)
         self.assertGreater(float(losses["requirement"].detach()), 0)
@@ -252,8 +394,8 @@ class TrainingTests(unittest.TestCase):
         model, batch = trainer(weights=weights), make_batch()
         original = model.adapter.forward_train
 
-        def mixed_precision_forward(*args):
-            output = original(*args)
+        def mixed_precision_forward(*args, **kwargs):
+            output = original(*args, **kwargs)
             output.phi = output.phi.bfloat16()
             return output
 

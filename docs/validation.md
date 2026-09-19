@@ -2,30 +2,44 @@
 
 日期：2026-09-19。所有下列结果区分代码/计算图验收与研究实验结果。
 
-## 已实际运行
+## 本轮 v2 已实际运行
 
 | 检查 | 结果 | 能支持的结论 |
 |---|---|---|
-| `evo-wam check` | 81 项通过，无跳过 | 契约、损失、数据、模型、训练、评测、CLI与原生封装回归通过 |
-| 原生 Zero-WAM CUDA smoke | 通过 | 实际 FlexAttention 视频/动作/IFP前向反向与采样可运行 |
-| current/remaining 路由 | 通过 | 视频可区分两类条件；动作只直接读取 current |
-| MCP固定Phi换任务 | 通过 | 辅助分支无独立任务条件捷径；纯动作上下文不携带 g |
-| 执行一致性梯度 | 通过 | 读取器获得直接条件梯度，视频采样链不接受该梯度 |
-| 原生无效动作通道 | 通过 | 初始噪声、每个采样步及最终输出的无效通道为0 |
-| 三阶段命令行训练 | 通过 | interface、reader、joint实际更新；joint启用4个IFP时域、交互与成对损失 |
-| 保存、恢复与阶段初始化 | 通过 | 冻结tiny基干、增量参数、optimizer与随机状态可保存/恢复 |
-| 仅观测推理 | 通过 | 输入不含未来标签、真实要求或记录动作，生成单候选归一化动作 |
-| F有限适配及四候选 | 通过 | 合成前缀标签、策略身份核对、F-only更新和固定候选排序链路运行 |
-| 空当前要求 | 正确拒绝 | 不把空要求作为已完成任务或零代价可执行目标 |
-| 未来池化泄漏检查 | 通过 | 交互头只能池化当前预测chunk，拒绝后续teacher-forced tokens |
+| 完整 unittest 回归 | **146 项通过，无跳过** | 包括契约、模型、成对训练、数据、CLI、真实原生小模型、视觉及环境桥检查 |
+| 三种绑定状态、容差与事件约束 | 通过 | 缺失/未知对象保留要求；不相容的事件发生时刻不能拼凑满足顺序 |
+| 遮挡监督 | 通过 | 单视角要求、latent、交互及蒸馏受数据证据控制；改变隐藏真值不改变对应可见损失和梯度 |
+| 暖启动调用与梯度 | 通过 | 启用前零采样/零教师/零学生蒸馏；启用后仍有直接条件梯度；execution=0 保持关闭 |
+| 原生历史缓存和 teacher-forcing | 通过 | 真正过去动作影响主视频及 Phi；padding 不影响输出；历史 KV 可反向；原始成对网格不被修改 |
+| 原生 FlexAttention | 通过 | 实际原生前向/反向，禁止编译次数耗尽后静默稠密回退 |
+| 三阶段命令行条件训练 | 通过 | interface、reader、joint 各一次成功更新；joint 含4个IFP目标、交互和成对监督；暖启动期间无执行蒸馏 |
+| 无条件分支 | 通过 | interface/joint 的原生目标可更新；reader 无可训练条件目标时不更新 |
+| 准确要求的原生采样 | 通过 | 真实 tiny-native G→视频采样→动作采样产生4步×3维有限候选，commands_sent=0 |
+| 示范读取诊断 | 正确拒绝 | 仅一步训练的小模型产生不确定绑定，采样前返回 unresolved_required_binding，不强行选实体 |
+| 原始视频预处理 | 通过 | 真实 FFV1 视频与真实随机微型 Wan VAE，RGB/因果端点/归一化/相机与ROI顺序及v2再加载正确 |
+| RoboTwin 桥 | 通过 API 检查 | 与固定上游的动作变换数值一致，fake环境验证前缀/实执行历史/双判据/终止；不是仿真任务结果 |
 
-运行环境：Python 3.10.19、PyTorch 2.9.0+cu126、diffusers 0.36.0、transformers 4.55.2，RTX 3080 Laptop GPU（16GB）。
+环境：Python 3.10.19、PyTorch 2.9.0+cu126、diffusers 0.36.0、transformers 4.55.2，RTX 3080 Laptop GPU（16GB）。完整回归约23秒，时间不作为性能结论。
 
-原生小模型为实际上游类的随机小配置（1层、2 heads、head dimension 18），不是用另一个attention近似的模型。独立smoke使用1个MCP头，命令行联合训练使用4个。已核对原生编译attention的原始调用对象确为 `torch.nn.attention.flex_attention.flex_attention`。
+CUDA检查使用真实上游类的随机小配置及原生融合 FlexAttention，没有用另一套attention替代。
+训练命令行用1层、2 heads、4组MCP；历史梯度检查还使用真实2层小模型，视觉测试使用随机微型Wan VAE。
+FlashAttention未安装；固定上游的未用legacy导入仍通过明确加载保护处理，submodule未修改。
 
-FlashAttention未安装。固定上游一处未用于ICL的硬导入通过显式内存加载保护处理；未伪造依赖模块、未改动submodule，真正调用legacy FlashAttention仍报缺依赖。
+本地可复跑：
 
-三阶段、F适配、候选与空要求检查使用标为synthetic的数值输入及随机tiny基干。`commands_sent=0`。它们证明软件路径可运行，**不证明机器人已经学会任务、控制关系或跨视角迁移**。损失值不是论文结果。
+```bash
+.venv/bin/python -m unittest discover -s tests -q
+.venv/bin/evo-wam make-fixture --output outputs/fixture-v2
+.venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage interface --steps 1 --output outputs/interface-v2
+.venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage reader --initialize outputs/interface-v2/adapter.pt --steps 1 --output outputs/reader-v2
+.venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage joint --initialize outputs/reader-v2/adapter.pt --steps 1 --output outputs/joint-v2
+```
+
+seed 1 的该数值 fixture 进入条件分支；seed 0 的首步进入无条件分支，两条路径本轮均实际运行。暖启动计数是当前阶段的成功优化更新数；联合阶段无条件原生更新也计数，reader阶段无条件批次不更新、不推进计数。
+
+这批结果仅证明代码和计算图路径，**不证明机器人已经学会任务、控制关系或跨视角迁移**。完整权重按用户要求留作服务器路径，本轮没有下载。
+
+`353eb016` 初版记录过81项测试、v1合成F适配和四候选CLI链路；它们是历史记录，不作为v2真实模型成绩。v2正式候选分布适配与成功率需要服务器数据后重新执行。
 
 ## 完整公开配置检查
 

@@ -8,6 +8,8 @@
 - [分阶段提交与验收](docs/implementation.md)
 - [安装、训练、恢复与推理](docs/running.md)
 - [数据格式与划分](docs/data.md)
+- [原始视觉预处理与权重路径](docs/vision.md)
+- [RoboTwin 准确要求闭环入口](docs/robotwin.md)
 - [评测协议及真实机器人边界](docs/evaluation.md)
 
 主底座为 [Zero-WAM](https://github.com/robbyant-research/Zero-WAM)，以 Git submodule 固定到 `08e2c4ae41e2b63573a299825cebe6753481407c`。上游代码保留其原有许可与归属；模型权重与数据不进入本仓库。
@@ -40,4 +42,4 @@ evo-wam check-native
 
 ## 验证边界
 
-代码按七个阶段提交和推送。测试区分契约／小计算图、原生 Zero-WAM 随机小模型、完整已训练检查点、模拟器与实机。见 [验证记录](docs/validation.md)。大规模训练、正式统计实验和实机结果须在资源落实后测量；合成检查不代表机器人成功率。
+初版按七个阶段提交；审查修复继续分阶段提交和推送。权重路径预留在 `configs/server/resources.example.json`，由服务器配置。测试区分契约／小计算图、原生 Zero-WAM 随机小模型、完整已训练检查点、模拟器与实机。见 [验证记录](docs/validation.md)。大规模训练、正式统计实验和实机结果须在资源落实后测量；合成检查不代表机器人成功率。

@@ -34,7 +34,7 @@ MAX_JOBS=2 FLASH_ATTN_CUDA_ARCHS=80 uv pip install --python .venv/bin/python fla
 
 ## 数据
 
-每样本采用审计过的 JSON+NPZ，详见 `data.md`。数据集索引：
+每样本采用审计过的 v2 JSON+NPZ，详见 `data.md`。数据集索引：
 
 ```json
 {"samples":[{"manifest":"episode_001/sample.json","split":"train"}]}
@@ -63,13 +63,16 @@ native 训练窗口必须真实完整执行。仅执行前缀的候选记录用�
 .venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture/index.json --tiny-native --stage joint --initialize outputs/reader/adapter.pt --steps 1 --output outputs/joint
 ```
 
-正式训练用本地发布权重替换 `--tiny-native`：
+权重按服务器资源保留空位，见 `configs/server/resources.example.json`；不在本地下载。
+正式训练用服务器本地发布权重替换 `--tiny-native`：
 
 ```bash
 .venv/bin/evo-wam train --config /absolute/audited-config.json --index /absolute/dataset/index.json --checkpoint /absolute/zero-wam-pretrain --stage interface --steps 1000 --output outputs/interface-real
 ```
 
 正式配置必须根据真实输入修改维度并将 `synthetic_dimensions_only` 设为 false；源码版本、动作维度与 IFP 架构均检查。单卡入口沿用上游每rank一个样本约束，不假定16GB显存能装完整10.8B模型。`native_config.json` 记录实际架构，tiny 的层号覆盖不会伪装成原30层配置。
+
+`training.loss_weights` 显式列出全部损失权重。`training.exec_start_step=100` 按当前阶段成功更新数启用蒸馏；此前完全跳过采样、教师和学生蒸馏。`execution=0` 是永久关闭对照。阶段切换计数清零，同阶段恢复保留计数。
 
 每次更新记录 losses、条件/无条件标记、阶段、梯度范数、实际计算时间与模型来源到 `metrics.jsonl`。无条件分支不运行任务读取、真实要求教师或成对损失。
 
@@ -100,11 +103,15 @@ tiny artifact 保存包括冻结基干在内的全部权重，因此更换进程
 .venv/bin/evo-wam predict --artifact outputs/calibrated/adapter.pt --manifest /absolute/evaluation/observation.json --checkpoint /absolute/zero-wam-pretrain --candidates 4 --scoring-config /absolute/validation/scoring.json --output outputs/candidates
 ```
 
-正式预测需 artifact 配置的 `validation_locked=true`；正式四候选另需 `scoring.json` 提供 `validation_locked=true`、校准后策略的 `policy_artifact_sha256`、全部 `field_weights`、`uncertainty_weight` 和有限 `max_cost`，不得通过命令行覆盖。`--diagnostic` 明确排除正式测试主张，允许临时 `--max-cost`。
+正式预测需 artifact 配置及 `binding_policy` 的 `validation_locked=true`；对象置信度和间隔门槛在验证集锁定。正式四候选另需 `scoring.json` 提供 `validation_locked=true`、校准后策略的 `policy_artifact_sha256`、全部 `field_weights`、`uncertainty_weight`、`event_threshold` 和有限 `max_cost`，不得通过命令行覆盖。`--diagnostic` 明确排除正式测试主张，允许临时 `--max-cost`。
 
-部署输入采用独立 `kind="observation"` 的JSON+NPZ，仅含 `entity_ids`、`robot_history`、`proprio_history`、`embodiment`、`robot_latent` 和按时间/空间排序的 `demo_view_0` 等示范。JSON声明 `view_ids`、`chunk_size`、`actions_per_frame` 和 `action_space`。推理既不要求也不读取未来标签、真实要求或记录动作；`make-fixture` 同时生成此观测示例。空当前要求会拒绝，不作为任务完成。
+部署输入采用独立 v2 `kind="observation"` JSON+NPZ。除了纯观测特征和示范，必须显式提供已执行动作、控制步时间、归一化身份和 native 历史切片；初始空动作历史也要明确声明。禁止读取未来动作标签。`make-fixture` 提供完整格式，旧 v1 不会静默升级。缺少对象、证据不足、空当前要求或不合法事件顺序都在采样前拒绝。
 
-输出为归一化动作数组和诊断 JSON，`commands_sent=0`。它不会直接发送实机命令。真实控制器须提供经标定的动作解码、控制频率和执行接口；闭环及快照回放接法见 `evaluation.md`。
+`preprocess-visual` 将原始人类视频、机器人 RGB 及显式实体跟踪区域转为观测输入，详见 `vision.md`。它复用本地 Wan VAE，不自动生成对象跟踪或接触标注。
+
+`predict` 输出归一化动作数组，`commands_sent=0`。真实 RoboTwin 接口见 `robotwin.md`：`NativePolicy.from_artifact(...).oracle_candidate` 与文件推理复用同一采样实现，可直接接准确要求诊断，不需要另写模型策略。工厂负责真实环境初始化、观测跟踪和两套成功判据。
+
+数据和增量权重均升级 v2，旧 artifact 因 G/Q 结构改变不可直接恢复。请重新训练接口，再初始化读取器与联合阶段；不要只改版本号来绕过兼容性检查。
 
 ## 结果应如何解释
 

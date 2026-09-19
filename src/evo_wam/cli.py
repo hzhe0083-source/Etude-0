@@ -687,6 +687,25 @@ def main(argv=None):
     commands.add_parser("doctor")
     commands.add_parser("check-native")
     commands.add_parser("check")
+    icl_visual = commands.add_parser("preprocess-icl-video", help="cache one raw video for native ICL semantic pairing")
+    icl_visual.add_argument("--manifest", required=True)
+    icl_visual.add_argument("--output", required=True)
+    icl_visual.add_argument("--device", default="cuda")
+    icl_train = commands.add_parser("train-native-icl", help="mix original robot ICL and human video-only updates")
+    icl_train.add_argument("--config", required=True)
+    icl_train.add_argument("--index", required=True)
+    icl_train.add_argument("--checkpoint")
+    icl_train.add_argument("--tiny-native", action="store_true")
+    icl_train.add_argument("--steps", type=int, default=1)
+    icl_train.add_argument("--seed", type=int, default=0)
+    icl_train.add_argument("--device", default="cuda")
+    icl_train.add_argument("--output", required=True)
+    icl_train.add_argument("--resume")
+    icl_export = commands.add_parser("export-native-icl", help="merge video adapters into the original checkpoint format")
+    icl_export.add_argument("--artifact", required=True)
+    icl_export.add_argument("--checkpoint")
+    icl_export.add_argument("--output", required=True)
+    icl_export.add_argument("--device", default="cpu")
     visual = commands.add_parser("preprocess-visual")
     visual.add_argument("--manifest", required=True)
     visual.add_argument("--output", required=True)
@@ -770,6 +789,15 @@ def main(argv=None):
         elif args.command == "preprocess-video":
             from .vision import preprocess_video
             result = preprocess_video(args.manifest, args.output, device=args.device)
+        elif args.command == "preprocess-icl-video":
+            from .icl_preprocess import preprocess_icl_video
+            result = preprocess_icl_video(args.manifest, args.output, device=args.device)
+        elif args.command == "train-native-icl":
+            from .icl_training import train_native_icl
+            result = train_native_icl(args)
+        elif args.command == "export-native-icl":
+            from .icl_training import export_native_icl
+            result = export_native_icl(args)
         elif args.command == "pretrain-video":
             from .video_cli import train_video
             result = train_video(args)

@@ -8,6 +8,7 @@
 - [分阶段提交与验收](docs/implementation.md)
 - [安装、训练、恢复与推理](docs/running.md)
 - [数据格式与划分](docs/data.md)
+- [非配对视频预训练与读取器接入](docs/unpaired_video.md)
 - [原始视觉预处理与权重路径](docs/vision.md)
 - [RoboTwin 准确要求闭环入口](docs/robotwin.md)
 - [评测协议及真实机器人边界](docs/evaluation.md)
@@ -37,6 +38,8 @@ evo-wam check-native
 ```
 
 训练支持 `interface`、`reader`、`joint` 三种运行阶段（对应两个研究阶段中的接口学习、读取器暖启动及有限联合训练）。`train`、`predict` 和 `calibrate-f` 的完整命令见运行文档。
+
+`preprocess-video`、`pretrain-video`、`encode-demonstrations` 支持非配对单视角视频 → 作用 tokens → 原有读取器；同步多视角仅作为可选约束。按当前确认，视频损失只训练轻量编码器和预测头，WAM 继续通过机器人训练更新。
 
 `configs/` 提供 T0/T1/T2、V0/V1、geometry/full 的匹配配置。默认维度明确标为**合成检查用**；真实检查点训练要求根据数据填写并审计维度、动作表示和时域，不能直接冒充真实机器人设置。
 

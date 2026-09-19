@@ -32,6 +32,12 @@ uv pip install --python .venv/bin/python ninja wheel
 MAX_JOBS=2 FLASH_ATTN_CUDA_ARCHS=80 uv pip install --python .venv/bin/python flash-attn==2.8.3.post1 --no-build-isolation
 ```
 
+## 非配对视频
+
+可先用单视角视频训练连续作用编码器，再冻结导出示范 tokens 供现有读取器使用；入口、数据契约和U0/U1/U2预算见 [unpaired_video.md](unpaired_video.md)。视频损失不更新WAM。
+
+机器人 `training_sample` 现在可含一个视角，`pair_kind` 缺省为 `none`；只有显式可靠的 `synchronized_views` 双视角会计算CV。已有可靠配对数据应补上该标记。
+
 ## 数据
 
 每样本采用审计过的 v2 JSON+NPZ，详见 `data.md`。数据集索引：

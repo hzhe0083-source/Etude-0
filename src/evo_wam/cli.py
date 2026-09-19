@@ -703,6 +703,10 @@ def main(argv=None):
     video_train.add_argument("--steps", type=int, default=1)
     video_train.add_argument("--seed", type=int, default=0)
     video_train.add_argument("--device", default="cpu")
+    capacity = commands.add_parser("make-capacity-configs", help="generate matched 16/64/100-token capacity candidates")
+    capacity.add_argument("--video-config", required=True)
+    capacity.add_argument("--robot-config", required=True)
+    capacity.add_argument("--output", required=True)
     video_eval = commands.add_parser("evaluate-video")
     video_eval.add_argument("--artifact", required=True)
     video_eval.add_argument("--index", required=True)
@@ -769,6 +773,9 @@ def main(argv=None):
         elif args.command == "pretrain-video":
             from .video_cli import train_video
             result = train_video(args)
+        elif args.command == "make-capacity-configs":
+            from .video_cli import make_capacity_configs
+            result = make_capacity_configs(args.video_config, args.robot_config, args.output)
         elif args.command == "evaluate-video":
             from .video_cli import evaluate_video
             result = evaluate_video(args)

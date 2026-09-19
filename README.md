@@ -41,7 +41,9 @@ Training supports three runtime stages: `interface`, `reader`, and `joint`. Thes
 
 `preprocess-video`, `pretrain-video`, and `encode-demonstrations` provide the path from unpaired single-view videos to effect tokens and the existing reader. Synchronized multi-view data supplies optional supervision. The video objective trains only the lightweight encoder and prediction heads; WAM is updated during the subsequent robot training stage.
 
-`configs/` provides matched T0/T1/T2, V0/V1, and geometry/full configurations. Default dimensions are explicitly marked **for synthetic checks only**. Training with real checkpoints requires data-specific, audited dimensions, action representations, and time horizons; the defaults are not validated robot configurations.
+`configs/` provides matched T0/T1/T2, V0/V1, and geometry/full configurations. The checked-in training configurations use dimensions explicitly marked **for synthetic checks only**. Training with real checkpoints requires data-specific, audited dimensions, action representations, and time horizons; the supplied dimensions are not validated robot configurations.
+
+`make-capacity-configs` generates matched 16/64/100-token video encoder candidates with a 768-dimensional latent, 512-dimensional internal layers, and a matching 768-dimensional reader/requirement interface. It preserves the supplied data dimensions, loss settings, training budgets, and synthetic-data markers, while clearing validation locks so each new model must be validated again. The 64-token candidate is an unvalidated starting point; see the [capacity setup](docs/unpaired_video.md) before preparing real-data experiments.
 
 ## Validation scope and limitations
 

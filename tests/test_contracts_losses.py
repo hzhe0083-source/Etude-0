@@ -4,7 +4,10 @@ from dataclasses import replace
 
 import torch
 
-from evo_wam.contracts import EffectRequirement, PhysicalOutcome, TaskRequirement
+from evo_wam.contracts import (
+    BINDING_UNCERTAIN, BINDING_UNMATCHED, BINDING_UNUSED,
+    EffectRequirement, PhysicalOutcome, TaskRequirement,
+)
 from evo_wam.losses import (
     MaskedLoss, aggregate_fields, masked_bce, masked_mean, masked_mse,
     merge_category_mass, paired_js, pair_supervised_mean,
@@ -38,6 +41,20 @@ def requirement():
         physical.entity_ids, physical.step_offsets, torch.tensor([[0, 2], [2, 1]]),
         **fields, requirement_mask=masks, label_valid=validity,
     )
+
+
+def temporal_requirement():
+    req = requirement()
+    # Two event constraints, not two compulsory event timestamps.
+    req.events[:, 0, 0, 0, 0] = 1
+    req.events[:, 1, 1, 1, 0] = 1
+    req.requirement_mask["events"][:, 0, 0, 0, 0] = True
+    req.requirement_mask["events"][:, 1, 1, 1, 0] = True
+    req.event_windows[..., 0] = 1
+    req.event_windows[..., 1] = 8
+    req.event_precedence = torch.tensor([[[0, 7], [-1, -1]], [[0, 7], [-1, -1]]])
+    req.label_valid["event_precedence"] = torch.ones(2, 2, dtype=torch.bool)
+    return req
 
 
 class ContractsTest(unittest.TestCase):
@@ -112,7 +129,10 @@ class ContractsTest(unittest.TestCase):
             remaining, step_offsets=torch.tensor([8]),
             geometry=remaining.geometry[:, :1], relations=remaining.relations[:, :1], events=remaining.events[:, :1],
             requirement_mask={name: value[:, :1] for name, value in remaining.requirement_mask.items()},
-            label_valid={name: value if name == "binding" else value[:, :1] for name, value in remaining.label_valid.items()},
+            geometry_tolerance=remaining.geometry_tolerance[:, :1],
+            event_windows=remaining.event_windows[:, :1],
+            label_valid={name: value if name in {"binding", "event_precedence"} else value[:, :1]
+                         for name, value in remaining.label_valid.items()},
         )
         TaskRequirement(current, future).validate()
         wrong = replace(remaining, entity_ids=remaining.entity_ids + 100)
@@ -128,6 +148,112 @@ class ContractsTest(unittest.TestCase):
         physical.relations[0, 0, 0, 1, 0] = 0.3
         with self.assertRaises(ValueError):
             physical.validate()
+
+    def test_legacy_defaults_are_exact_fixed_time_and_known(self):
+        req = requirement().validate()
+        self.assertFalse(req.geometry_tolerance.any())
+        self.assertTrue(torch.equal(req.event_windows[:, 0], torch.ones_like(req.event_windows[:, 0])))
+        self.assertTrue(torch.equal(req.event_windows[:, 1], torch.full_like(req.event_windows[:, 1], 4)))
+        self.assertEqual(req.event_precedence.shape, (2, 0, 2))
+        self.assertTrue(req.semantics_known.all())
+        self.assertTrue(TaskRequirement(req, req).resolved.all())
+
+    def test_missing_and_uncertain_bindings_preserve_requirements(self):
+        for status in (BINDING_UNMATCHED, BINDING_UNCERTAIN):
+            req = requirement()
+            before = {name: mask.clone() for name, mask in req.requirement_mask.items()}
+            req.binding[:, 0] = status
+            req.validate(active=torch.ones(2, dtype=torch.bool))
+            self.assertFalse(req.resolved.any())
+            self.assertFalse(req.semantics_known.any())
+            self.assertTrue(req.has_requirement.all())
+            for name, mask in before.items():
+                self.assertTrue(torch.equal(mask, req.requirement_mask[name]))
+            permuted = req.permute_entities(torch.tensor([2, 0, 1])).validate()
+            self.assertTrue((permuted.binding[:, 0] == status).all())
+        req = requirement()
+        req.binding[:, 1] = BINDING_UNUSED  # Role 1 has no conditions in this fixture.
+        req.validate()
+        self.assertTrue(req.resolved.all())
+        req.binding[:, 0] = BINDING_UNUSED
+        with self.assertRaises(ValueError):
+            req.validate()
+
+    def test_geometry_intervals_and_semantic_validity_are_independent(self):
+        req = requirement()
+        req.geometry.fill_(3.0)
+        req.geometry_tolerance.fill_(0.5)
+        req.validate()
+        low, high = req.geometry_bounds
+        self.assertTrue((low == 2.5).all())
+        self.assertTrue((high == 3.5).all())
+        req.geometry_tolerance[0, -1, 0, 0] = -0.1
+        with self.assertRaises(ValueError):
+            req.validate()
+        req.label_valid["geometry_tolerance"][0, -1, 0, 0] = False
+        req.geometry_tolerance[0, -1, 0, 0] = float("nan")
+        req.validate()
+        self.assertTrue(torch.equal(req.semantics_known, torch.tensor([False, True])))
+
+    def test_explicit_semantics_require_explicit_validity(self):
+        req = requirement()
+        validity = {name: value for name, value in req.label_valid.items() if name != "geometry_tolerance"}
+        with self.assertRaises(ValueError):
+            replace(req, label_valid=validity).validate()
+        with self.assertRaises(ValueError):
+            replace(req, event_windows=req.event_windows.float()).validate()
+
+    def test_windows_are_inclusive_intervals_and_unknown_is_not_absence(self):
+        req = temporal_requirement().validate()
+        self.assertTrue(req.semantics_known.all())
+        req.event_windows[0, 0, 0, 0, 0] = torch.tensor([5, 3])
+        with self.assertRaises(ValueError):
+            req.validate()
+        req.label_valid["event_windows"][0, 0, 0, 0, 0] = False
+        req.validate()
+        self.assertFalse(req.semantics_known[0])
+        req = temporal_requirement()
+        req.label_valid["event_precedence"][0, 1] = False
+        req.validate()
+        self.assertFalse(req.semantics_known[0])
+        self.assertTrue(req.semantics_known[1])
+
+    def test_precedence_rejects_bad_indices_padding_and_nonpositive_nodes(self):
+        for pair in ((0, 8), (-1, 0), (-2, -2), (0, 0), (0, 1)):
+            req = temporal_requirement()
+            req.event_precedence[0, 0] = torch.tensor(pair)
+            with self.subTest(pair=pair), self.assertRaises(ValueError):
+                req.validate()
+        req = temporal_requirement()
+        req.requirement_mask["events"][0, 0, 0, 0, 0] = False
+        with self.assertRaises(ValueError):
+            req.validate()
+
+    def test_precedence_rejects_duplicates_cycles_and_infeasible_windows(self):
+        req = temporal_requirement()
+        req.event_precedence[0, 1] = req.event_precedence[0, 0]
+        with self.assertRaises(ValueError):
+            req.validate()
+        req = temporal_requirement()
+        req.event_precedence[0, 1] = torch.tensor([7, 0])
+        with self.assertRaises(ValueError):
+            req.validate()
+        req = temporal_requirement()
+        req.event_windows[0, 0, 0, 0, 0] = torch.tensor([3, 5])
+        req.event_windows[0, 1, 1, 1, 0] = torch.tensor([1, 3])
+        with self.assertRaises(ValueError):
+            req.validate()
+        req.event_windows[0, 1, 1, 1, 0] = torch.tensor([4, 8])
+        req.validate()
+
+    def test_entity_permutation_does_not_reindex_role_temporal_constraints(self):
+        req = temporal_requirement().validate()
+        permuted = req.permute_entities(torch.tensor([1, 2, 0])).validate()
+        for name in ("geometry_tolerance", "event_windows", "event_precedence"):
+            self.assertTrue(torch.equal(getattr(permuted, name), getattr(req, name)))
+            self.assertTrue(torch.equal(permuted.label_valid[name], req.label_valid[name]))
+        self.assertTrue(torch.equal(permuted.required_roles, req.required_roles))
+        self.assertTrue(torch.equal(permuted.entity_ids.gather(1, permuted.binding), req.entity_ids.gather(1, req.binding)))
 
 
 class LossesTest(unittest.TestCase):

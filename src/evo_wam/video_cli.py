@@ -1,6 +1,7 @@
 """Unpaired video pretraining and frozen demonstration-token export."""
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import math
 from pathlib import Path
@@ -44,6 +45,42 @@ def load_video_config(path):
     if type(training["learning_rate"]) not in (int, float) or not math.isfinite(training["learning_rate"]) or training["learning_rate"] <= 0:
         raise ValueError("positive finite learning_rate required")
     return config
+
+
+def make_capacity_configs(video_config_path, robot_config_path, output):
+    """Vary K only; widen B/P and the reader/codec without guessing data dimensions.
+
+    Synthetic markers are preserved. Generating these files does not audit the
+    data, run an experiment, or establish that any candidate capacity is enough.
+    """
+    from .cli import write_json
+    from .data import load_experiment
+
+    video = load_video_config(video_config_path)
+    robot = load_experiment(robot_config_path)
+    data_dimensions = ("entity_dim", "proprio_dim", "embodiment_dim", "geometry_dim",
+                       "relation_dim", "event_dim", "action_dim", "roles", "max_precedence_edges")
+    if any(type(robot["dimensions"].get(name)) is not int or robot["dimensions"][name] < 1
+           for name in data_dimensions):
+        raise ValueError("declare positive integer robot data dimensions before generating capacity configs")
+    output = Path(output).resolve()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise ValueError("capacity configs require a fresh output directory")
+    video_paths = {}
+    for count in (16, 64, 100):
+        candidate = deepcopy(video)
+        candidate["model"].update(num_tokens=count, latent_dim=768, hidden_dim=512)
+        path = output / f"video_K{count}.json"
+        write_json(path, candidate)
+        video_paths[str(count)] = str(path)
+    robot["dimensions"].update(demo_dim=768, token_dim=768)
+    # Changed capacity requires fresh validation of predictions and thresholds.
+    robot["validation_locked"] = False
+    robot["binding_policy"]["validation_locked"] = False
+    robot_path = output / "robot_768.json"
+    write_json(robot_path, robot)
+    return {"video_configs": video_paths, "primary_video_config": video_paths["64"],
+            "robot_config": str(robot_path)}
 
 
 def build_video_models(config, device):

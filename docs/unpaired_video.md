@@ -22,6 +22,40 @@ P 只读取过去的逐实体／patch 特征、B 输出和未来时间查询；p
 几何标签必须使用共同、经过审核的坐标约定和单位；单目估计不能伪装成精确三维真值。
 仅含关系／事件的样本不需要向几何头提供标签。机器人 replay 和人类视频共用 B/P 与一致的特征／作用词汇身份。
 
+## 容量候选与测试配置
+
+`configs/video/U0_robot_only.json`、`U1_feature_prediction.json`、`U2_effect_constraints.json`
+及现有机器人 JSON 保留微型维度和 `synthetic_dimensions_only: true`，用于测试。
+B 的类默认值改为每窗口64个768维 tokens、内部宽度512；P默认使用同样的768／512宽度。
+这些是尚未经正式实验验证的容量起点，不能仅凭接口变宽就宣称细节保留充分或迁移改善。
+
+容量实验同时将读取器的 `demo_dim` 和 R／G／Q 共用的 `token_dim` 设为768：
+
+| 容量候选 | B每窗口token数 | B/P latent宽度 | B/P内部宽度 | R/G/Q宽度 |
+|---|---:|---:|---:|---:|
+| K16 | 16 | 768 | 512 | 768 |
+| K64（主候选） | 64 | 768 | 512 | 768 |
+| K100 | 100 | 768 | 512 | 768 |
+
+已有配置加载器要求明确填写模型维度，因此不会静默采用类默认值。数据就绪后，从审核过的视频和机器人配置生成上述对照：
+
+```bash
+evo-wam make-capacity-configs \
+  --video-config /server/audited-video-config.json \
+  --robot-config /server/audited-robot-config.json \
+  --output /server/capacity-configs
+```
+
+输出 `video_K16.json`、`video_K64.json`、`video_K100.json` 和共用的 `robot_768.json`。
+生成器改变上述容量字段，并清除旧配置的实验与绑定阈值验证锁，要求新模型重新验证；阈值数值本身不变。输入特征维度、作用标签词汇、窗口和查询时域、噪声与所有损失权重、调度、种子和预算保持不变。
+它也保留原配置的合成标记，不会把测试配置自动认证为正式数据配置；尚无真实数据时，可用仓库的U2与V1生成扩大容量的数值检查配置，但不能将其称为正式实验。
+
+`g_current/g_remaining` 的数量仍由角色数乘查询时刻数决定，生成器不将它们改成16／64／100。
+这里的 K 只指 B 每窗口的输出数量，十个窗口会产生160／640／1,000个示范 tokens。
+三个 K 使用独立的预训练、导出和机器人训练运行，保持同一数据索引与训练预算，并分别记录真实窗口数、示范序列长度、耗时和显存；相同步数不表示相同计算量。
+内部宽度512不改变现有时空编码与查询汇总架构。`capacity` 仍乘 `mean(z²)`，不是位姿重建权重或KL；扩容时不同时增加压缩正则。
+先检验目标对象、移动方向和中间事件的保留，再测下游绑定与执行，不能只报告特征重建误差。
+
 ## 输入与预处理
 
 `video_pretrain` 数据格式见 [video_data.md](video_data.md)。它与包含机器人执行监督的 `training_sample` 是独立类型。
@@ -30,14 +64,14 @@ P 只读取过去的逐实体／patch 特征、B 输出和未来时间查询；p
 
 ```bash
 evo-wam preprocess-video --manifest /server/raw-human-video.json --output /server/windows/human-001
-evo-wam pretrain-video --config configs/video/U2_effect_constraints.json \
+evo-wam pretrain-video --config /server/capacity-configs/video_K64.json \
   --index /server/video-index.json --steps 900 --device cuda --output /server/runs/video-effects
-evo-wam pretrain-video --config configs/video/U2_effect_constraints.json \
+evo-wam pretrain-video --config /server/capacity-configs/video_K64.json \
   --index /server/video-index.json --steps 100 --device cuda \
   --resume /server/runs/video-effects/video_encoder.pt --output /server/runs/video-effects
 ```
 
-续训的累计步数仍受预算限制，上例分900+100步完成登记预算。
+续训的累计步数仍受预算限制；上例假设数据配置登记了1,000步预算，分900+100步完成。
 预处理复用本地 Wan VAE，权重路径仍由服务器填写。原始片段须已筛选为连续操作；本版不自动识别镜头切换。
 相机运动、演员外观与接触稳定性仍需要独立诊断，裁剪不能充当真实三维视角标签。
 
@@ -59,7 +93,7 @@ artifact 的 `feature_kind_updates` 分别记录 `patches` 和 `tracked_entities
 ```bash
 evo-wam encode-demonstrations --artifact /server/runs/video-effects/video_encoder.pt \
   --manifest /server/robot-sample/sample.json --output /server/robot-sample-encoded
-evo-wam train --config /server/audited-robot-config.json --index /server/encoded-index.json \
+evo-wam train --config /server/capacity-configs/robot_768.json --index /server/encoded-index.json \
   --demo-encoder /server/runs/video-effects/video_encoder.pt --checkpoint /server/zero-wam \
   --stage interface --steps 1000 --output /server/runs/interface
 ```
@@ -85,9 +119,9 @@ evo-wam train --config /server/audited-robot-config.json --index /server/encoded
 通用入口也允许 `domain_schedule=["human"]`，可在机器人数据就绪前独立预训练编码器；这不建立执行能力。上表正式对照保留固定机器人回放。
 
 三组使用同一架构和初始化种子；U1/U2的数据调度与总步数相同。U0的总计算更少，须单独报告，不能称为总算力完全匹配。
-这里的“普通预测”对照仍经过同一小瓶颈以控制参数容量；U1/U2的差值检验整组约束的增量，不能单独归因于控制关系。
+这里的“普通预测”对照仍经过同容量瓶颈以控制参数容量；U1/U2的差值检验整组约束的增量，不能单独归因于控制关系。
 若要进一步归因，可在固定噪声和容量设置下，仅改变关系／事件损失权重。
-所有默认维度是数值验收用，真实特征维度需要服务器配置。
+上述U系列JSON中的微型维度是数值验收用，真实特征维度需要服务器配置。U系列的数据／监督对照与K16／K64／K100容量对照是两个独立实验轴。
 
 ```bash
 evo-wam evaluate-video --artifact /server/runs/video-effects/video_encoder.pt \

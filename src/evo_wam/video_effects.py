@@ -1,4 +1,4 @@
-"""Small continuous video-effect bottleneck and masked multi-time prediction.
+"""Continuous video-effect bottleneck and masked multi-time prediction.
 
 Precomputed, frozen visual features are inputs. There is no visual backbone,
 detector, action label, task requirement, view-pair requirement or download here.
@@ -63,8 +63,10 @@ class VideoEffectEncoder(nn.Module):
     clipped Gaussian perturbation; this is not a formal information-rate bound.
     """
 
-    def __init__(self, feature_dim: int, latent_dim: int = 32, num_tokens: int = 4,
-                 hidden_dim: int = 64, noise_std: float = .05):
+    # Capacity candidate, not an experimentally established optimum. Unit-test
+    # configurations pass their small dimensions explicitly.
+    def __init__(self, feature_dim: int, latent_dim: int = 768, num_tokens: int = 64,
+                 hidden_dim: int = 512, noise_std: float = .05):
         super().__init__()
         if any(type(size) is not int or size < 1 for size in (feature_dim, latent_dim, num_tokens, hidden_dim)):
             raise ValueError("effect encoder dimensions and token count must be positive integers")
@@ -159,7 +161,7 @@ class EffectFeaturePredictor(nn.Module):
     This task-conditioned predictor is not the independent physical predictor F.
     """
 
-    def __init__(self, feature_dim: int, latent_dim: int = 32, hidden_dim: int = 64,
+    def __init__(self, feature_dim: int, latent_dim: int = 768, hidden_dim: int = 512,
                  geometry_dim: int = 0, relation_dim: int = 0, event_dim: int = 0):
         super().__init__()
         if any(type(size) is not int or size < 1 for size in (feature_dim, latent_dim, hidden_dim)):

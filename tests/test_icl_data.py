@@ -59,6 +59,58 @@ class NativeICLDataTest(unittest.TestCase):
         self.assertEqual(sample.history_frames, 2)
         self.assertIsNone(sample.actions)
         self.assertIsNone(sample.actions_mask)
+        self.assertIsNone(sample.appearance_demonstration)
+
+    def test_appearance_pair_preserves_same_demo_lineage_without_new_source_edges(self):
+        path, metadata, demo, _ = write_sample(self.root)
+        metadata["appearance_variant"] = {"arrays": "appearance.npz", "derived_from": "pair-A",
+                                          "evidence": "audited appearance-only transform of A"}
+        path.write_text(json.dumps(metadata))
+        variant = {**demo, "latent": demo["latent"] + 0.25}
+        np.savez_compressed(self.root / "appearance.npz", **variant)
+        sample = load_icl_sample(path)
+        torch.testing.assert_close(sample.appearance_demonstration[0], torch.from_numpy(variant["latent"]))
+        self.assertEqual(sample.appearance_demonstration.shape, sample.demonstration.shape)
+        torch.testing.assert_close(sample.demonstration[0], torch.from_numpy(demo["latent"]))
+        self.assertIsNone(sample.actions)
+        index = self.write_index([{"manifest": path.name, "split": "train"}])
+        with patch("numpy.load", side_effect=AssertionError("index must not read appearance arrays")):
+            selected, records = load_icl_index(index)
+        self.assertEqual(selected, [path])
+        self.assertEqual([record["source_id"] for record in records], ["pair-A", "pair-B"])
+
+    def test_appearance_metadata_requires_evidence_same_lineage_and_separate_local_path(self):
+        path, metadata, _, _ = write_sample(self.root)
+        variant = {"arrays": "appearance.npz", "derived_from": "pair-A", "evidence": "audited transform"}
+        invalid = [None, {key: value for key, value in variant.items() if key != "evidence"},
+                   {**variant, "evidence": " "}, {**variant, "derived_from": "pair-B"},
+                   {**variant, "arrays": "pair-A.npz"}, {**variant, "arrays": "pair-B.npz"},
+                   {**variant, "arrays": "../appearance.npz"},
+                   {**variant, "arrays": str(self.root / "appearance.npz")},
+                   {**variant, "arrays": "appearance.json"}]
+        invalid.extend({**variant, name: "invented"} for name in ("actions", "geometry", "flow"))
+        index = self.write_index([{"manifest": path.name, "split": "train"}])
+        for changed in invalid:
+            path.write_text(json.dumps({**metadata, "appearance_variant": changed}))
+            with self.subTest(variant=changed), patch("numpy.load", side_effect=AssertionError("metadata only")):
+                with self.assertRaises(ValueError):
+                    load_icl_index(index)
+
+    def test_appearance_payload_requires_exact_shape_times_and_no_extra_labels(self):
+        path, metadata, demo, _ = write_sample(self.root)
+        metadata["appearance_variant"] = {"arrays": "appearance.npz", "derived_from": "pair-A",
+                                          "evidence": "audited transform"}
+        path.write_text(json.dumps(metadata))
+        invalid = [{**demo, "latent": demo["latent"][:, :, :, :1]},
+                   {**demo, "latent": np.full_like(demo["latent"], np.nan)},
+                   {**demo, "frame_times": demo["frame_times"] + 1e-12},
+                   {**demo, "frame_times": np.array([0., 0.2, np.nan])},
+                   {"latent": demo["latent"]}]
+        invalid.extend({**demo, name: np.zeros(1)} for name in ("actions", "geometry", "flow"))
+        for number, payload in enumerate(invalid):
+            np.savez_compressed(self.root / "appearance.npz", **payload)
+            with self.subTest(number=number), self.assertRaises(ValueError):
+                load_icl_sample(path)
 
     def test_human_rejects_invented_actions_proprio_and_effects_in_either_video(self):
         path, metadata, demo, target = write_sample(self.root)

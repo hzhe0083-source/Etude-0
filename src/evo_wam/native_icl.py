@@ -80,6 +80,9 @@ def forward_video_only(native, input_dict):
     hidden_parts, projection_parts = [noisy_hs, clean_hs], [noisy_proj, clean_proj]
     grid_parts = [target_grid, target_grid]
     icl = input_dict.get("icl_latent_dict")
+    if icl is not None:
+        from .demo_context import prepare_demo_context
+        icl = prepare_demo_context(native, icl)
     icl_length = 0
     if icl is not None:
         icl_hs, _, icl_proj = native._training_embed(

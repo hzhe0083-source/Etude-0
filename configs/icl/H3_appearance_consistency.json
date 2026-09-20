@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "kind": "native_icl_experiment",
+  "synthetic_dimensions_only": true,
+  "human_context": "cross_video",
+  "domain_schedule": [
+    "robot",
+    "human",
+    "human",
+    "human"
+  ],
+  "lambda_human": 1.0,
+  "lora": {
+    "rank": 8,
+    "alpha": 8
+  },
+  "training": {
+    "max_steps": 1000,
+    "learning_rate": 0.0001,
+    "gradient_clip": 1.0
+  },
+  "chunk_size": 2,
+  "max_frame_chunk_size": 4,
+  "window_size": 32,
+  "icl_rope_h": 24,
+  "video_snr_shift": 5.0,
+  "mcp_snr_shift": 10.0,
+  "ifp": {
+    "enabled": true,
+    "loss_weights": [
+      0.5,
+      0.25,
+      0.15,
+      0.1
+    ],
+    "future_chunk_stride": 2
+  },
+  "demo_bottleneck": {
+    "dim": 768,
+    "num_heads": 8,
+    "group_frames": 4,
+    "tokens_per_group": 4,
+    "layers": 2,
+    "consistency_weight": 0.01
+  }
+}

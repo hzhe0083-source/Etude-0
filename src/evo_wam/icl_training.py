@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 
 import torch
+from torch.nn import functional as F
 
 from .cli import file_sha256, move, source_module, write_json
 from .icl_data import load_icl_index, load_icl_sample
@@ -45,6 +46,20 @@ def load_icl_config(path):
     weights = config["ifp"]["loss_weights"]
     if not isinstance(weights, list) or not weights or any(type(w) not in (int, float) or not math.isfinite(w) or w < 0 for w in weights):
         raise ValueError("IFP loss_weights must be a nonempty list of finite nonnegative weights")
+    if "demo_bottleneck" in config:
+        bottleneck = config["demo_bottleneck"]
+        sizes = {"dim", "num_heads", "group_frames", "tokens_per_group", "layers"}
+        if not isinstance(bottleneck, dict) or set(bottleneck) != sizes | {"consistency_weight"}:
+            raise ValueError("demo_bottleneck requires explicit dimensions, temporal grouping and consistency_weight")
+        if any(type(bottleneck[key]) is not int or bottleneck[key] < 1 for key in sizes):
+            raise ValueError("bottleneck sizes must be positive integers")
+        if bottleneck["dim"] % bottleneck["num_heads"]:
+            raise ValueError("bottleneck dim must be divisible by num_heads")
+        weight = bottleneck["consistency_weight"]
+        if type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
+            raise ValueError("consistency_weight must be finite and nonnegative")
+        if config["human_context"] != "cross_video":
+            raise ValueError("bottleneck comparisons require the cross_video context path")
     return config
 
 
@@ -80,6 +95,12 @@ def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda"
     if null.ndim != 3 or null.shape[-1] != native.config.text_dim or not torch.isfinite(null).all():
         raise ValueError("native empty-text embedding does not match the checkpoint")
     install_icl_lora(native, **config["lora"])
+    if "demo_bottleneck" in config:
+        from .demo_context import install_demo_interface
+        install_demo_interface(native, {key: value for key, value in config["demo_bottleneck"].items()
+                                       if key != "consistency_weight"})
+        native.demo_icl_rope_h = config["icl_rope_h"]
+        native.eval()
     return native, null, identity
 
 
@@ -144,6 +165,18 @@ def prepare_icl_inputs(sample, config, native, null, generator):
             "timesteps": torch.zeros(1, f, device=device),
             "grid_id": get_mesh_id(f // patch[0], h // patch[1], w // patch[2], 0,
                                     h_shift=config["icl_rope_h"])[None].to(device)}
+        if "demo_bottleneck" in config:
+            from .demo_context import prepare_demo_context
+            raw_context = {**inputs["icl_latent_dict"], "frame_times": sample.demonstration_times.to(device)}
+            inputs["icl_latent_dict"] = prepare_demo_context(native, raw_context)
+            if config["demo_bottleneck"]["consistency_weight"] > 0:
+                if sample.appearance_demonstration is None:
+                    raise ValueError("positive consistency_weight requires an audited appearance_variant for every demonstration")
+                variant = prepare_demo_context(native, {**raw_context,
+                    "latent": sample.appearance_demonstration.detach().to(device)})
+                # Only the compressed original reaches WAM; the variant is used
+                # solely by the auxiliary representation-consistency objective.
+                inputs["appearance_tokens"] = variant["latent"].tokens
         inputs["text_emb"] = torch.cat((null, null), dim=1)
         inputs["encoder_seq_ids"] = torch.cat((inputs["encoder_seq_ids"],
             torch.ones(null.shape[1], dtype=torch.int, device=device)))
@@ -186,12 +219,23 @@ def native_icl_loss(native, inputs, config, *, human):
     losses["ifp"] = sum((weight * mse(prediction, stream, native.patch_size)
         for weight, prediction, stream in zip(config["ifp"]["loss_weights"], future, streams)), losses["video"].new_zeros(()))
     losses["total"] = sum(losses.values()) * (config["lambda_human"] if human else 1.)
+    weight = config.get("demo_bottleneck", {}).get("consistency_weight", 0.)
+    if weight > 0:
+        if "appearance_tokens" not in inputs:
+            raise ValueError("appearance consistency requires the audited variant representation")
+        first = inputs["icl_latent_dict"]["latent"].tokens.float()
+        second = inputs["appearance_tokens"].float()
+        if first.shape != second.shape or not torch.isfinite(second).all():
+            raise ValueError("appearance tokens must match the original demonstration's temporal groups")
+        consistency = (F.normalize(first, dim=-1) - F.normalize(second, dim=-1)).square().mean()
+        losses["appearance_consistency"] = consistency
+        losses["total"] = losses["total"] + weight * consistency * (config["lambda_human"] if human else 1.)
     return losses
 
 
 def _model_state(native, tiny):
     return {key: value.detach().cpu() for key, value in native.state_dict().items()
-            if tiny or ".down." in key or ".up." in key}
+            if tiny or ".down." in key or ".up." in key or key.startswith("demo_bottleneck.")}
 
 
 def _read_icl_artifact(path):
@@ -273,6 +317,12 @@ def train_native_icl(args):
                 array = str((path.parent / sample.metadata[role]["arrays"]).resolve())
                 if array not in visited:
                     visited[array] = file_sha256(array)
+            if config.get("demo_bottleneck", {}).get("consistency_weight", 0.) > 0:
+                if "appearance_variant" not in sample.metadata:
+                    raise ValueError("appearance-consistency training requires an audited variant")
+                array = str((path.parent / sample.metadata["appearance_variant"]["arrays"]).resolve())
+                if array not in visited:
+                    visited[array] = file_sha256(array)
             inputs = prepare_icl_inputs(sample, config, native, null, generators[domain])
             optimizer.zero_grad(set_to_none=True)
             losses = native_icl_loss(native, inputs, config, human=domain == "human")
@@ -289,6 +339,8 @@ def train_native_icl(args):
                        target_id=sample.metadata["target"]["source_id"], used_demonstration="icl_latent_dict" in inputs,
                        video_frames=sample.target.shape[2], demonstration_frames=sample.demonstration.shape[2],
                        ifp_valid_values=[int(stream["valid_mask"].sum()) for stream in inputs.get("mcp_latent_dicts", [])])
+            if "demo_bottleneck" in config:
+                row["context_tokens"] = inputs["icl_latent_dict"]["latent"].hidden.shape[1]
             log.write(json.dumps(row, allow_nan=False) + "\n")
             log.flush()
     if str(args.device).startswith("cuda"):
@@ -307,6 +359,7 @@ def train_native_icl(args):
         "domain_updates": updates, "elapsed_seconds": time.monotonic() - started,
         "peak_cuda_bytes": torch.cuda.max_memory_allocated() if str(args.device).startswith("cuda") else None,
         "wam_video_adapters_updated": True, "action_parameters_updated": False,
+        "demo_bottleneck_updated": "demo_bottleneck" in config,
         "test_time_updates": False, "robot_execution_evaluated": False}
     write_json(output / "run.json", report)
     return report
@@ -334,9 +387,10 @@ def export_native_icl(args):
     from huggingface_hub import split_torch_state_dict_into_shards
     from safetensors.torch import save_file
 
-    folder = output / "transformer"
+    bottleneck = payload["config"].get("demo_bottleneck")
+    folder = output / ("backbone" if bottleneck else "transformer")
     native.save_config(folder)
-    state = native.state_dict()
+    state = {key: value for key, value in native.state_dict().items() if not key.startswith("demo_bottleneck.")}
     shards = split_torch_state_dict_into_shards(state, max_shard_size="5GB",
         filename_pattern="diffusion_pytorch_model{suffix}.safetensors")
     for filename, names in shards.filename_to_tensors.items():
@@ -346,6 +400,22 @@ def export_native_icl(args):
     if shards.is_sharded:
         write_json(folder / "diffusion_pytorch_model.safetensors.index.json",
                    {"metadata": shards.metadata, "weight_map": shards.tensor_to_filename})
+    if bottleneck:
+        context_path = output / "demo_bottleneck.pt"
+        torch.save({key: value.detach().cpu() for key, value in native.demo_bottleneck.state_dict().items()}, context_path)
+        files = [context_path, *sorted(folder.iterdir())]
+        spaces = {record["feature_space_id"] for record in payload["source_records"] if "feature_space_id" in record}
+        if len(spaces) != 1:
+            raise ValueError("bottleneck deployment requires one audited visual feature space")
+        manifest = {"format_version": 1, "kind": "native_icl_temporal_bottleneck", "upstream_commit": ZERO_WAM_COMMIT,
+            "demo_bottleneck": {key: value for key, value in bottleneck.items() if key != "consistency_weight"},
+            "icl_rope_h": payload["config"]["icl_rope_h"], "feature_space_id": next(iter(spaces)),
+            "tiny_native": payload["tiny_native"],
+            "files": {str(path.relative_to(output)): file_sha256(path) for path in files}}
+        write_json(output / "bottleneck.json", manifest)
+        return {"deployment": str(output.resolve()), "context_interface": "temporal_bottleneck",
+                "artifact_sha256": file_sha256(args.artifact), "tiny_native": payload["tiny_native"],
+                "test_time_updates": False, "commands_sent": 0}
     report = {"transformer": str((output / "transformer").resolve()), "artifact_sha256": file_sha256(args.artifact),
               "tiny_native": payload["tiny_native"], "test_time_updates": False, "commands_sent": 0}
     write_json(output / "adaptation.json", report)

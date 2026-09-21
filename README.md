@@ -2,7 +2,7 @@
 
 Training native Zero-WAM with additional human demonstration videos for in-context robot control.
 
-The current experiment adds **human-to-human cross-video prediction** to the existing robot ICL objective: watch demonstration A, observe the earlier part of an independent execution B, and predict B's continuation through Zero-WAM's native video pathway. A and B need audited task compatibility; each additional human video does not need a matching robot trajectory or human action labels. At deployment, the original demonstration-to-robot execution path runs with fixed parameters.
+The current experiment adds **human-to-human cross-video prediction** to the existing robot ICL objective: watch demonstration A, observe the earlier part of an independent execution B, and predict B's continuation through Zero-WAM's native video pathway. A and B need audited task compatibility; each additional human video does not need a matching robot trajectory or human action labels. H1 preserves the raw demonstration baseline. H2 adds an ordered temporal bottleneck at the demonstration entrance; H3 adds audited appearance consistency. At deployment, the selected demonstration interface runs with fixed parameters.
 
 - [Native human-video ICL: data, training, controls, and export](docs/human_icl.md)
 - [Current scope and archived effect-interface specification](docs/spec.md)
@@ -42,13 +42,13 @@ evo-wam validate-data --index outputs/fixture/index.json
 evo-wam check-native
 ```
 
-The current route uses `preprocess-icl-video`, `train-native-icl`, and `export-native-icl`. It feeds normalized Wan latents into the native ICL context path, trains video/context attention LoRA, and exports merged weights in the original model format. Robot batches keep the native video/action objectives; human batches have no action branch or action loss. The action expert and base weights stay frozen during this adaptation.
+The current route uses `preprocess-icl-video`, `train-native-icl`, and `export-native-icl`. It feeds normalized Wan latents into the native ICL context path and trains video/context attention LoRA. H2/H3 also train a shared demonstration compressor and adapter, while leaving target observations uncompressed. H1 exports merged weights in the original model format; enabled bottleneck runs export a deployment bundle containing the merged backbone and the required interface weights. Robot batches keep the native video/action objectives; human batches have no action branch or action loss. The action expert and base weights stay frozen during this adaptation.
 
-`configs/icl/` contains R0 (robot-only adaptation), H0 (the same robot data plus ordinary human-video continuation), and H1 (the same videos with human cross-video ICL). These are explicitly marked **for synthetic checks only**. They keep the robot update count fixed; H0/H1 additionally match human targets, losses, and update counts. Real data, semantic pair audits, full-checkpoint validation, and measured resource budgets are still required. See the [native ICL guide](docs/human_icl.md) for the exact comparison and input contracts.
+`configs/icl/` contains R0 (robot-only adaptation), H0 (the same robot data plus ordinary human-video continuation), H1 (the same videos with raw human cross-video ICL), H2 (H1 plus temporal demonstration compression), and H3 (H2 plus appearance consistency). These are explicitly marked **for synthetic checks only**. They keep the robot update count fixed; H0/H1 additionally match human targets, losses, and update counts. H2 preserves H1's predictive losses; H3 changes only the consistency weight and requires an audited appearance variant for each conditioned sample. Candidate bottleneck dimensions are unvalidated. Real data, semantic pair audits, full-checkpoint validation, and measured resource budgets are still required. See the [native ICL guide](docs/human_icl.md) for the exact comparison and input contracts.
 
 The earlier `interface`, `reader`, and `joint` stages and `pretrain-video`/`encode-demonstrations` commands continue to implement the separate effect-interface experiments. Their T0/T1/T2, V0/V1, geometry/full, and U0/U1/U2 configurations also retain synthetic dimensions.
 
-`make-capacity-configs` belongs to those earlier B/P experiments. Its 16/64/100-token candidates are not a new bottleneck in the native ICL route.
+`make-capacity-configs` belongs to those earlier B/P experiments. Its 16/64/100-token candidates remain separate from the native temporal bottleneck, which produces `ceil(T / group_frames) * tokens_per_group` ordered tokens per demonstration.
 
 ## Validation scope and limitations
 

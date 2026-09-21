@@ -28,6 +28,7 @@ class NativeICLSample:
     history_frames: int             # target[:history_frames] is observed history
     actions: Tensor | None = None   # robot only: [1,A,F,N,1]
     actions_mask: Tensor | None = None
+    appearance_demonstration: Tensor | None = None  # same A, appearance-only variant [1,C,F,H,W]
 
 
 def _identity(record: Mapping) -> None:
@@ -48,7 +49,7 @@ def _metadata(path: Path) -> dict:
     required = {"format_version", "kind", "sample_id", "feature_space_id", "latent_normalization",
                 "history_frames", "demonstration", "target", "compatibility"}
     if (not isinstance(metadata, dict) or required - set(metadata)
-            or set(metadata) - required - {"provenance"}
+            or set(metadata) - required - {"provenance", "appearance_variant"}
             or type(metadata.get("format_version")) is not int or metadata["format_version"] != 1
             or metadata.get("kind") != "native_icl_sample"):
         raise ValueError("expected an explicit version-1 native_icl_sample schema")
@@ -78,6 +79,16 @@ def _metadata(path: Path) -> dict:
             raise ValueError("native video records accept only source identity, arrays and robot-target action_space")
         _local_path(path.parent, _text(record, "arrays"), ".npz")
     demo, target = metadata["demonstration"], metadata["target"]
+    if "appearance_variant" in metadata:
+        variant = metadata["appearance_variant"]
+        if not isinstance(variant, dict) or set(variant) != {"arrays", "derived_from", "evidence"}:
+            raise ValueError("appearance_variant requires exactly arrays, derived_from and evidence")
+        _text(variant, "evidence")
+        if _text(variant, "derived_from") != demo["source_id"]:
+            raise ValueError("appearance_variant must be derived_from the same demonstration source_id")
+        variant_path = _local_path(path.parent, _text(variant, "arrays"), ".npz")
+        if variant_path in {_local_path(path.parent, record["arrays"], ".npz") for record in (demo, target)}:
+            raise ValueError("appearance_variant arrays must differ from demonstration and target paths")
     if target["domain"] == "human":
         if demo["domain"] != "human":
             raise ValueError("human cross-video ICL requires a human demonstration")
@@ -109,6 +120,13 @@ def load_icl_sample(manifest_path: str | Path) -> NativeICLSample:
     robot = metadata["target"]["domain"] == "robot"
     demo = _arrays(path, metadata["demonstration"], robot_target=False)
     target = _arrays(path, metadata["target"], robot_target=robot)
+    appearance = None
+    if "appearance_variant" in metadata:
+        variant = _arrays(path, metadata["appearance_variant"], robot_target=False)
+        if (variant["latent"].shape != demo["latent"].shape
+                or not torch.equal(variant["frame_times"], demo["frame_times"])):
+            raise ValueError("appearance_variant must preserve demonstration latent shape and exact frame_times")
+        appearance = variant["latent"].unsqueeze(0)
     context, frames = metadata["history_frames"], target["latent"].shape[1]
     if context >= frames:
         raise ValueError("history_frames must leave at least one future latent frame")
@@ -130,7 +148,7 @@ def load_icl_sample(manifest_path: str | Path) -> NativeICLSample:
             raise ValueError("robot targets require valid future action supervision")
         actions, mask = actions.unsqueeze(0), mask.unsqueeze(0)
     return NativeICLSample(metadata, demo["latent"].unsqueeze(0), target["latent"].unsqueeze(0),
-                           demo["frame_times"], target["frame_times"], context, actions, mask)
+                           demo["frame_times"], target["frame_times"], context, actions, mask, appearance)
 
 
 def load_icl_index(index_path: str | Path, split: str = "train") -> tuple[list[Path], list[dict]]:

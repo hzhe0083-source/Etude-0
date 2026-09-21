@@ -1,24 +1,28 @@
-# Evo-WAM 当前范围与历史规格
+# Evo-WAM scope and archived specification
 
-## 当前主线：SE(3) 目标监督的视频到动作接口
+## Current experiment: full-parameter recurrent goal interface
 
-当前主线把瓶颈放在机器人未来视频特征到 Action Expert 的条件通路上。第一阶段只读取机器人真实动作块终点 SE(3) 和当前状态，训练 Goal Encoder、状态编码器、接入层及动作注意力 LoRA；不读取图像。这是从 Zero-WAM 动作权重初始化后适配的两阶段方案，不是从头训练动作专家，也不声称复现 LIT。
+The primary route is a two-stage, LIT-style **soft latent interface**, initialized from pretrained Zero-WAM. Stage 1 receives explicit robot endpoint pose/gripper targets, independent language, and measured current state, and updates the complete Action Expert plus its goal/state/condition encoders. It reads no visual arrays or visual caches. This is nonvisual adaptation of existing action weights, not training an action expert from scratch or proof that prior visual biases were removed.
 
-第二阶段冻结上述接口和动作专家，让人类或机器人参考示范与目标机器人已观测历史先生成机器人未来，再从生成未来的逐层特征中读取目标相关 tokens。训练视频／示范注意力 LoRA、视觉目标读取器与 Pose Decoder，使用目标机器人动作损失、逐动作块终点位姿重建损失，以及独立的原生视频／IFP 预测损失。示范需与目标机器人执行有经过审核的操作对应，人类示范不需要自身的三维或动作标签。
+Stage 2 updates the full video backbone, Action Expert, and interface, without LoRA. External text and visual encoders remain frozen. A compatible human or robot demonstration, observed robot history, and language first generate a future without gradients. After detaching the sample and clearing caches, the model recomputes the demonstration/history conditions and reads the future with gradients. Each video layer updates a recurrent latent condition for the corresponding action layer. Native video/IFP supervision runs separately; true-future caches never enter the deployment-style action path. Full-parameter updates coexist with stopped sampling gradients.
 
-目标与动作通路不能读取真实未来视频；真实未来只用于独立的视频监督。动作专家只读取连续 tokens 与当前机器人状态，不能直接读取原始视频特征或缓存。tokens 不等于 SE(3) 数值，Pose Decoder 只用于辅助监督和诊断输出，其坐标不作为动作专家输入。两阶段结束后全部冻结，使用专用策略加载入口推理。数据、训练、冻结边界和导出约定见 [se3_interface.md](se3_interface.md)。
+Each query predicts the next action block and uses 100 tokens of width 768 by default, 8 heads, and 6 groups of parameters shared across contiguous layers. At every layer tokens undergo self-attention, language/state cross-attention, and visual cross-attention. The first 8 final tokens feed the goal decoder, while all tokens condition actions. Pose reconstruction therefore does not impose a pure geometric information channel. The main action branch can read only its layer's latent, independent language/state, and noisy actions; its separate projections alone are not considered evidence of visual isolation.
 
-这条路线使用自己的 Goal Encoder 与视频到动作接口，不叠加下述示范时序压缩器或历史 G/Q、B/P。终点位姿监督不能单独保证路径、抓持时机或交互纯度；目前没有真实训练或跨视角迁移收益的证据。
+Goal samples, indexes, observations, training artifacts, and deployment policies use version 2. Targets explicitly identify absolute robot-base-to-tool transforms in meters, tool ordering, normalized gripper values and physical bounds, measured versus commanded source, and the action-block endpoint time. Frozen instruction caches have a separate version-1 format with text, encoder, tokenizer, preprocessing, and array identities. Missing language is not replaced with null text. Human references require audited operation correspondence but no human pose/action labels.
 
-## 独立对照：原生 Zero-WAM 人类跨视频 ICL
+Training uses FP32 parameters, gradients, and AdamW state with BF16 CUDA autocast. Exact same-stage recovery includes model, optimizer, random states, data cursor and identities; Stage 1 to Stage 2 starts a new optimizer. Deployment uses complete checksum-validated safetensors shards, has no dependency on external base weights, and cannot substitute for the FP32 training recovery artifact. Inference freezes all parameters and accepts observed-only inputs.
 
-此前实现保留 Zero-WAM 原有示范条件执行路径，增加人类示范 A 与独立人类执行 B 的视频预测样本，直接训练原生视频／示范注意力的 LoRA。机器人样本继续使用原有视频、动作与可选 IFP 损失；人类样本不构造动作 token，不填零动作或虚构本体状态，也不计算动作损失。该对照中的动作专家及基础权重冻结，推理时不更新参数。
+The matched `direct_features` control starts from the same Stage 1 checkpoint with the same data, language/state, generation conditions, and Stage 2 budget. It intentionally conditions action layers on generated-future features directly and omits recurrent latent processing and goal loss. This tests their joint Stage 2 increment, not pose loss alone or the value of Stage 1. Historical H1/H2/H3 are not sufficient matched controls because their inputs and updated parameters differ.
 
-A/B 需要经过审核的任务语义对应，不要求同步机位或每条人类视频配套机器人轨迹。训练沿用逐块 teacher forcing：每个查询可以读取 B 的较早干净块，不能读取同块或未来块的干净答案。数据、三组对照、训练与导出约定见 [human_icl.md](human_icl.md)。
+Required acceptance distinguishes cache-intervention isolation, gradient flow through freshly recomputed context, deployment-label isolation, and loss-target interventions with already constructed noisy inputs held fixed. Demonstration dependence must be fitted and evaluated with scene, state, language, and noise fixed. Random output differences do not establish ICL. Full details, CLI examples, and contracts are in [se3_interface.md](se3_interface.md); actual evidence and unmeasured results are in [validation.md](validation.md).
 
-H1保留原始示范入口作为基线。H2在原生示范embedding之后增加按时间分组的可训练压缩器及接入层，WAM只读取压缩后的示范，当前观测不被压缩；H3在同一路径上增加经过审核的同示范外观一致性监督。人类训练、机器人训练和推理共用该接口，启用版本的保存与加载必须包含压缩器及接入层，不能只使用合并LoRA后的主干。它是带时间结构的示范压缩器，交互纯度与泛化收益仍待实验。
+This scope excludes subgoal segmentation, completion detection, integration with archived B/P or G/Q/R/F modules, and additional action-history conditioning. No real-data training, arbitrary-view transfer, or robot success is claimed.
 
-以下 G/Q/R/F、B/P、作用标签和额外接口的定义保留为**历史可选实验**，不再是这条主线的训练或部署前置条件。下文的阶段顺序与“本轮”表述均指历史实现，不代表当前研究范围。现阶段尚无真实数据或已验证的迁移收益。
+## Independent historical native ICL route
+
+[H1/H2/H3](human_icl.md) remain separate experiments. H1 trains human-to-human cross-video prediction through video/context LoRA while retaining the native robot objective. H2 adds a temporal demonstration compressor; H3 adds audited appearance consistency. They retain their original input, training, and deployment contracts. Their LoRA settings do not apply to the current full-parameter goal route.
+
+The following effect-interface specification is retained in its original language for existing optional experiments. Its stage numbers, “current round” statements, G/Q/R/F, B/P, and effect-label requirements are **historical**, not prerequisites or claims of the current goal-interface implementation.
 
 ## 历史作用接口路线
 

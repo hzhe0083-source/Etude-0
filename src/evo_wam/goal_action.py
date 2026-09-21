@@ -1,69 +1,80 @@
 """Run the native Action Expert using only goal-interface and robot-state tokens."""
 
+from copy import deepcopy
 import math
+from types import MethodType
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .zerowam import VideoLoRA, action_mask_for, unpack_velocity
+from .zerowam import action_mask_for, unpack_velocity
 
 
-_ACTION_TARGETS = ("attn1.action_to_q", "attn1.action_to_k", "attn1.action_to_v",
-                   "attn1.action_to_out.0", "attn2.action_to_q", "attn2.action_to_out.0")
+def _action_cross_project(self, hs_latent, hs_action, hs_pad, encoder_hidden_states):
+    """Use independent action K/V; video queries keep the native projection path."""
+    if hs_action is None:
+        return type(self)._project(self, hs_latent, hs_action, hs_pad, encoder_hidden_states)
+    if hs_latent is not None or encoder_hidden_states is None:
+        raise ValueError("the goal action interface requires isolated action cross-attention")
+    query = self.action_norm_q(self.action_to_q(hs_action)).unflatten(2, (self.heads, -1))
+    padding = query.new_zeros(query.shape[0], hs_pad.shape[1], self.heads, query.shape[-1])
+    query = torch.cat((query, padding), dim=1)
+    key = self.action_norm_k(self.action_to_k(encoder_hidden_states)).unflatten(2, (self.heads, -1))
+    value = self.action_to_v(encoder_hidden_states).unflatten(2, (self.heads, -1))
+    return query, key, value, 0, hs_action.shape[1]
 
 
-def install_action_lora(native, rank=8, alpha=8):
-    """Install after video LoRA; never adapt the cross-attention's shared K/V."""
-    projections = []
+def install_action_interface(native):
+    """Split native cross-attention aliases and route their actual action calls.
+
+    Load pretrained native weights before installation; restore specialized full
+    checkpoints after installation. The names in state_dict stay native-compatible,
+    but their action K/V values can now differ from the video's values.
+    """
+    if getattr(native, "_goal_action_interface", False):
+        raise ValueError("goal action interface is already installed")
     for block in native.blocks:
-        if (block.attn1.action_to_k is block.attn1.to_k
-                or block.attn1.action_to_v is block.attn1.to_v):
-            raise ValueError("action adapters require separate action self-attention K/V")
-        for path in _ACTION_TARGETS:
-            parent_path, name = path.rsplit(".", 1)
-            parent = block.get_submodule(parent_path)
-            base = getattr(parent, name)
-            if not isinstance(base, nn.Linear):
-                raise ValueError("action adapters require unwrapped native Linear projections")
-            projections.append((parent, name, VideoLoRA(base, rank, alpha)))
-    for parent, name, adapter in projections:
-        setattr(parent, name, adapter)
-        adapter.enable(True)
+        for name in ("to_q", "to_k", "to_v", "action_to_q", "action_to_k", "action_to_v"):
+            if not isinstance(getattr(block.attn1, name), nn.Linear) or not isinstance(getattr(block.attn2, name), nn.Linear):
+                raise ValueError("goal action interface requires native projections without LoRA")
+        if (block.attn2.action_to_k is not block.attn2.to_k
+                or block.attn2.action_to_v is not block.attn2.to_v
+                or block.attn2.action_norm_k is not block.attn2.norm_k):
+            raise ValueError("expected native shared cross-attention aliases before installation")
+    for block in native.blocks:
+        attention = block.attn2
+        attention.action_to_k = deepcopy(attention.to_k)
+        attention.action_to_v = deepcopy(attention.to_v)
+        attention.action_norm_k = deepcopy(attention.norm_k)
+        attention._project = MethodType(_action_cross_project, attention)
+    native._goal_action_interface = True
     return native
 
 
-def set_action_lora(native, enabled):
-    """Change only action LoRA trainability; video/interface stages remain caller-owned."""
-    for block in native.blocks:
-        for path in _ACTION_TARGETS:
-            adapter = block.get_submodule(path)
-            if isinstance(adapter, VideoLoRA):
-                adapter.enable(enabled)
-    return native
+def action_named_parameters(native):
+    """Full executed action branch, including its independent language projection.
 
-
-@torch.no_grad()
-def merge_action_lora(native):
-    """Restore checkpoint-compatible native action Linear layers in place."""
-    for block in native.blocks:
-        for path in _ACTION_TARGETS:
-            parent_path, name = path.rsplit(".", 1)
-            parent = block.get_submodule(parent_path)
-            adapter = getattr(parent, name)
-            if isinstance(adapter, VideoLoRA):
-                update = adapter.up.weight.float() @ adapter.down.weight.float()
-                adapter.base.weight.copy_((adapter.base.weight.float() + update * adapter.scale)
-                                          .to(adapter.base.weight))
-                setattr(parent, name, adapter.base)
-    return native
+    The caller embeds nonvisual language with condition_embedder_action.text_embedder.
+    MCP action branches are unused by this route and deliberately excluded.
+    """
+    if not getattr(native, "_goal_action_interface", False):
+        raise ValueError("install the goal action interface before selecting action parameters")
+    prefixes = ("action_embedder.", "condition_embedder_action.", "action_norm_out.", "action_proj_out.")
+    for name, parameter in native.named_parameters():
+        if (name.startswith(prefixes) or name == "scale_shift_table_action"
+                or (name.startswith("blocks.") and any(
+                    part.startswith("action_") or part == "scale_shift_table_action"
+                    for part in name.split(".")[2:]))):
+            yield name, parameter
 
 
 def goal_action_forward(native, noisy_actions, timesteps, condition, *, cache_name="se3_action"):
     """Denoise one action block with zero video tokens and zero video-cache access.
 
-    ``condition`` is the learned z plus current-state token, already projected
-    to native.inner_dim. The same function serves training and inference.
+    ``condition`` contains one [1,K_layer,native.inner_dim] tensor per native
+    layer, combining that layer's latent with independent language/state tokens.
+    Training and inference use the same route, without raw visual K/V access.
     Calls on the shared native model are sequential, as in upstream ICL.
     """
     if (not isinstance(noisy_actions, torch.Tensor) or noisy_actions.ndim != 5
@@ -71,11 +82,12 @@ def goal_action_forward(native, noisy_actions, timesteps, condition, *, cache_na
             or noisy_actions.shape[-1] != 1 or min(noisy_actions.shape) < 1
             or not noisy_actions.is_floating_point() or not torch.isfinite(noisy_actions).all()):
         raise ValueError("noisy_actions must be finite native [1,A,F,N,1] floating point")
-    if (not isinstance(condition, torch.Tensor) or condition.ndim != 3
-            or condition.shape[0] != 1 or condition.shape[1] < 2
-            or condition.shape[-1] != native.inner_dim or not condition.is_floating_point()
-            or not torch.isfinite(condition).all()):
-        raise ValueError("condition must be finite [1,K+1,native.inner_dim] goal/state tokens")
+    if (not isinstance(condition, (tuple, list)) or len(condition) != len(native.blocks)
+            or any(not isinstance(value, torch.Tensor) or value.ndim != 3
+                   or value.shape[0] != 1 or value.shape[1] < 1
+                   or value.shape[-1] != native.inner_dim or not value.is_floating_point()
+                   or not torch.isfinite(value).all() for value in condition)):
+        raise ValueError("condition must contain one finite [1,K_layer,native.inner_dim] tensor per layer")
     if not isinstance(cache_name, str) or not cache_name.strip() or cache_name == "pos":
         raise ValueError("action cache_name must be nonempty and separate from the native pos cache")
     frames = noisy_actions.shape[2]
@@ -87,8 +99,11 @@ def goal_action_forward(native, noisy_actions, timesteps, condition, *, cache_na
     from wan_va.modules.icl_model import ICLAttentionBackend
     from wan_va.utils import get_mesh_id
 
+    if not getattr(native, "_goal_action_interface", False):
+        raise ValueError("install the goal action interface before action decoding")
     weight = native.action_embedder.weight
-    actions, condition = noisy_actions.to(weight), condition.to(weight)
+    actions = noisy_actions.to(weight)
+    condition = [value.to(weight) for value in condition]
     hidden, temb, projection = native._embed_stream(
         {"noisy_latents": actions, "timesteps": time.to(device=weight.device, dtype=torch.float32)},
         "action")
@@ -100,19 +115,19 @@ def goal_action_forward(native, noisy_actions, timesteps, condition, *, cache_na
     seq = F.pad(torch.zeros(count, device=weight.device, dtype=torch.int), (0, padding), value=-1)
     types = F.pad(torch.ones(count, device=weight.device, dtype=torch.int), (0, padding), value=-1)
     frame_ids = seq.clone()  # All queries belong to the same denoised action block.
-    encoder_seq = torch.zeros(condition.shape[1], device=weight.device, dtype=torch.int)
     previous = [(block.attn1.self_block_mask, block.attn2.cross_block_mask) for block in native.blocks]
     backend_masks = ICLAttentionBackend.self_mask, ICLAttentionBackend.cross_mask
     try:
         self_mask = ICLAttentionBackend.build_self_mask(
             types, types, seq, seq, frame_ids, frame_ids, -1, weight.device, compile_mask=False)
-        cross_mask = ICLAttentionBackend.build_cross_mask(seq, encoder_seq, weight.device, compile_mask=False)
-        for block in native.blocks:
+        for block, layer_condition in zip(native.blocks, condition):
+            encoder_seq = torch.zeros(layer_condition.shape[1], device=weight.device, dtype=torch.int)
+            cross_mask = ICLAttentionBackend.build_cross_mask(seq, encoder_seq, weight.device, compile_mask=False)
             # Never native.clear_cache(): even a named clear erases shared video metadata.
             block.attn1.clear_cache(cache_name)
             block.attn1.self_block_mask = self_mask
             block.attn2.cross_block_mask = cross_mask
-            _, hidden = block(None, hidden, pad, condition, None, projection, rotary,
+            _, hidden = block(None, hidden, pad, layer_condition, None, projection, rotary,
                               update_cache=0, cache_name=cache_name)
         shift, scale = (native.scale_shift_table_action[None] + temb[:, :, None]).unbind(2)
         hidden = (native.action_norm_out(hidden.float()) * (1 + scale) + shift).to(hidden.dtype)

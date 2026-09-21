@@ -687,7 +687,12 @@ def main(argv=None):
     commands.add_parser("doctor")
     commands.add_parser("check-native")
     commands.add_parser("check")
-    goal_train = commands.add_parser("train-goal-interface", help="train the nonvisual goal/action or visual SE(3) interface stage")
+    goal_language = commands.add_parser("cache-goal-language", help="cache an explicit instruction with the frozen local native text encoder")
+    goal_language.add_argument("--text", required=True)
+    goal_language.add_argument("--checkpoint", required=True)
+    goal_language.add_argument("--output", required=True)
+    goal_language.add_argument("--device", default="cuda")
+    goal_train = commands.add_parser("train-goal-interface", help="fully train the nonvisual goal/action or recurrent visual interface stage")
     goal_train.add_argument("--config", required=True)
     goal_train.add_argument("--index", required=True)
     goal_train.add_argument("--stage", required=True, choices=("goal", "visual"))
@@ -703,10 +708,11 @@ def main(argv=None):
     goal_export = commands.add_parser("export-goal-policy", help="export the complete trained SE(3) interface policy")
     goal_export.add_argument("--artifact", required=True)
     goal_export.add_argument("--output", required=True)
+    goal_export.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
+    goal_export.add_argument("--max-shard-size", default="2GB")
     goal_predict = commands.add_parser("predict-goal-policy", help="predict normalized actions from observed-only SE(3) policy inputs")
     goal_predict.add_argument("--policy", required=True)
     goal_predict.add_argument("--observation", required=True)
-    goal_predict.add_argument("--checkpoint")
     goal_predict.add_argument("--device", default="cuda")
     goal_predict.add_argument("--seed", type=int, default=0)
     goal_predict.add_argument("--output", required=True)
@@ -812,6 +818,9 @@ def main(argv=None):
         elif args.command == "preprocess-video":
             from .vision import preprocess_video
             result = preprocess_video(args.manifest, args.output, device=args.device)
+        elif args.command == "cache-goal-language":
+            from .goal_language import cache_goal_language
+            result = cache_goal_language(args)
         elif args.command == "train-goal-interface":
             from .goal_training import train_goal_interface
             result = train_goal_interface(args)

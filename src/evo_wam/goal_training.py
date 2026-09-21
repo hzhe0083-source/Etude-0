@@ -1,47 +1,62 @@
-"""Two-stage SE(3)-supervised interface with no raw-video action shortcut."""
+"""Full-parameter, two-stage goal training with an explicit visual information boundary."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import math
 from pathlib import Path
+import random
 import time
 
 import numpy as np
 import torch
 
 from .cli import file_sha256, source_module, write_json
-from .goal_action import goal_action_forward, goal_action_sample, install_action_lora
+from .goal_action import action_named_parameters, goal_action_forward, goal_action_sample, install_action_interface
 from .goal_data import GoalObservation, load_goal_index, load_goal_observation, load_goal_sample
 from .goal_future import generated_robot_features
 from .goal_interface import GoalInterface, goal_pose_loss
-from .icl_training import build_icl_model, native_icl_loss, prepare_icl_inputs, validate_icl_config, _model_state
-from .video_data import patch_grid_coordinates, _source_components
-from .zerowam import VideoLoRA, ZERO_WAM_COMMIT
+from .icl_training import build_icl_model, native_icl_loss, prepare_icl_inputs, validate_icl_config
+from .video_data import patch_grid_coordinates, _source_components, _local_path
+from .zerowam import ZERO_WAM_COMMIT, load_native_class
 
 
 STAGES = {"goal", "visual"}
+ARCHITECTURE = "recurrent_goal_full_v2"
+
+
+def autocast_for(native):
+    device = native.action_embedder.weight.device.type
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device == "cuda" else nullcontext()
 
 
 def load_goal_config(path):
-    config = json.loads(Path(path).read_text())
-    if not isinstance(config, dict) or config.get("kind") != "se3_goal_experiment":
-        raise ValueError("expected se3_goal_experiment, not a raw/demo-compression ICL config")
-    validate_icl_config({**config, "kind": "native_icl_experiment"})
-    if "demo_bottleneck" in config or config["domain_schedule"] != ["robot"]:
-        raise ValueError("the SE(3) action interface uses robot-supervised targets and no demo bottleneck")
+    return validate_goal_config(json.loads(Path(path).read_text()))
+
+
+def validate_goal_config(config):
+    if (not isinstance(config, dict) or config.get("kind") != "se3_goal_experiment"
+            or config.get("schema_version") != 2 or "lora" in config):
+        raise ValueError("expected version-2 full-parameter se3_goal_experiment without LoRA")
+    validate_icl_config({**config, "kind": "native_icl_experiment", "schema_version": 1}, adaptation=False)
+    if ("demo_bottleneck" in config or config["domain_schedule"] != ["robot"]
+            or config["human_context"] != "cross_video"):
+        raise ValueError("goal training requires cross-video robot targets without demo compression")
+    if config.get("interface_type") not in {"latent", "direct_features"}:
+        raise ValueError("interface_type must explicitly select latent or the direct_features comparison")
     interface = config.get("goal_interface")
-    required = {"state_dim", "dim", "num_tokens", "num_heads", "translation_scale"}
+    required = {"state_dim", "dim", "num_tokens", "num_heads", "translation_scale", "num_layer_groups", "num_pose_tokens"}
     if not isinstance(interface, dict) or set(interface) != required:
-        raise ValueError("goal_interface must declare state/capacity dimensions and translation_scale")
-    for key in required - {"translation_scale"}:
-        if type(interface[key]) is not int or interface[key] < 1:
-            raise ValueError("goal interface dimensions must be positive integers")
-    if interface["dim"] % interface["num_heads"]:
-        raise ValueError("goal interface dim must be divisible by num_heads")
-    for value in (interface["translation_scale"], config["pose_weight"], config["video_weight"]):
+        raise ValueError("goal_interface must declare dimensions, depth groups, pose tokens and translation_scale")
+    if any(type(interface[key]) is not int or interface[key] < 1 for key in required - {"translation_scale"}):
+        raise ValueError("goal interface dimensions must be positive integers")
+    if interface["dim"] % interface["num_heads"] or interface["num_pose_tokens"] > interface["num_tokens"]:
+        raise ValueError("invalid attention heads or pose-token count")
+    for value in (interface["translation_scale"], config["pose_weight"], config["video_weight"],
+                  config["training"]["backbone_learning_rate"]):
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-            raise ValueError("pose/video weights and translation scale must be positive and finite")
+            raise ValueError("loss weights, translation scale and learning rates must be positive and finite")
     for name in ("sampling_steps", "action_sampling_steps"):
         if type(config[name]) is not int or config[name] < 1:
             raise ValueError("sampling steps must be positive integers")
@@ -49,42 +64,57 @@ def load_goal_config(path):
 
 
 def goal_registry(sample):
-    keys = ("state_space_id", "coordinate_frame", "pose_units", "end_effectors", "goal_source", "action_space", "control_dt")
-    return {**{key: sample.metadata[key] for key in keys}, "actions_per_frame": sample.actions.shape[3]}
+    keys = ("state_space_id", "coordinate_frame", "pose_units", "pose_representation", "tool_frames",
+            "end_effectors", "gripper_space", "goal_source", "action_space", "control_dt")
+    return {**{key: sample.metadata[key] for key in keys}, "actions_per_frame": sample.actions.shape[3],
+            "language_identity": sample.language_identity}
+
+
+def _interface(native, config, registry):
+    if registry["action_space"]["dimension"] != native.config.action_dim:
+        raise ValueError("goal action dimension differs from native checkpoint")
+    if registry["language_identity"]["text_dim"] != native.config.text_dim:
+        raise ValueError("language encoder width differs from native checkpoint")
+    return GoalInterface(native_dim=native.inner_dim, feature_dim=native.inner_dim,
+        num_layers=len(native.blocks), effectors=len(registry["end_effectors"]),
+        **config["goal_interface"]).to(native.action_embedder.weight)
+
+
+def _set_training(native, interface, stage, interface_type):
+    native.requires_grad_(stage == "visual")
+    if stage == "goal":
+        for _, parameter in action_named_parameters(native):
+            parameter.requires_grad_(True)
+    for name, parameter in interface.named_parameters():
+        if stage == "goal":
+            enabled = name.startswith(("goal_encoder.", "state_encoder.", "condition_adapter."))
+        elif interface_type == "direct_features":
+            enabled = name.startswith("state_encoder.")
+        else:
+            enabled = not name.startswith("goal_encoder.")
+        parameter.requires_grad_(enabled)
+    native.train()
+    interface.train()
 
 
 def build_goal_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda"):
     if stage not in STAGES:
-        raise ValueError("SE(3) stage must be goal or visual")
-    native, null, identity = build_icl_model(config, checkpoint=checkpoint, tiny_native=tiny_native, device=device)
-    install_action_lora(native, **config["lora"])
-    layers = list(native.mcp_hidden_collect_layers)
-    if not layers or len(set(layers)) != len(layers) or max(layers) >= len(native.blocks):
-        raise ValueError("native feature-collection layers must identify actual video blocks")
-    if registry["action_space"]["dimension"] != native.config.action_dim:
-        raise ValueError("goal action dimension does not match the native checkpoint")
-    interface = GoalInterface(native_dim=native.inner_dim, feature_dim=len(layers) * native.inner_dim,
-        effectors=len(registry["end_effectors"]), **config["goal_interface"]).to(native.patch_embedding_mlp.weight)
-    native.requires_grad_(False)
-    for name, module in native.named_modules():
-        if isinstance(module, VideoLoRA):
-            module.enable(("action_" in name) == (stage == "goal"))
-    for name, parameter in interface.named_parameters():
-        enabled = (name.startswith(("goal_encoder.", "state_encoder.", "condition_adapter.")) if stage == "goal"
-                   else name.startswith(("visual_", "pose_decoder.")))
-        parameter.requires_grad_(enabled)
-    native.eval()
-    interface.eval()
-    return native, interface, null, identity, layers
+        raise ValueError("stage must be goal or visual")
+    native, _, identity = build_icl_model(config, checkpoint=checkpoint, tiny_native=tiny_native,
+                                        device=device, adaptation=False, dtype=torch.float32)
+    install_action_interface(native)
+    interface = _interface(native, config, registry)
+    _set_training(native, interface, stage, config["interface_type"])
+    return native, interface, None, identity, list(range(len(native.blocks)))
 
 
 def _check_sample(sample, config, registry):
     if goal_registry(sample) != registry:
-        raise ValueError("goal frame, source type, state/action normalization or control timing changed")
+        raise ValueError("goal frame/source, gripper, language or robot conventions changed")
     if sample.state.shape[-1] != config["goal_interface"]["state_dim"]:
-        raise ValueError("state width differs from the configured observed robot state")
+        raise ValueError("state width differs from configuration")
     if sample.actions.shape[2] != config["chunk_size"]:
-        raise ValueError("one SE(3) target must supervise exactly one configured future action chunk")
+        raise ValueError("one query must supervise exactly one configured action block")
 
 
 def _action_noise(actions, mask, generator, device):
@@ -98,130 +128,209 @@ def _action_noise(actions, mask, generator, device):
     return noisy.to(device), times[None].to(device), target.to(device), mask.to(device)
 
 
-def visual_goal_tokens(native, interface, demonstration, history, state, null, config, generator,
+def masked_action_loss(prediction, target, mask):
+    """Loss-only function: callers hold noisy inputs fixed when intervening on targets."""
+    if prediction.shape != target.shape or mask.shape != target.shape or mask.dtype != torch.bool:
+        raise ValueError("action prediction, target and Boolean mask must have identical shapes")
+    difference = torch.where(mask, prediction.float() - target.detach().float(), 0)
+    return difference.square().sum() / mask.sum().clamp_min(1)
+
+
+def visual_goal_tokens(native, interface, demonstration, history, state, language, config, generator,
                        *, feature_layers, current_time, control_dt, actions_per_frame, demo_times=None):
-    """This API deliberately has no ground-truth future, pose or action argument."""
-    generated, features = generated_robot_features(native, demonstration, history, null,
-        {**config, "feature_layers": feature_layers}, generator, demo_times=demo_times)
-    frames = generated.shape[2]
-    times = torch.arange(1, frames + 1, device=features.device, dtype=torch.float64)
+    """Observed-only path; return per-layer conditions, final latents and sampled future."""
+    if config["interface_type"] not in {"latent", "direct_features"}:
+        raise ValueError("unknown visual interface; no implicit raw-feature fallback")
+    if feature_layers != list(range(len(native.blocks))):
+        raise ValueError("the interface requires every native coupling layer in depth order")
+    weight = native.action_embedder.weight
+    language = language.to(weight)
+    language_hidden = native.condition_embedder_action.text_embedder(language)
+    semantic = interface.semantic(language_hidden, state)
+    tokens = interface.initial_queries(state.shape[0]) if config["interface_type"] == "latent" else None
+    times = torch.arange(1, config["chunk_size"] + 1, device=weight.device, dtype=torch.float64)
     times = times * actions_per_frame * control_dt + current_time
-    coordinates = patch_grid_coordinates([generated.shape[-2] // native.patch_size[1],
-                                         generated.shape[-1] // native.patch_size[2]]).to(features.device)
-    return interface.read_future(features, state, times, coordinates), generated
+    coordinates = patch_grid_coordinates([history.shape[-2] // native.patch_size[1],
+                                         history.shape[-1] // native.patch_size[2]]).to(weight.device)
+    conditions = []
+
+    def read_layer(index, features):
+        nonlocal tokens
+        if index != len(conditions):
+            raise ValueError("native feature callbacks must follow coupling-layer order")
+        if tokens is None:
+            condition = interface.direct_condition(features, state, language_hidden)
+        else:
+            tokens = interface.read_layer(tokens, features, semantic, times, coordinates, index)
+            condition = interface.condition(tokens, state, language_hidden)
+        conditions.append(condition)
+
+    generated, _ = generated_robot_features(native, demonstration, history, language,
+        {**config, "feature_layers": feature_layers}, generator, demo_times=demo_times, on_layer=read_layer)
+    if len(conditions) != len(native.blocks):
+        raise ValueError("not every action layer received its visual condition")
+    return conditions, tokens, generated
 
 
-def goal_training_loss(native, interface, null, sample, config, generators, *, stage, feature_layers):
+def _clear_video_cache(native):
+    names = {"pos"} | {name for block in native.blocks for name in block.attn1.attn_caches}
+    for name in names:
+        native.clear_cache(name)
+
+
+def goal_training_loss(native, interface, unused, sample, config, generators, *, stage, feature_layers):
+    del unused
     device = native.action_embedder.weight.device
-    state = sample.state.to(device)
-    if stage == "goal":
-        tokens = interface.encode_goal(sample.goal_poses.to(device))
-    elif stage == "visual":
-        if sample.visual is None:
-            raise ValueError("visual training requires a compatible reference and observed robot history")
-        pair = sample.visual
-        tokens, _ = visual_goal_tokens(native, interface, pair.demonstration,
-            pair.target[:, :, :pair.history_frames], state, null, config, generators["future"],
-            feature_layers=feature_layers, current_time=sample.metadata["current_time"],
-            control_dt=sample.metadata["control_dt"], actions_per_frame=sample.actions.shape[3],
-            demo_times=pair.demonstration_times)
-    else:
-        raise ValueError("stage must be goal or visual")
-    condition = interface.condition(tokens, state)
-    noisy, times, target, mask = _action_noise(sample.actions, sample.actions_mask, generators["action"], device)
-    predicted = goal_action_forward(native, noisy, times, condition).float()
-    losses = {"action": torch.where(mask, (predicted - target.detach()).square(), 0).sum() / mask.sum().clamp_min(1)}
-    losses["total"] = losses["action"]
-    if stage == "visual":
-        pose = goal_pose_loss(interface.decode_goal(tokens), sample.goal_poses.to(device), interface.translation_scale)
-        losses["pose_translation"], losses["pose_rotation"] = pose["translation"], pose["rotation"]
-        # Teacher-forced video supervision is separate from the generated-only
-        # goal/action path. No raw-video action expert is called for this loss.
-        video_inputs = prepare_icl_inputs(sample.visual, config, native, null, generators["video"], include_actions=False)
-        video = native_icl_loss(native, video_inputs, config, human=False, video_only=True)
-        losses["video"], losses["ifp"] = video["video"], video["ifp"]
-        losses["total"] = losses["total"] + config["pose_weight"] * pose["total"] + config["video_weight"] * video["total"]
+    state, language = sample.state.to(device), sample.language.to(device)
+    with autocast_for(native):
+        if stage == "goal":
+            tokens = interface.encode_goal(sample.goal_poses.to(device), sample.goal_gripper.to(device))
+            language_hidden = native.condition_embedder_action.text_embedder(language)
+            condition = interface.condition(tokens, state, language_hidden)
+            conditions = [condition] * len(native.blocks)
+        elif stage == "visual":
+            if sample.visual is None:
+                raise ValueError("visual training requires an operation-compatible reference and observed history")
+            pair = sample.visual
+            conditions, tokens, _ = visual_goal_tokens(native, interface, pair.demonstration,
+                pair.target[:, :, :pair.history_frames], state, language, config, generators["future"],
+                feature_layers=feature_layers, current_time=sample.metadata["current_time"],
+                control_dt=sample.metadata["control_dt"], actions_per_frame=sample.actions.shape[3],
+                demo_times=pair.demonstration_times)
+        else:
+            raise ValueError("stage must be goal or visual")
+        noisy, times, target, mask = _action_noise(sample.actions, sample.actions_mask, generators["action"], device)
+        predicted = goal_action_forward(native, noisy, times, conditions)
+        losses = {"action": masked_action_loss(predicted, target, mask)}
+        losses["total"] = losses["action"]
+        if stage == "visual":
+            if tokens is not None:
+                decoded = interface.decode_goal(tokens)
+                pose = goal_pose_loss(decoded["goal_poses"], sample.goal_poses.to(device), interface.translation_scale,
+                    gripper_prediction=decoded["goal_gripper"], gripper_target=sample.goal_gripper.to(device))
+                for key, value in pose.items():
+                    if key != "total":
+                        losses[f"pose_{key}"] = value
+                losses["total"] = losses["total"] + config["pose_weight"] * pose["total"]
+            # Teacher-forced video/IFP execution owns no cache from the deployment path.
+            _clear_video_cache(native)
+            try:
+                inputs = prepare_icl_inputs(sample.visual, config, native, language, generators["video"], include_actions=False)
+                video = native_icl_loss(native, inputs, config, human=False, video_only=True)
+            finally:
+                _clear_video_cache(native)
+            losses["video"], losses["ifp"] = video["video"], video["ifp"]
+            losses["total"] = losses["total"] + config["video_weight"] * video["total"]
     return losses
 
 
-def _system_state(native, interface, tiny):
-    return {"native": _model_state(native, tiny),
-            "interface": {key: value.detach().cpu() for key, value in interface.state_dict().items()}}
+def _system_state(native, interface, tiny=None):
+    return {name: {key: value.detach().cpu() for key, value in module.state_dict().items()}
+            for name, module in (("native", native), ("interface", interface))}
 
 
-def _restore_system(native, interface, model, tiny):
-    expected = _system_state(native, interface, tiny)
-    if set(model) != set(expected) or any(model[key].keys() != expected[key].keys() for key in expected):
-        raise ValueError("SE(3) artifact must contain the full action/video adapters and goal interface")
-    native.load_state_dict(model["native"], strict=tiny)
-    interface.load_state_dict(model["interface"], strict=True)
+def _restore_system(native, interface, model, tiny=None):
+    if set(model) != {"native", "interface"}:
+        raise ValueError("artifact must contain full native and interface weights")
+    for name, module in (("native", native), ("interface", interface)):
+        expected = module.state_dict()
+        if model[name].keys() != expected.keys() or any(
+                model[name][key].shape != value.shape or model[name][key].dtype != value.dtype
+                for key, value in expected.items()):
+            raise ValueError("complete model keys, shapes and precision must match the independent action topology")
+        module.load_state_dict(model[name], strict=True)
 
 
 def read_goal_artifact(path, kind="se3_goal_training"):
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if (not isinstance(payload, dict) or payload.get("format_version") != 1
-            or payload.get("kind") != kind or payload.get("upstream_commit") != ZERO_WAM_COMMIT):
-        raise ValueError(f"expected a pinned {kind} artifact; raw ICL/demo bottleneck artifacts are different models")
+    if (not isinstance(payload, dict) or payload.get("format_version") != 2
+            or payload.get("kind") != kind or payload.get("architecture") != ARCHITECTURE
+            or payload.get("upstream_commit") != ZERO_WAM_COMMIT or payload.get("precision") != "float32"):
+        raise ValueError("expected a version-2 FP32 full training artifact; deployment and old adapters cannot resume")
     return payload
 
 
+def _optimizer(native, interface, config, stage):
+    action_ids = {id(p) for _, p in action_named_parameters(native)}
+    video = [p for p in native.parameters() if p.requires_grad and id(p) not in action_ids]
+    action = [p for p in native.parameters() if p.requires_grad and id(p) in action_ids]
+    groups = [{"params": action + [p for p in interface.parameters() if p.requires_grad],
+               "lr": config["training"]["learning_rate"], "name": "action_interface"}]
+    if video:
+        groups.append({"params": video, "lr": config["training"]["backbone_learning_rate"], "name": "video"})
+    return torch.optim.AdamW(groups, weight_decay=0.)
+
+
+def _sample_files(path, sample):
+    files = [path, path.parent / sample.metadata["arrays"]]
+    language = path.parent / sample.metadata["language"]
+    files += [language, language.parent / json.loads(language.read_text())["arrays"]]
+    if sample.visual is not None:
+        pair = path.parent / sample.metadata["visual_pair"]
+        files.append(pair)
+        files += [pair.parent / sample.visual.metadata[role]["arrays"] for role in ("demonstration", "target")]
+    return files
+
+
 def train_goal_interface(args):
-    config = load_goal_config(args.config)
-    stage = args.stage
+    config, stage = load_goal_config(args.config), args.stage
     if stage not in STAGES or args.resume and args.initialize:
-        raise ValueError("choose one SE(3) stage and either resume or initialize")
+        raise ValueError("choose a stage and either resume or initialize")
     paths, sources = load_goal_index(args.index)
     if type(args.steps) is not int or args.steps < 1:
-        raise ValueError("steps must be a positive integer")
+        raise ValueError("steps must be positive")
     first = load_goal_sample(paths[0], visual=stage == "visual")
     registry = goal_registry(first)
     _check_sample(first, config, registry)
     previous = read_goal_artifact(args.resume or args.initialize) if args.resume or args.initialize else None
     if stage == "visual" and previous is None:
-        raise ValueError("Stage 2 requires a successfully trained goal/action interface from Stage 1")
+        raise ValueError("Stage 2 requires a successfully trained Stage 1 artifact")
     if args.initialize and (stage != "visual" or previous["stage"] != "goal" or previous["updates"] < 1):
         raise ValueError("initialize is only Stage 1 goal -> Stage 2 visual")
-    if previous and (previous["config"] != config or previous["registry"] != registry or previous["tiny_native"] != args.tiny_native):
-        raise ValueError("stage transition/resume requires identical interface, coordinate/state/action conventions and base mode")
-    identities = {"index": file_sha256(args.index)}
-    for path in paths:
-        identities[str(path)] = file_sha256(path)
-        if stage == "visual":
-            meta = json.loads(path.read_text())
-            pair_path = path.parent / meta["visual_pair"]
-            identities[str(pair_path.resolve())] = file_sha256(pair_path)
+    comparable = lambda c: {key: value for key, value in c.items() if key != "interface_type"}
+    if previous and (comparable(previous["config"]) != comparable(config)
+                     or previous["registry"] != registry or previous["tiny_native"] != args.tiny_native):
+        raise ValueError("stage transition/resume requires matching model, data conventions and training settings")
+    identities = {"index": file_sha256(args.index), **{str(p.resolve()): file_sha256(p) for p in paths}}
     start = previous["attempted_steps"] if args.resume else 0
     if start + args.steps > config["training"]["max_steps"]:
-        raise ValueError("cumulative SE(3) stage budget exceeded")
-    if args.resume and (previous["stage"] != stage or previous["data_identity"] != identities or previous["seed"] != args.seed):
-        raise ValueError("resume requires the same stage, index and seed")
+        raise ValueError("cumulative stage budget exceeded")
+    if args.resume and (previous["stage"] != stage or previous["data_identity"] != identities
+                        or previous["seed"] != args.seed or previous["config"] != config):
+        raise ValueError("resume requires the same stage, interface, index and seed")
     if previous:
         _source_components([*previous["source_records"], *sources])
     visited = dict(previous["visited_arrays"]) if args.resume else {}
-    for name, digest in visited.items():
-        if file_sha256(name) != digest:
-            raise ValueError("consumed SE(3)/video arrays changed before resume")
+    if any(file_sha256(path) != digest for path, digest in visited.items()):
+        raise ValueError("consumed training inputs changed before resume")
     output = Path(args.output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())) and not args.resume:
-        raise ValueError("SE(3) training requires a fresh output directory or explicit resume")
+        raise ValueError("training requires a fresh output directory or explicit resume")
     torch.manual_seed(args.seed)
-    native, interface, null, identity, layers = build_goal_system(config, registry, stage=stage,
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    native, interface, unused, identity, layers = build_goal_system(config, registry, stage=stage,
         checkpoint=args.checkpoint, tiny_native=args.tiny_native, device=args.device)
     if previous:
         if previous["base_identity"] != identity or previous["feature_layers"] != layers:
-            raise ValueError("frozen base/feature layers differ from the learned goal interface")
-        _restore_system(native, interface, previous["model"], args.tiny_native)
-    parameters = [p for module in (native, interface) for p in module.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(parameters, lr=config["training"]["learning_rate"], weight_decay=0.)
+            raise ValueError("initial checkpoint or coupling layers changed")
+        _restore_system(native, interface, previous["model"])
+    optimizer = _optimizer(native, interface, config, stage)
+    parameters = [p for group in optimizer.param_groups for p in group["params"]]
     generators = {name: torch.Generator().manual_seed(args.seed + offset)
                   for offset, name in enumerate(("action", "future", "video"))}
     updates = 0
     if args.resume:
+        if previous["scheduler"] != {"kind": "constant", "state": None} or previous["data_cursor"] != start % len(paths):
+            raise ValueError("scheduler or data cursor differs from this trainer")
         optimizer.load_state_dict(previous["optimizer"])
         updates = previous["updates"]
         for name, generator in generators.items():
             generator.set_state(previous["rng"][name])
         torch.set_rng_state(previous["torch_rng"])
+        random.setstate(previous["python_rng"])
+        n = previous["numpy_rng"]
+        np.random.set_state((n[0], np.asarray(n[1], dtype=np.uint32), n[2], n[3], n[4]))
         if torch.cuda.is_available() and previous["cuda_rng"]:
             torch.cuda.set_rng_state_all(previous["cuda_rng"])
     visual_space = previous.get("visual_feature_space") if args.resume else None
@@ -229,29 +338,25 @@ def train_goal_interface(args):
     write_json(output / "config.json", config)
     if str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
     with (output / "metrics.jsonl").open("a") as log:
         for step in range(start, start + args.steps):
             path = paths[step % len(paths)]
             sample = load_goal_sample(path, visual=stage == "visual")
             _check_sample(sample, config, registry)
-            arrays = [path.parent / sample.metadata["arrays"]]
             if sample.visual is not None:
                 space = sample.visual.metadata["feature_space_id"]
                 if visual_space is not None and visual_space != space:
-                    raise ValueError("visual feature space must remain identical across paired robot samples")
+                    raise ValueError("visual encoder changed across samples")
                 visual_space = space
-                pair_path = path.parent / sample.metadata["visual_pair"]
-                arrays += [pair_path.parent / sample.visual.metadata[role]["arrays"] for role in ("demonstration", "target")]
-            for array in arrays:
-                key = str(array.resolve())
-                if key not in visited:
-                    visited[key] = file_sha256(array)
+            for file in _sample_files(path, sample):
+                visited.setdefault(str(file.resolve()), file_sha256(file))
             optimizer.zero_grad(set_to_none=True)
-            losses = goal_training_loss(native, interface, null, sample, config, generators,
+            losses = goal_training_loss(native, interface, unused, sample, config, generators,
                                         stage=stage, feature_layers=layers)
             if not torch.isfinite(losses["total"]):
-                raise ValueError("nonfinite SE(3) objective; optimizer not updated")
+                raise ValueError("nonfinite objective; optimizer not updated")
             losses["total"].backward()
             norm = torch.nn.utils.clip_grad_norm_(parameters, config["training"]["gradient_clip"], error_if_nonfinite=True)
             optimizer.step()
@@ -259,100 +364,155 @@ def train_goal_interface(args):
             log.write(json.dumps({**{key: float(value.detach()) for key, value in losses.items()},
                 "stage": stage, "step": step, "updated": True, "gradient_norm": float(norm),
                 "goal_source": registry["goal_source"], "goal_input": "true_goal" if stage == "goal" else "generated_future_only",
-                "raw_video_to_action": False}, allow_nan=False) + "\n")
+                "interface_type": config["interface_type"], "raw_video_to_action": stage == "visual" and config["interface_type"] == "direct_features"},
+                allow_nan=False) + "\n")
             log.flush()
     if str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
+    elapsed = time.monotonic() - started
+    numpy_state = np.random.get_state()
     goal_updates = updates if stage == "goal" else previous["goal_stage_updates"]
-    payload = {"format_version": 1, "kind": "se3_goal_training", "upstream_commit": ZERO_WAM_COMMIT,
-        "config": config, "stage": stage, "model": _system_state(native, interface, args.tiny_native),
+    payload = {"format_version": 2, "kind": "se3_goal_training", "architecture": ARCHITECTURE,
+        "precision": "float32", "upstream_commit": ZERO_WAM_COMMIT, "config": config, "stage": stage,
+        "model": _system_state(native, interface), "native_config": {k: v for k, v in dict(native.config).items() if not k.startswith("_")},
         "base_identity": identity, "tiny_native": args.tiny_native, "feature_layers": layers,
         "registry": registry, "visual_feature_space": visual_space, "updates": updates, "goal_stage_updates": goal_updates,
-        "attempted_steps": start + args.steps, "seed": args.seed, "optimizer": optimizer.state_dict(),
+        "attempted_steps": start + args.steps, "data_cursor": (start + args.steps) % len(paths),
+        "seed": args.seed, "optimizer": optimizer.state_dict(), "scheduler": {"kind": "constant", "state": None},
         "rng": {key: gen.get_state() for key, gen in generators.items()}, "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [], "python_rng": random.getstate(),
+        "numpy_rng": [numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]],
         "data_identity": identities, "visited_arrays": visited,
+        "stage1_artifact_sha256": (file_sha256(args.initialize) if args.initialize else previous.get("stage1_artifact_sha256") if previous else None),
         "source_records": previous["source_records"] if args.resume else [*(previous["source_records"] if previous else []), *sources]}
     temp = output / "goal_interface.pt.tmp"
     torch.save(payload, temp)
     temp.replace(output / "goal_interface.pt")
     report = {"artifact": str((output / "goal_interface.pt").resolve()), "stage": stage,
-        "updates": updates, "goal_stage_updates": goal_updates, "elapsed_seconds": time.monotonic() - started,
-        "action_adapters_updated": stage == "goal", "raw_video_to_action": False,
+        "updates": updates, "goal_stage_updates": goal_updates, "elapsed_seconds": elapsed,
+        "trainable_parameters": sum(p.numel() for p in parameters), "precision": "float32", "lora": False,
+        "optimizer_groups": [{"name": g["name"], "lr": g["lr"], "parameters": sum(p.numel() for p in g["params"])} for g in optimizer.param_groups],
+        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated() if str(args.device).startswith("cuda") else None,
+        "interface_type": config["interface_type"], "raw_video_to_action": stage == "visual" and config["interface_type"] == "direct_features",
         "ground_truth_future_for_goal": False, "robot_execution_evaluated": False}
     write_json(output / "run.json", report)
     return report
 
 
 def export_goal_policy(args):
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from safetensors.torch import save_file
+
     payload = read_goal_artifact(args.artifact)
-    if payload["stage"] != "visual" or payload["updates"] < 1 or payload["goal_stage_updates"] < 1:
-        raise ValueError("export requires both trained goal/action and visual-interface stages")
+    if payload["stage"] != "visual" or min(payload["updates"], payload["goal_stage_updates"]) < 1:
+        raise ValueError("export requires both successfully trained stages")
     output = Path(args.output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
-        raise ValueError("SE(3) policy export requires a fresh output directory")
+        raise ValueError("export requires a fresh directory")
+    precision = getattr(args, "dtype", "float32")
+    if precision not in {"float32", "bfloat16"}:
+        raise ValueError("deployment dtype must be float32 or bfloat16")
+    dtype = getattr(torch, precision)
+    state = {f"{module}.{key}": value.to(dtype=dtype) if value.is_floating_point() else value
+             for module, values in payload["model"].items() for key, value in values.items()}
+    split = split_torch_state_dict_into_shards(state, filename_pattern="model{suffix}.safetensors",
+                                              max_shard_size=getattr(args, "max_shard_size", "2GB"))
     output.mkdir(parents=True, exist_ok=True)
-    excluded = {"optimizer", "rng", "torch_rng", "cuda_rng", "visited_arrays", "data_identity"}
+    files, weight_map = {}, {}
+    for filename, keys in split.filename_to_tensors.items():
+        # Cloning this shard breaks upstream state-dict aliases without retaining another full model.
+        save_file({key: state[key].contiguous().clone() for key in keys}, str(output / filename))
+        files[filename] = file_sha256(output / filename)
+        weight_map.update({key: filename for key in keys})
+    excluded = {"model", "optimizer", "scheduler", "rng", "torch_rng", "cuda_rng", "python_rng", "numpy_rng",
+                "visited_arrays", "data_identity", "data_cursor"}
     policy = {key: value for key, value in payload.items() if key not in excluded}
-    policy["kind"] = "se3_goal_policy"
-    torch.save(policy, output / "policy.pt")
-    write_json(output / "policy.json", {"kind": "se3_goal_policy", "format_version": 1,
-        "policy_sha256": file_sha256(output / "policy.pt"), "source_artifact_sha256": file_sha256(args.artifact)})
-    return {"policy": str(output.resolve()), "test_time_updates": False, "raw_video_to_action": False}
+    policy.update(kind="se3_goal_policy", precision=precision, shards=files, weight_map=weight_map,
+                  source_artifact_sha256=file_sha256(args.artifact))
+    write_json(output / "policy.json", policy)
+    return {"policy": str(output.resolve()), "test_time_updates": False,
+            "raw_video_to_action": payload["config"]["interface_type"] == "direct_features", "precision": precision}
 
 
-def load_goal_policy(path, *, checkpoint=None, device="cuda"):
+def load_goal_policy(path, *, device="cuda"):
+    from safetensors.torch import load_file
+
     folder = Path(path)
-    manifest = json.loads((folder / "policy.json").read_text())
-    if (manifest.get("kind") != "se3_goal_policy" or manifest.get("format_version") != 1
-            or file_sha256(folder / "policy.pt") != manifest.get("policy_sha256")):
-        raise ValueError("SE(3) policy manifest/checksum mismatch")
-    payload = read_goal_artifact(folder / "policy.pt", kind="se3_goal_policy")
+    payload = json.loads((folder / "policy.json").read_text())
+    if (payload.get("kind") != "se3_goal_policy" or payload.get("format_version") != 2
+            or payload.get("architecture") != ARCHITECTURE or payload.get("upstream_commit") != ZERO_WAM_COMMIT
+            or payload.get("precision") not in {"float32", "bfloat16"}):
+        raise ValueError("expected a version-2 complete goal policy")
     if payload["stage"] != "visual" or min(payload["updates"], payload["goal_stage_updates"]) < 1:
-        raise ValueError("both interface stages must have successful updates")
-    native, interface, null, identity, layers = build_goal_system(payload["config"], payload["registry"],
-        stage="visual", checkpoint=checkpoint, tiny_native=payload["tiny_native"], device=device)
-    if identity != payload["base_identity"] or layers != payload["feature_layers"]:
-        raise ValueError("policy requires the same immutable native checkpoint and feature layers")
-    _restore_system(native, interface, payload["model"], payload["tiny_native"])
+        raise ValueError("policy requires both successful training stages")
+    validate_goal_config(payload["config"])
+    dtype = getattr(torch, payload["precision"])
+    native = load_native_class()(**payload["native_config"]).to(device=device, dtype=dtype)
+    install_action_interface(native)
+    interface = _interface(native, payload["config"], payload["registry"])
+    state = {}
+    for filename, digest in payload["shards"].items():
+        shard = _local_path(folder, filename, ".safetensors")
+        if file_sha256(shard) != digest:
+            raise ValueError("policy shard checksum mismatch")
+        tensors = load_file(str(shard))
+        if any(key in state or payload["weight_map"].get(key) != filename for key in tensors):
+            raise ValueError("policy shard registry mismatch")
+        state.update(tensors)
+    if state.keys() != payload["weight_map"].keys():
+        raise ValueError("incomplete policy shards")
+    model = {module: {key[len(module) + 1:]: value for key, value in state.items() if key.startswith(module + ".")}
+             for module in ("native", "interface")}
+    if sum(map(len, model.values())) != len(state):
+        raise ValueError("unknown policy module")
+    _restore_system(native, interface, model)
+    if payload["feature_layers"] != list(range(len(native.blocks))):
+        raise ValueError("policy coupling layers differ from model")
     native.eval().requires_grad_(False)
     interface.eval().requires_grad_(False)
-    return native, interface, null, payload
+    return native, interface, None, payload
 
 
 @torch.no_grad()
-def predict_goal_actions(native, interface, null, payload, observation, *, seed=0):
+def predict_goal_actions(native, interface, unused, payload, observation, *, seed=0):
+    del unused
     if not isinstance(observation, GoalObservation):
-        raise ValueError("prediction accepts observed-only GoalObservation, never a supervised training sample")
-    if any(p.requires_grad for module in (native, interface) for p in module.parameters()):
-        raise ValueError("freeze the complete SE(3) policy before inference")
+        raise ValueError("prediction accepts observed-only GoalObservation, not supervised samples")
+    if any(p.requires_grad for m in (native, interface) for p in m.parameters()):
+        raise ValueError("freeze the complete policy before inference")
     registry, config = payload["registry"], payload["config"]
-    for name in registry.keys() - {"goal_source"}:
+    for name in registry.keys() - {"goal_source", "language_identity"}:
         if observation.metadata.get(name) != registry[name]:
-            raise ValueError(f"observed {name} differs from the trained robot interface")
+            raise ValueError(f"observed {name} differs from trained interface")
+    if observation.language_identity != registry["language_identity"]:
+        raise ValueError("language encoder differs from trained interface")
     if observation.metadata["feature_space_id"] != payload["visual_feature_space"]:
-        raise ValueError("observation/demo visual encoder differs from the trained interface")
-    state = observation.state.to(native.action_embedder.weight.device)
-    tokens, future = visual_goal_tokens(native, interface, observation.demonstration, observation.history, state,
-        null, config, torch.Generator().manual_seed(seed + 1), feature_layers=payload["feature_layers"],
-        current_time=observation.metadata["current_time"], control_dt=registry["control_dt"],
-        actions_per_frame=registry["actions_per_frame"], demo_times=observation.demonstration_times)
-    condition = interface.condition(tokens, state)
-    shape = (1, native.config.action_dim, config["chunk_size"], registry["actions_per_frame"], 1)
-    mask = torch.tensor(registry["action_space"]["valid_channels"], dtype=torch.bool)[None, :, None, None, None]
-    actions = goal_action_sample(native, condition, shape, mask, torch.Generator().manual_seed(seed),
-                                 steps=config["action_sampling_steps"])
-    return {"actions": actions, "goal_poses": interface.decode_goal(tokens), "generated_future": future}
+        raise ValueError("visual encoder differs from trained interface")
+    weight = native.action_embedder.weight
+    with autocast_for(native):
+        conditions, tokens, future = visual_goal_tokens(native, interface, observation.demonstration,
+            observation.history, observation.state.to(weight), observation.language.to(weight), config,
+            torch.Generator().manual_seed(seed + 1), feature_layers=payload["feature_layers"],
+            current_time=observation.metadata["current_time"], control_dt=registry["control_dt"],
+            actions_per_frame=registry["actions_per_frame"], demo_times=observation.demonstration_times)
+        shape = (1, native.config.action_dim, config["chunk_size"], registry["actions_per_frame"], 1)
+        mask = torch.tensor(registry["action_space"]["valid_channels"], dtype=torch.bool)[None, :, None, None, None]
+        actions = goal_action_sample(native, conditions, shape, mask, torch.Generator().manual_seed(seed),
+                                     steps=config["action_sampling_steps"])
+        result = {"actions": actions, "generated_future": future}
+        if tokens is not None:
+            result.update(interface.decode_goal(tokens))
+    return result
 
 
 def predict_goal_cli(args):
     output = Path(args.output)
     if output.exists() or output.suffix != ".npz":
-        raise ValueError("SE(3) prediction requires a fresh .npz output path")
-    native, interface, null, payload = load_goal_policy(args.policy, checkpoint=args.checkpoint, device=args.device)
-    observation = load_goal_observation(args.observation)
-    result = predict_goal_actions(native, interface, null, payload, observation, seed=args.seed)
+        raise ValueError("prediction requires a fresh .npz output path")
+    native, interface, unused, payload = load_goal_policy(args.policy, device=args.device)
+    result = predict_goal_actions(native, interface, unused, payload, load_goal_observation(args.observation), seed=args.seed)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **{name: value.float().cpu().numpy() for name, value in result.items()})
     return {"output": str(output.resolve()), "coordinate_frame": payload["registry"]["coordinate_frame"],
-        "goal_source": payload["registry"]["goal_source"], "test_time_updates": False, "commands_sent": 0}
+        "goal_source": payload["registry"]["goal_source"], "test_time_updates": False, "commands_sent": 0,
+        "interface_type": payload["config"]["interface_type"]}

@@ -1,8 +1,36 @@
-# 验证记录
+# Validation record
 
-更新日期：2026-09-21。所有下列结果区分代码/计算图验收与研究实验结果。
+Updated: 2026-09-21. Code/graph checks, trained full-model results, simulation, and robot execution are separate evidence categories.
 
-## SE(3) 视频到动作接口：本轮验收
+## Current full-parameter recurrent goal interface (v2)
+
+The full regression run passed **301 tests, no skips, in 242.681 seconds** using `taskset -c 0 .venv/bin/python -m unittest discover -s tests -q`. CPU affinity avoids the host's cross-core clock issue; native CUDA attention was used. After that run, the strengthened joint goal/action fitting check and the three language-cache checks also passed. The historical **291-test** result below belongs to the previous LoRA/one-shot interface.
+
+The two-example fitting check uses a randomly initialized small native model and fixed noisy action inputs. Stage 1 reached action-flow-target MSEs of **0.00175 / 0.00624** in 20 updates. Stage 2 jointly fitted actions, pose and gripper in 50 updates: action-flow-target MSEs **0.00092 / 0.00508**, predicted x **-0.285 / +0.246** for targets **-0.3 / +0.3**, and predicted gripper **0.0145 / 0.9855** for targets **0 / 1**. Scene, state, language and initial noise were held fixed while the demonstration changed. These are synthetic overfitting checks, not robot execution results.
+
+A separate CLI smoke run retained the **100 × 768 interface and 8 pose tokens**, with one parameter group for the two-block tiny native backbone. It completed one update in each stage, complete multi-shard FP32 and BF16 exports, and fresh-process observed-only predictions. The matched `direct_features` route used the same Stage 1 artifact and also completed training/export/prediction. Outputs were finite, inactive action channels remained zero, and no robot commands were sent. This does not test the full thirty-layer pretrained model or its memory requirements.
+
+Internal source review found and fixed an AMP boundary issue: detached sampling could populate autocast's weight cache, disconnecting later feature replay. Tests now check gradients on recomputed demonstration/history embeddings and K/V directly. Computer Use returned no connected browsers during this task, so no external ChatGPT review is claimed.
+
+The verified v2 checks cover:
+
+- Stage 1 loads no visual arrays or caches and updates complete action parameter groups from explicit pose/gripper, language, and current-state conditions; video weights remain fixed.
+- Stage 2 updates full video/action/interface parameters, sends a distinct recurrent condition to each action layer, and obtains finite nonzero action/goal gradients in freshly recomputed demonstration/history features. Generated future samples remain detached.
+- Main-path action outputs remain unchanged when latent, language, state, and action inputs are fixed but unrelated visual or stale action caches are changed. The `direct_features` control is explicitly exempt from the latent-only visual boundary.
+- Deployment isolation fixes all observed inputs and initial noise before changing supervision. Loss isolation fixes already constructed noisy network inputs before changing targets. These interventions must not be conflated with changing clean labels before noise construction.
+- Fitted Stage 1 examples distinguish endpoint/gripper requirements. Fitted Stage 2 examples hold scene, state, language, and noise fixed while changing only a demonstration's requirements.
+- Same-stage continuation restores full FP32 parameters, optimizer/random state, and data position; stage transition creates a new optimizer. Complete deployment shards load without external base weights and remain frozen. Wrong formats, missing/corrupt shards, or incompatible conventions are rejected.
+- Goal-data v2 requires absolute pose/tool conventions, normalized gripper bounds/source, endpoint cadence, and explicit validated language. The frozen language-cache command uses local native preprocessing and cannot silently download components or insert null text. Its local unit test injects a small encoder; it does not validate inference with released UMT5 weights.
+
+The matched full-fine-tuning control must share the exact Stage 1 artifact and Stage 2 data/budget/generation conditions; it changes `interface_type` to `direct_features`, omits recurrent processing and goal loss, and reports actual compute. This is a joint interface-plus-supervision comparison, not a pose-only ablation.
+
+Real robot data are not yet available. No complete pretrained-weight training, distributed or full-model memory validation, cross-view gain, simulation score, or robot success is claimed by this implementation. A Computer Use connection attempt returned no available apps or browsers; no external ChatGPT review was obtained from that attempt. External review is separate from technical acceptance. Method and commands: [se3_interface.md](se3_interface.md).
+
+## Historical records
+
+The following records are preserved in their original language. Counts, timings, stage freezes, artifact formats, and successful commands apply only to their named earlier implementation. They are not inherited as v2 results.
+
+## Historical SE(3) v1 interface — before the full-parameter v2 change
 
 - 完整回归 **291项通过，无跳过，81.739秒**。运行固定CPU亲和性以避开宿主机跨核时钟问题；原生GPU注意力没有被替换。
 - 第一阶段仅目标位姿、当前状态与动作监督：测试禁止任何图像加载、视频embedding或视频主干调用，目标编码／接入层与动作侧LoRA仍有非零梯度和更新，视频权重不变。
@@ -15,7 +43,7 @@
 
 这些是合成数据与随机小模型的代码／计算图验收，不是LIT复现、真实SE(3)控制成功率或人机迁移结果。正式机器人目标数据尚未提供；方法、数据契约和两阶段入口见 [se3_interface.md](se3_interface.md)。
 
-## 时序示范瓶颈：本轮验收
+## Historical temporal demonstration bottleneck
 
 - 完整回归 **260项通过，无跳过，49.819秒**；保留H1无瓶颈基线，H2增加时序压缩，H3仅增加外观一致性权重。
 - 压缩发生在冻结的原生patch embedding之后：内容、真实时间和二维位置先联合编码，每时间组使用共享learned queries，再经小型Transformer及接入层。针对性小样本拟合可区分相同首尾、不同中间顺序与位置交换；同步重排存储位置、尾组padding与梯度检查通过。

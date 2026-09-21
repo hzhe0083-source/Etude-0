@@ -10,21 +10,27 @@ import torch
 
 from evo_wam.goal_data import load_goal_index, load_goal_observation, load_goal_sample
 from test_icl_data import LATENT_NORMALIZATION, write_sample
+from test_goal_language import write_goal_language
 
 
 def write_goal_sample(root, name="goal", *, visual=False):
     """Synthetic measured/controller labels are explicit, never derived from actions."""
     metadata = {
-        "format_version": 1, "kind": "se3_goal_sample", "sample_id": name, "arrays": f"{name}.npz",
+        "format_version": 2, "kind": "se3_goal_sample", "sample_id": name, "arrays": f"{name}.npz",
         "robot_source": {"source_id": f"{name}-robot", "source_group": f"{name}-robot",
                          "domain": "robot", "trajectory_id": f"{name}-trajectory"},
         "action_space": {"representation": "zero-wam-normalized", "normalization_id": "fixture",
                          "dimension": 2, "valid_channels": [True, False]},
         "state_space_id": "fixture-joint-state", "coordinate_frame": "robot_base", "pose_units": "m",
         "goal_source": "measured_endpoint", "end_effectors": ["gripper"],
+        "pose_representation": "absolute_robot_base_tool", "tool_frames": ["gripper_tool"],
+        "gripper_space": {"normalization_id": "fixture-gripper-width", "closed": [0.], "open": [.08], "units": "m"},
+        "language": f"{name}-language.json",
         "current_time": 0.3, "goal_time": 0.9, "control_dt": 0.1,
     }
+    write_goal_language(root, f"{name}-language")
     arrays = {"state": np.arange(4, dtype=np.float32), "goal_poses": np.eye(4, dtype=np.float32)[None],
+              "goal_gripper": np.array([.5], dtype=np.float32),
               "actions": np.ones((2, 2, 3, 1), dtype=np.float32),
               "actions_mask": np.ones((2, 2, 3, 1), dtype=np.bool_)}
     if visual:
@@ -40,7 +46,7 @@ def write_goal_sample(root, name="goal", *, visual=False):
 
 def write_goal_observation(root, name="observation"):
     metadata = {
-        "format_version": 1, "kind": "se3_goal_observation", "arrays": f"{name}.npz",
+        "format_version": 2, "kind": "se3_goal_observation", "arrays": f"{name}.npz",
         "demonstration": {"arrays": f"{name}-demo.npz", "source_id": f"{name}-demo",
                           "source_group": f"{name}-demo", "domain": "human"},
         "feature_space_id": "fixture-wan-v1", "latent_normalization": LATENT_NORMALIZATION,
@@ -48,7 +54,11 @@ def write_goal_observation(root, name="observation"):
                          "dimension": 2, "valid_channels": [True, False]},
         "state_space_id": "fixture-joint-state", "coordinate_frame": "robot_base", "pose_units": "m",
         "end_effectors": ["gripper"], "current_time": 0.3, "control_dt": 0.1, "actions_per_frame": 3,
+        "pose_representation": "absolute_robot_base_tool", "tool_frames": ["gripper_tool"],
+        "gripper_space": {"normalization_id": "fixture-gripper-width", "closed": [0.], "open": [.08], "units": "m"},
+        "language": f"{name}-language.json",
     }
+    write_goal_language(root, f"{name}-language")
     arrays = {"state": np.arange(4, dtype=np.float32),
               "history_latent": np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2),
               "history_times": np.array([0., 0.3], dtype=np.float64)}
@@ -73,7 +83,7 @@ class GoalDataTest(unittest.TestCase):
 
     def write_index(self, samples, **extra):
         path = self.root / "index.json"
-        path.write_text(json.dumps({"format_version": 1, "kind": "se3_goal_index", "samples": samples, **extra}))
+        path.write_text(json.dumps({"format_version": 2, "kind": "se3_goal_index", "samples": samples, **extra}))
         return path
 
     def test_stage1_reads_only_goal_arrays_and_keeps_goal_semantics_explicit(self):
@@ -86,11 +96,14 @@ class GoalDataTest(unittest.TestCase):
             with patch("evo_wam.goal_data.load_icl_sample", side_effect=AssertionError("Stage 1 must not load videos")), \
                     patch("numpy.load", wraps=original_load) as loads:
                 sample = load_goal_sample(path)
-            self.assertEqual(loads.call_count, 1)
-            self.assertEqual(loads.call_args.args[0], self.root / "goal.npz")
+            self.assertEqual(loads.call_count, 2)
+            self.assertEqual([call.args[0] for call in loads.call_args_list],
+                             [self.root / "goal.npz", self.root / "goal-language.npz"])
             self.assertEqual(sample.metadata["goal_source"], source)
             self.assertEqual(sample.state.shape, (1, 4))
             self.assertEqual(sample.goal_poses.shape, (1, 1, 4, 4))
+            self.assertEqual(sample.goal_gripper.shape, (1, 1))
+            self.assertEqual(sample.language.shape, (1, 3, 8))
             self.assertEqual(sample.actions.shape, (1, 2, 2, 3, 1))
             self.assertIsNone(sample.visual)
             torch.testing.assert_close(sample.goal_poses[0], torch.from_numpy(arrays["goal_poses"]))
@@ -108,6 +121,12 @@ class GoalDataTest(unittest.TestCase):
                    {"control_dt": True}, {"goal_time": float("nan")}, {"current_time": float("inf")},
                    {"visual_pair": "../outside.json"}, {"arrays": str(self.root / "absolute.npz")},
                    {"provenance": "text"}, {"human_poses": "invented"}]
+        invalid += [{"format_version": 1}, {"pose_representation": "relative"},
+                    {"tool_frames": []}, {"tool_frames": [""]}, {"language": "../outside.json"},
+                    {"gripper_space": {**metadata["gripper_space"], "closed": [.08]}},
+                    {"gripper_space": {**metadata["gripper_space"], "open": [float("nan")]}},
+                    {"gripper_space": {**metadata["gripper_space"], "closed": [False]}},
+                    {"gripper_space": {**metadata["gripper_space"], "units": ""}}]
         for changed in invalid:
             path.write_text(json.dumps({**metadata, **changed}))
             with self.subTest(changed=changed), self.assertRaises(ValueError):
@@ -161,6 +180,9 @@ class GoalDataTest(unittest.TestCase):
                    {"actions_mask": arrays["actions_mask"].astype(np.int64)},
                    {"actions_mask": np.ones((2, 2, 2, 1), dtype=np.bool_)},
                    {"unknown_label": np.ones(1)}]
+        changes += [{"goal_gripper": np.array([value], dtype=np.float32)} for value in (-.1, 1.1, np.nan)]
+        changes += [{"goal_gripper": np.array([1], dtype=np.int64)},
+                    {"goal_gripper": np.zeros((1, 1), dtype=np.float32)}]
         for changed in changes:
             self.save(path, metadata, {**arrays, **changed})
             with self.subTest(changed=list(changed)), self.assertRaises(ValueError):
@@ -299,6 +321,16 @@ class GoalDataTest(unittest.TestCase):
             with self.subTest(entries=entries), self.assertRaises(ValueError):
                 load_goal_index(index)
 
+    def test_index_rejects_mixed_measured_and_controller_targets(self):
+        train, _, _ = write_goal_sample(self.root, "train")
+        other, metadata, _ = write_goal_sample(self.root, "other")
+        metadata["goal_source"] = "controller_target"
+        other.write_text(json.dumps(metadata))
+        index = self.write_index([{"manifest": train.name, "split": "train"},
+                                  {"manifest": other.name, "split": "train"}])
+        with self.assertRaisesRegex(ValueError, "must not mix"):
+            load_goal_index(index)
+
 
 class GoalObservationTest(unittest.TestCase):
     def setUp(self):
@@ -315,6 +347,7 @@ class GoalObservationTest(unittest.TestCase):
         self.assertEqual(sample.state.shape, (1, 4))
         self.assertEqual(sample.history.shape, (1, 2, 2, 2, 2))
         self.assertEqual(sample.demonstration.shape, (1, 2, 3, 2, 2))
+        self.assertEqual(sample.language.shape, (1, 3, 8))
         torch.testing.assert_close(sample.state[0], torch.from_numpy(arrays["state"]))
         torch.testing.assert_close(sample.history[0], torch.from_numpy(arrays["history_latent"]))
         torch.testing.assert_close(sample.history_times, torch.from_numpy(arrays["history_times"]))
@@ -325,7 +358,7 @@ class GoalObservationTest(unittest.TestCase):
 
     def test_rejects_supervision_in_metadata_history_archive_or_demo_archive(self):
         path, metadata, arrays, demo = write_goal_observation(self.root)
-        for name in ("goal_poses", "future_latent", "actions", "actions_mask", "goal_time", "goal_source", "target"):
+        for name in ("goal_poses", "goal_gripper", "future_latent", "actions", "actions_mask", "goal_time", "goal_source", "target"):
             path.write_text(json.dumps({**metadata, name: "not-an-inference-input"}))
             with self.subTest(location="metadata", name=name), self.assertRaisesRegex(ValueError, "without supervision"):
                 load_goal_observation(path)

@@ -42,5 +42,5 @@
   "action_sampling_steps": 4,
   "pose_weight": 1.0,
   "video_weight": 1.0,
-  "interface_type": "latent"
+  "interface_type": "direct_features"
 }

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from .goal_language import load_goal_language
 from .icl_data import (LATENT_NORMALIZATION, NativeICLSample, _IDENTITY_FIELDS, _arrays as _icl_arrays,
                        _identity, _metadata as _icl_metadata, load_icl_sample)
 from .video_data import SPLITS, _local_path, _masked_values, _source_components, _text
@@ -22,6 +23,9 @@ class GoalSample:
     metadata: Mapping
     state: Tensor                  # [1,S], current measured robot state
     goal_poses: Tensor             # [1,E,4,4], explicit goal-frame transforms
+    goal_gripper: Tensor           # [1,E], declared closed=0/open=1 scale
+    language: Tensor               # [1,L,D], frozen independent text features
+    language_identity: Mapping
     actions: Tensor                # [1,A,F,N,1], one future action block only
     actions_mask: Tensor
     visual: NativeICLSample | None = None
@@ -35,6 +39,8 @@ class GoalObservation:
     history_times: Tensor          # [F], seconds
     demonstration: Tensor          # [1,C,Fd,Hd,Wd], complete context video
     demonstration_times: Tensor    # [Fd], seconds
+    language: Tensor               # [1,L,D], frozen independent text features
+    language_identity: Mapping
 
 
 def _interface_metadata(metadata: Mapping) -> None:
@@ -51,6 +57,24 @@ def _interface_metadata(metadata: Mapping) -> None:
             or any(not isinstance(name, str) or not name.strip() for name in effectors)
             or len(set(effectors)) != len(effectors)):
         raise ValueError("end_effectors must be an ordered nonempty list of unique nonempty names")
+    if metadata["pose_representation"] != "absolute_robot_base_tool":
+        raise ValueError("pose_representation must be absolute_robot_base_tool")
+    tools = metadata["tool_frames"]
+    if (not isinstance(tools, list) or len(tools) != len(effectors)
+            or any(not isinstance(name, str) or not name.strip() for name in tools)
+            or len(set(tools)) != len(tools)):
+        raise ValueError("tool_frames must name one unique tool frame per ordered end effector")
+    gripper = metadata["gripper_space"]
+    if not isinstance(gripper, dict) or set(gripper) != {"normalization_id", "closed", "open", "units"}:
+        raise ValueError("gripper_space must declare normalization_id, closed, open and units")
+    for name in ("normalization_id", "units"):
+        _text(gripper, name)
+    for name in ("closed", "open"):
+        if (not isinstance(gripper[name], list) or len(gripper[name]) != len(effectors)
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in gripper[name])):
+            raise ValueError("gripper_space closed/open must contain one finite physical value per end effector")
+    if any(closed == opened for closed, opened in zip(gripper["closed"], gripper["open"])):
+        raise ValueError("gripper_space closed and open values must differ for every end effector")
     for name in ("current_time", "control_dt"):
         if type(metadata[name]) not in (int, float) or not math.isfinite(metadata[name]):
             raise ValueError(f"{name} must be a finite number in seconds")
@@ -70,16 +94,18 @@ def _metadata(path: Path) -> dict:
     metadata = json.loads(path.read_text(encoding="utf-8"))
     required = {"format_version", "kind", "sample_id", "arrays", "robot_source", "action_space",
                 "state_space_id", "coordinate_frame", "pose_units", "goal_source", "end_effectors",
-                "current_time", "goal_time", "control_dt"}
+                "current_time", "goal_time", "control_dt", "pose_representation", "tool_frames",
+                "gripper_space", "language"}
     if (not isinstance(metadata, dict) or required - set(metadata)
             or set(metadata) - required - {"visual_pair", "provenance"}
-            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 1
+            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 2
             or metadata.get("kind") != "se3_goal_sample"):
-        raise ValueError("expected an explicit version-1 se3_goal_sample schema")
+        raise ValueError("expected an explicit version-2 se3_goal_sample schema")
     _interface_metadata(metadata)
     for name in ("sample_id", "arrays"):
         _text(metadata, name)
     _local_path(path.parent, metadata["arrays"], ".npz")
+    _local_path(path.parent, _text(metadata, "language"), ".json")
     source = metadata["robot_source"]
     _identity(source)
     if set(source) != _IDENTITY_FIELDS or source["domain"] != "robot":
@@ -115,16 +141,20 @@ def load_goal_sample(manifest_path: str | Path, *, visual: bool = False) -> Goal
 
     path = Path(manifest_path)
     metadata = _metadata(path)
-    expected = {"state", "goal_poses", "actions", "actions_mask"}
+    expected = {"state", "goal_poses", "goal_gripper", "actions", "actions_mask"}
     with np.load(_local_path(path.parent, metadata["arrays"], ".npz"), allow_pickle=False) as archive:
         if len(archive.files) != len(expected) or set(archive.files) != expected:
-            raise ValueError("goal block NPZ needs exactly state, goal_poses, actions and actions_mask")
+            raise ValueError("goal block NPZ needs exactly state, goal_poses, goal_gripper, actions and actions_mask")
         arrays = {name: torch.from_numpy(archive[name].copy()) for name in expected}
     state, poses, actions, mask = (arrays[name] for name in ("state", "goal_poses", "actions", "actions_mask"))
     _validate_state(state)
     if poses.shape != (len(metadata["end_effectors"]), 4, 4):
         raise ValueError("goal_poses must be [E,4,4] in the declared end_effectors order")
     validate_se3(poses)
+    gripper = arrays["goal_gripper"]
+    if (gripper.shape != (len(metadata["end_effectors"]),) or not gripper.is_floating_point()
+            or not torch.isfinite(gripper).all() or ((gripper < 0) | (gripper > 1)).any()):
+        raise ValueError("goal_gripper must be finite floating [E] normalized to [0,1] with closed=0 and open=1")
     if actions.ndim != 4 or min(actions.shape) < 1 or actions.shape[-1] != 1:
         raise ValueError("goal actions must be nonempty [A,F,N,1] for one future block")
     space = action_space(metadata, actions.shape[0])
@@ -156,7 +186,9 @@ def load_goal_sample(manifest_path: str | Path, *, visual: bool = False) -> Goal
         future_times = metadata["current_time"] + torch.arange(1, actions.shape[1] + 1, dtype=torch.float64) * actions.shape[2] * metadata["control_dt"]
         if not torch.allclose(pair.target_times[history:].double(), future_times, atol=1e-6, rtol=0):
             raise ValueError("visual target future times must follow the action block cadence N*control_dt")
-    return GoalSample(metadata, state.unsqueeze(0), poses.unsqueeze(0), actions.unsqueeze(0), mask.unsqueeze(0), pair)
+    language, language_identity = load_goal_language(_local_path(path.parent, metadata["language"], ".json"))
+    return GoalSample(metadata, state.unsqueeze(0), poses.unsqueeze(0), gripper.unsqueeze(0),
+                      language, language_identity, actions.unsqueeze(0), mask.unsqueeze(0), pair)
 
 
 def load_goal_observation(manifest_path: str | Path) -> GoalObservation:
@@ -165,11 +197,12 @@ def load_goal_observation(manifest_path: str | Path) -> GoalObservation:
     metadata = json.loads(path.read_text(encoding="utf-8"))
     required = {"format_version", "kind", "arrays", "demonstration", "feature_space_id", "latent_normalization",
                 "action_space", "current_time", "control_dt", "actions_per_frame", "state_space_id",
-                "coordinate_frame", "pose_units", "end_effectors"}
+                "coordinate_frame", "pose_units", "end_effectors", "pose_representation", "tool_frames",
+                "gripper_space", "language"}
     if (not isinstance(metadata, dict) or required - set(metadata) or set(metadata) - required - {"provenance"}
-            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 1
+            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 2
             or metadata.get("kind") != "se3_goal_observation"):
-        raise ValueError("expected an explicit version-1 se3_goal_observation schema without supervision fields")
+        raise ValueError("expected an explicit version-2 se3_goal_observation schema without supervision fields")
     _interface_metadata(metadata)
     _text(metadata, "feature_space_id")
     if metadata["latent_normalization"] != LATENT_NORMALIZATION:
@@ -199,8 +232,9 @@ def load_goal_observation(manifest_path: str | Path) -> GoalObservation:
     demo = _icl_arrays(path, record, robot_target=False)
     if demo["latent"].shape[0] != history.shape[0]:
         raise ValueError("demonstration and history must share the same latent channel dimension")
+    language, language_identity = load_goal_language(_local_path(path.parent, _text(metadata, "language"), ".json"))
     return GoalObservation(metadata, state.unsqueeze(0), history.unsqueeze(0), times,
-                           demo["latent"].unsqueeze(0), demo["frame_times"])
+                           demo["latent"].unsqueeze(0), demo["frame_times"], language, language_identity)
 
 
 def load_goal_index(index_path: str | Path, split: str = "train") -> tuple[list[Path], list[dict]]:
@@ -210,19 +244,23 @@ def load_goal_index(index_path: str | Path, split: str = "train") -> tuple[list[
     path = Path(index_path)
     document = json.loads(path.read_text(encoding="utf-8"))
     if (not isinstance(document, dict) or type(document.get("format_version")) is not int
-            or document["format_version"] != 1 or document.get("kind") != "se3_goal_index"
+            or document["format_version"] != 2 or document.get("kind") != "se3_goal_index"
             or set(document) - {"format_version", "kind", "samples", "source_aliases", "bridge_sources"}):
-        raise ValueError("expected a version-1 se3_goal_index")
+        raise ValueError("expected a version-2 se3_goal_index")
     entries, aliases, bridges = (document.get("samples"), document.get("source_aliases", []),
                                   document.get("bridge_sources", []))
     if not isinstance(entries, list) or not entries or not isinstance(aliases, list) or not isinstance(bridges, list):
         raise ValueError("goal index needs nonempty samples and optional source_aliases/bridge_sources lists")
     selected, records, sample_ids = [], [], set()
+    goal_source = None
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != {"manifest", "split"} or entry["split"] not in SPLITS:
             raise ValueError("goal index samples require exactly manifest and a valid split")
         manifest = _local_path(path.parent, entry["manifest"], ".json")
         metadata = _metadata(manifest)
+        if goal_source is not None and metadata["goal_source"] != goal_source:
+            raise ValueError("goal index must not mix measured_endpoint and controller_target labels")
+        goal_source = metadata["goal_source"]
         if metadata["sample_id"] in sample_ids:
             raise ValueError("sample_id must be unique across the goal index")
         sample_ids.add(metadata["sample_id"])

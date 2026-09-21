@@ -21,7 +21,7 @@ def load_icl_config(path):
     return validate_icl_config(config)
 
 
-def validate_icl_config(config):
+def validate_icl_config(config, *, adaptation=True):
     """Shared validation for callers which already loaded a native configuration."""
     if config.get("schema_version") != 1 or config.get("kind") != "native_icl_experiment":
         raise ValueError("expected a native_icl_experiment configuration")
@@ -32,12 +32,17 @@ def validate_icl_config(config):
         raise ValueError("domain_schedule must contain human/robot slots")
     if config["human_context"] not in {"none", "cross_video"}:
         raise ValueError("human_context must be none or cross_video")
-    for value in (config["lambda_human"], config["video_snr_shift"], config["mcp_snr_shift"],
-                  config["lora"]["alpha"], config["training"]["learning_rate"], config["training"]["gradient_clip"]):
+    scalars = [config["lambda_human"], config["video_snr_shift"], config["mcp_snr_shift"],
+               config["training"]["learning_rate"], config["training"]["gradient_clip"]]
+    sizes = [config["chunk_size"], config["max_frame_chunk_size"],
+             config["training"]["max_steps"], config["ifp"]["future_chunk_stride"]]
+    if adaptation:
+        scalars.append(config["lora"]["alpha"])
+        sizes.append(config["lora"]["rank"])
+    for value in scalars:
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError("loss, scheduler and optimizer settings must be positive and finite")
-    for value in (config["chunk_size"], config["max_frame_chunk_size"], config["lora"]["rank"],
-                  config["training"]["max_steps"], config["ifp"]["future_chunk_stride"]):
+    for value in sizes:
         if type(value) is not int or value < 1:
             raise ValueError("chunk, rank, step and stride settings must be positive integers")
     if config["chunk_size"] > config["max_frame_chunk_size"]:
@@ -68,8 +73,9 @@ def validate_icl_config(config):
     return config
 
 
-def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda"):
+def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda", adaptation=True, dtype=None):
     cls = load_native_class()
+    dtype = dtype or (torch.bfloat16 if str(device).startswith("cuda") else torch.float32)
     if tiny_native:
         native_config = dict(patch_size=(1, 1, 1), num_attention_heads=2, attention_head_dim=18,
             in_channels=4, out_channels=4, action_dim=3, text_dim=8, freq_dim=4, ffn_dim=16,
@@ -77,7 +83,7 @@ def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda"
             attn_window=config["window_size"], enable_mcp=True,
             num_mcp_modules=len(config["ifp"]["loss_weights"]), mcp_blocks_per_group=1,
             mcp_hidden_collect_layers=(0, 1))
-        native = cls(**native_config).to(device=device, dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32)
+        native = cls(**native_config).to(device=device, dtype=dtype)
         null = torch.zeros(1, 2, 8, device=device)
         # Diffusers' private default-field list has process-dependent ordering.
         # Identity uses the explicit constructor settings and pinned source.
@@ -93,13 +99,14 @@ def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda"
         identity = {"kind": "released-safetensors", "sha256": {p.name: file_sha256(p)
             for p in [folder / "config.json", *weights, *sorted(folder.glob("*.safetensors.index.json"))]}}
         native = cls.from_pretrained(str(folder), local_files_only=True, use_safetensors=True,
-                                    torch_dtype=torch.bfloat16 if str(device).startswith("cuda") else torch.float32).to(device)
+                                    torch_dtype=dtype).to(device)
         null = torch.load(DEFAULT_SOURCE / "wan_va/assets/empty_text_emb.pt", weights_only=True, map_location=device)[None]
     if config["ifp"]["enabled"] and (not native.enable_mcp or len(native.mcp_blocks) != len(config["ifp"]["loss_weights"])):
         raise ValueError("IFP weights must match the native checkpoint's MCP groups")
     if null.ndim != 3 or null.shape[-1] != native.config.text_dim or not torch.isfinite(null).all():
         raise ValueError("native empty-text embedding does not match the checkpoint")
-    install_icl_lora(native, **config["lora"])
+    if adaptation:
+        install_icl_lora(native, **config["lora"])
     if "demo_bottleneck" in config:
         from .demo_context import install_demo_interface
         install_demo_interface(native, {key: value for key, value in config["demo_bottleneck"].items()
@@ -206,6 +213,13 @@ def native_icl_loss(native, inputs, config, *, human, video_only=False):
         output = native(inputs, train_mode=True)
         video, action = output[:2]
         future = output[2] if len(output) == 3 else []
+
+    return native_icl_objective(native, inputs, config, video, action, future,
+                                human=human, video_only=video_only)
+
+
+def native_icl_objective(native, inputs, config, video, action, future, *, human, video_only=False):
+    """Compute losses from fixed predictions; never construct noise or run a model."""
 
     def mse(prediction, stream, patch_size, *, valid_mean=True):
         prediction = unpack_velocity(prediction, stream["targets"].shape, patch_size).float()

@@ -1,95 +1,122 @@
-# SE(3)-supervised video-to-action interface
+# Full-parameter, goal-supervised video-to-action interface
 
-This experiment trains a continuous interface between Zero-WAM's predicted robot future and its Action Expert. A compatible human or robot demonstration is interpreted in the **target robot's scene**. Supervision comes from that robot's next action block and its endpoint pose; human videos need no pose or action labels.
+This experiment adapts Zero-WAM to interpret a compatible demonstration in the **target robot's current scene**. It uses a LIT-style soft latent interface, explicit language, and the target robot's endpoint pose, gripper state, and action labels. It is a modified experiment initialized from pretrained Zero-WAM, not an exact LIT reproduction or evidence of cross-view transfer.
 
-The interface tokens `z` are learned features. They are neither SE(3) coordinates nor a complete action block. A pose decoder provides auxiliary supervision and diagnostic outputs; the Action Expert receives `z` and the observed robot state, never the decoded pose.
+Each query represents exactly the **next action block**, with one group of recurrent interface tokens. The native execution path currently requires batch size 1. This route does not add subgoal segmentation, completion detection, additional action history, or the archived B/P, G/Q, F, and temporal demonstration compressors.
 
 ```text
-Stage 1: robot endpoint pose -> Goal Encoder -> goal tokens
-                                                    + observed robot state
-                                                    -> adapter -> Action Expert -> action block
+Stage 1 — no visual inputs:
+true endpoint pose + gripper -> Goal Encoder -> 100 goal tokens
+independent language + current robot state -------------------+
+                                                             v
+                                            full Action Expert -> action block
 
-Stage 2 and deployment:
-reference video + observed robot history -> Zero-WAM -> generated robot future features
-                                                    + observed robot state
-                                                    -> visual goal readout -> z
-                                                        |                  |
-                                                        v                  v
-                                                   Pose Decoder      adapter + state
-                                                        |                  |
-                                                   endpoint pose     Action Expert
-                                                                           |
-                                                                      action block
+Stage 2 — true endpoint is supervision only:
+demonstration + observed robot history + language
+                      |
+             generate future without gradients
+                      |
+          detach future; recompute context with gradients
+                      |
+          video layer 1 -> update Z1 -> action layer 1
+          video layer 2 -> update Z2 -> action layer 2
+                      ...
+          video layer L -> update ZL -> action layer L -> action block
+                                  |
+                        first 8 tokens -> endpoint pose + gripper
 ```
 
-This is a modified two-stage experiment initialized from Zero-WAM, not a reproduction of LIT or evidence of cross-view transfer. The independent [H1/H2/H3 ICL experiments](human_icl.md), including temporal demonstration compression, remain available as comparisons. The SE(3) route does not stack that compressor, B/P, G/Q, or F ranking onto this interface.
+## Stages, parameters, and losses
 
-## Two stages and trainable parameters
-
-| Stage | Inputs to the goal/action path | Trainable | Frozen |
+| Stage | Action conditions | Updated parameters | Frozen or unused |
 | --- | --- | --- | --- |
-| `goal` | Robot endpoint pose, observed state, noisy action block | Goal Encoder, state encoder, condition adapter, Action Expert attention LoRA | Base checkpoint and video LoRA; unused visual readout and pose decoder |
-| `visual` | Reference video, observed robot history/state, noisy action block | Video/context attention LoRA, visual goal readout, Pose Decoder | Stage 1 Goal Encoder, state encoder, condition adapter, Action Expert including its learned LoRA, base checkpoint |
+| `goal` | True goal tokens, independent language features, measured current state | Complete Action Expert, Goal Encoder, state encoder, action-side language and condition projections | Video backbone; unused recurrent visual interface and goal decoder |
+| `visual`, `interface_type: "latent"` | The corresponding layer's recurrent latent, independent language features, measured current state | Complete video backbone and Action Expert, recurrent interface, state/condition projections, goal decoder | Stage 1 Goal Encoder is unused |
 
-Stage 1 loads Zero-WAM action weights and adapts selected action-attention projections. It does not train an Action Expert from scratch. Video arrays are not read for this stage; if a visual pair is listed, its metadata can still be inspected for source/split auditing.
+The external text encoder and visual VAE remain frozen; their cached outputs are inputs. **No LoRA is installed in this route.** Stage 1 loads the pretrained action weights and performs nonvisual adaptation; it does not randomly reinitialize the expert, and input isolation does not prove that previous visual biases have disappeared. Stage 2 continues to update the action expert.
 
-Stage 2 must initialize from a successfully updated Stage 1 artifact, or resume its own Stage 2 artifact. Both stages must use the same interface dimensions, base checkpoint, robot state/action conventions, pose frame and source type. Freezing Stage 1 parameters preserves the learned goal-to-action interface while action-loss gradients still reach the visual readout through the frozen Action Expert.
+Training keeps model parameters, gradients, and AdamW state in **FP32**, using BF16 autocast on CUDA for forward computation. CPU checks use FP32. Backward executes outside autocast. Defaults are `training.learning_rate: 1e-4` for action/interface parameters and `training.backbone_learning_rate: 1e-5` for Stage 2 video parameters, with constant learning rates and no scheduler. Stage 2 constructs a new optimizer rather than reusing Stage 1 optimizer groups.
 
-Stage 1 minimizes masked action flow-matching loss. Stage 2 minimizes:
+Stage 1 minimizes masked native action flow-matching loss. The main Stage 2 objective is:
 
 ```text
-action loss
-  + pose_weight * (normalized translation MSE + squared rotation-matrix distance)
-  + video_weight * (native video prediction loss + configured IFP loss)
+L_action
+  + pose_weight * (L_translation + L_rotation + L_gripper)
+  + video_weight * (L_video + configured L_IFP)
 ```
 
-Translation is divided by the positive `translation_scale`, expressed in meters. Rotation uses a squared chordal distance on rotation matrices, not Euler-angle MSE. The decoder constructs valid rotations from a continuous 6D representation. `pose_weight` is a reconstruction weight; it is not a token-energy, KL, or information-rate penalty.
+`L_translation` is MSE after dividing positions by the positive `translation_scale` in meters. `L_rotation` is squared rotation-matrix distance; the decoder constructs valid rotations from a 6D representation. `L_gripper` is MSE in the declared `[0,1]` gripper scale. Logs separate these losses and report mean position distance in meters, angular error in degrees, and gripper absolute error. Default outer weights remain `pose_weight: 1.0` and `video_weight: 1.0`; these losses are not LIT's quantile-normalized vector loss, and its reported `0.3` coefficient is not copied here.
 
-The default interface has 64 tokens of width 768, plus a separate encoded state token before projection into the native action cross-attention width. The visual readout combines collected per-layer future features with patch coordinates and elapsed time before attention pooling, using state-conditioned queries. These dimensions are experimental choices, not measured optimal capacities.
+## Recurrent soft interface and visual boundary
 
-## Preventing a true-future or raw-video shortcut
+The default interface uses **100 tokens of width 768**, 8 attention heads, and 6 groups of shared parameters. Each group serves a contiguous portion of the native layers; the 30-layer model assigns five layers per group. The number of layers must be divisible by the configured number of groups. Small native tests explicitly reduce these settings.
 
-The goal/action path generates the next robot video block from the reference and observed history only. Native denoising runs without gradients; the resulting latent is detached. A final clean read of this **generated** block, with the observed context replayed, retains gradients during Stage 2. Features from the checkpoint's MCP collection layers are concatenated for the visual goal readout. This trains the feature computation; gradients do not backpropagate through the sampling trajectory.
+The Goal Encoder maps normalized position, 6D rotation, and gripper values to `[B,100,768]`. At Stage 1, the same goal condition is available to every action layer. Stage 2 begins with learned queries and updates them at **every native coupling layer**, in order: self-attention, language/state cross-attention, then visual cross-attention. Visual content combines the actual patch grid coordinates and relative frame times before aggregation. Every action layer receives its own updated condition.
 
-The true robot future is used only by the separate native video/IFP supervision branch. Its teacher-forced inputs are not passed into the goal readout or action conditioning. That branch calls the video-only objective and does not invoke the original raw-video-conditioned action branch.
+Only the first 8 final-layer tokens are directly read by the goal decoder. All 100 condition action generation, and all can indirectly receive goal-loss gradients through self-attention. This is a **goal-supervised soft latent interface**: tokens are not explicit SE(3) coordinates, and successful reconstruction does not prove that background information has been removed. Decoded pose/gripper values are diagnostics, not the action expert's input.
 
-`goal_action_forward` supplies no video hidden tokens (`hs_latent=None`). It uses an isolated action cache and conditions action cross-attention only on the interface and current-state tokens. It neither reads raw video keys/values nor falls back to Zero-WAM's original action route. The same action function is used in both training stages and deployment.
+The main action path receives only its layer's interface condition, independent language/state features, and this block's noisy actions. `goal_action_forward` supplies `hs_latent=None`, uses a separate action cache, and clears stale action entries. It cannot directly read raw demonstration, observed-video, or generated-future K/V. Action-side cross-attention K/V projections and key normalization are separate from video projections, and the actual forward dispatch uses those copies. The language condition is frozen text-encoder output followed by an action-side projection; the state encoder is independent of video. Neither direct condition is a visually fused hidden state.
 
-## Robot supervision data
+The `direct_features` comparison intentionally relaxes this visual boundary, as described below. Its output metadata explicitly reports `raw_video_to_action: true`.
 
-An index uses `format_version: 1`, `kind: "se3_goal_index"`, and `samples` with exactly `manifest` and `split` per entry. Splits are `train`, `validation`, and `test`. Optional `source_aliases` and `bridge_sources` use the existing [source-component audit](human_icl.md); robot trajectories and reference sources connected by aliases or correspondences cannot cross splits.
+## Three forwards and their gradient boundary
 
-Each `se3_goal_sample` JSON points to one NPZ containing exactly:
+Stage 2 separates these computations, while sharing model parameters:
+
+1. **Future sampling:** use evaluation mode and `torch.no_grad()` to sample from the demonstration, observed history, language, and initial noise. Detach the generated future; do not use `inference_mode`.
+2. **Differentiable feature replay:** clear the sampling caches, restore training mode, and recompute demonstration/history conditions and their K/V. Read the detached generated future with autograd enabled and update the per-layer interface. Action and goal losses can update the visual condition path through this replay.
+3. **Video/IFP supervision:** execute a separate native video-only training forward with its own teacher-forced/noisy inputs, masks, and cleared caches. True future targets never enter the deployment-style prediction path.
+
+Modes and caches are restored or cleared on exceptional exits too. No-grad sampling disables autocast's weight cache so detached weight casts cannot silently be reused by differentiable replay. The generated sample has no gradient, while recomputed context features retain gradients. **Full-parameter fine-tuning does not mean differentiation through the sampling trajectory.**
+
+## Version-2 supervision and observation contracts
+
+A goal index uses `format_version: 2`, `kind: "se3_goal_index"`, and entries containing exactly `manifest` and `split` (`train`, `validation`, or `test`). Optional source aliases and human/robot bridges retain the [existing split audit](human_icl.md). A single index cannot mix `measured_endpoint` and `controller_target` labels.
+
+Each `se3_goal_sample` manifest uses version 2 and references an NPZ containing exactly:
 
 | Array | Shape before batching | Meaning |
 | --- | --- | --- |
-| `state` | `[S]` | Finite, measured current robot state in the declared state convention |
-| `goal_poses` | `[E,4,4]` | One valid homogeneous SE(3) transform per ordered end effector, at the end of the next action block |
-| `actions` | `[A,F,N,1]` | Normalized native controls for that one future block |
-| `actions_mask` | Same as `actions`, Boolean | Valid action labels, intersected with the declared valid channels |
+| `state` | `[S]` | Finite current measured state in the declared state convention |
+| `goal_poses` | `[E,4,4]` | Absolute transforms from robot base to each tool at the block endpoint |
+| `goal_gripper` | `[E]` | Endpoint gripper values, normalized with closed = 0 and open = 1 |
+| `actions` | `[A,F,N,1]` | Normalized native controls for this one future block |
+| `actions_mask` | Same as `actions`, Boolean | Valid labels, intersected with declared valid action channels |
 
-`E` is the number of end effectors, `A` the action width, `F` the configured `chunk_size`, and `N` the number of controls per latent video frame. State width and action width are separate quantities. Neither is inferred from a human video.
+Required metadata includes:
 
-Required metadata is:
+- `sample_id`, local relative `arrays`, and local relative `language` manifest paths.
+- `robot_source`: exactly `source_id`, `source_group`, `domain: "robot"`, and `trajectory_id`.
+- `state_space_id` and `action_space` (representation, normalization identity, width, valid channels).
+- `pose_representation: "absolute_robot_base_tool"`, `coordinate_frame` naming the audited robot base, `pose_units: "m"`, ordered unique `end_effectors`, and one distinct named `tool_frames` entry per end effector.
+- `gripper_space`: `normalization_id`, physical `closed` and `open` lists in effector order, and `units`. Bounds must be finite and differ. The normalized target is `(physical_value - closed) / (open - closed)` and must be in `[0,1]`; the loader validates declared targets rather than inventing them from action channels.
+- `goal_source`: `measured_endpoint` or `controller_target`, applying consistently to pose and gripper. A close command and a measured gripper opening are different labels. Runs and stage transitions require the same declared convention.
+- `current_time`, `goal_time`, and positive `control_dt` in seconds, with `goal_time = current_time + F * N * control_dt`. `F` must equal the configured `chunk_size`; `N` is controls per latent frame.
 
-- `format_version: 1`, `kind: "se3_goal_sample"`, `sample_id`, and local relative `arrays` path.
-- `robot_source`: `source_id`, `source_group`, `domain: "robot"`, and `trajectory_id`.
-- `state_space_id` identifying the state representation and normalization; `action_space` declaring representation, normalization identity, dimension, and valid channels.
-- `coordinate_frame` naming the target robot's pose frame (use the audited robot base frame), `pose_units: "m"`, and ordered unique `end_effectors`.
-- `goal_source`: explicitly either `measured_endpoint` or `controller_target`. A measured achieved endpoint and a commanded target are different labels and cannot be silently mixed in one run.
-- `current_time`, `goal_time`, and positive `control_dt`, all in seconds. The duration must equal `F * N * control_dt`.
+Optional `provenance` is an audit record, not a model input. Stage 2 also requires `visual_pair`, a local [native ICL sample](human_icl.md) with an audited, operation-compatible human or robot reference and the same target robot execution. A robot reference cannot share the target recording/group/explicit trajectory. A human semantic bridge remains allowed. A shared task name alone does not verify extent, order, or timing.
 
-Optional `provenance` records label derivation and audits; it is not a model input. Supply measured endpoint transforms or documented controller targets directly. Normalized action channels alone do not establish an endpoint SE(3), and the loader does not fabricate poses from them.
+The visual pair contains observed history plus exactly one future action block. Future action labels, masks, normalization, history endpoint, final endpoint, and every future video time must agree with the goal block: `current_time + (i + 1) * N * control_dt`. Human references need no human pose or action labels. Stage 1 reads goal, action, state, and language arrays only; source-audit metadata can still reference visual records.
 
-Stage 2 also requires a local `visual_pair` path to a [native ICL sample](human_icl.md). Its demonstration may be human or robot, but its target must be the same robot execution as `robot_source`. A robot reference must not be the same source, recording group, or explicitly identified trajectory as that target; otherwise it could carry the target future through the reference input. This does not reject a human reference merely because it has a semantic HumanGen/trajectory bridge. The pair must carry audited operation compatibility; sharing a task name does not establish matching movement extent, contact sequence, or timing. Its target future contains exactly one action block after the observed history. Future actions, masks, action normalization, history endpoint time and final time must agree with the goal sample. Every future video endpoint must also follow `current_time + (i + 1) * N * control_dt`, matching the generated feature schedule; observed history cadence is not otherwise constrained. Supervision always uses the **target robot's** poses and actions, never the demonstrator's coordinates.
+Inference instead accepts `se3_goal_observation` version 2. It contains the same state/action, pose/gripper, language, and visual-encoder conventions, plus `current_time`, `control_dt`, and `actions_per_frame`, but **no goal source, endpoint time, or supervision fields**. Its NPZ contains exactly `state [S]`, `history_latent [C,F,H,W]`, and `history_times [F]`; the final history time equals `current_time`. A separate demonstration record references native `latent` and `frame_times` arrays. All paths are local and relative to their containing manifest.
 
-This route therefore needs compatible reference-to-robot pairs. It does not train SE(3) from unpaired human-only target videos; the separate H1 route can still use human-to-human cross-video prediction.
+## Frozen instruction cache
 
-## Training and export
+Cache each explicitly supplied instruction with the local pretrained model's `text_encoder/` and `tokenizer/` components:
 
-[`configs/se3/goal_interface.json`](../configs/se3/goal_interface.json) is marked `synthetic_dimensions_only: true`. In particular, `state_dim: 4` is a placeholder, and its chunk length, loss weights, 4-step samplers and budget are not audited production settings. Copy and configure it against collected robot data and the chosen checkpoint before formal experiments. Keeping `domain_schedule: ["robot"]` means all supervised targets are robots; it does not prohibit human reference videos. `demo_bottleneck` is rejected by this route.
+```bash
+evo-wam cache-goal-language \
+  --text "Operate the drawer as demonstrated." \
+  --checkpoint /models/zero-wam --device cuda \
+  --output /data/evo/language/drawer
+```
 
-With audited data and a matching native checkpoint:
+The command does not download missing components. It uses frozen UMT5, native `prompt_clean`, a maximum length of 512 with truncation and special tokens, and zero padding. It writes `language.json` and `language.npz`. The separate language format remains version 1; it is not a version-1 goal sample.
+
+The manifest records the original instruction and its hash, cleaned instruction, valid length, array hash, encoder/tokenizer file identities, preprocessing/library versions, encoder precision, and text width. Training/deployment compare that encoder identity independently of the instruction contents, so a new instruction using the same encoder is allowed. Loading validates the full finite FP32 `[1,512,D]` cache and zero padding, then returns only valid tokens `[1,L,D]`. There is no implicit null-text fallback or visual caption generation. Use one consistent cache encoder/precision across a run and its deployment inputs.
+
+## Training, matched comparison, and persistence
+
+[`configs/se3/goal_interface.json`](../configs/se3/goal_interface.json) declares `schema_version: 2` and `interface_type: "latent"`. It still has `synthetic_dimensions_only: true`: `state_dim: 4`, chunk length, sampler steps, and training budget are placeholders. Audit these against collected robot data before formal training. `domain_schedule: ["robot"]` describes supervised targets and does not prohibit human references.
 
 ```bash
 evo-wam train-goal-interface \
@@ -102,34 +129,39 @@ evo-wam train-goal-interface \
   --stage visual --checkpoint /models/zero-wam --device cuda \
   --initialize outputs/se3-stage1/goal_interface.pt \
   --steps 1000 --seed 0 --output outputs/se3-stage2
-
-evo-wam export-goal-policy \
-  --artifact outputs/se3-stage2/goal_interface.pt --output outputs/se3-policy
 ```
 
-Use `--resume` with the stage's `goal_interface.pt` instead of `--initialize` to continue that same stage, index, seed and cumulative configured budget. A new run or export requires a fresh output directory. `--tiny-native` replaces `--checkpoint` only for randomly initialized small native checks; it is not pretrained-model validation.
+For the matched Stage 2 comparison, copy the same configuration and change **only** `interface_type` to `"direct_features"`. Initialize it from the **same Stage 1 artifact**, use the same visual index, seed, budget, language/state inputs, future-sampling settings, and video/IFP objective, and write to a separate output directory. It conditions each action layer on that layer's generated-future features directly, without recurrent latent processing or goal reconstruction loss. This compares the **joint increment of the Stage 2 interface and geometric supervision**; it does not isolate pose loss or establish Stage 1's benefit. Log actual elapsed time, trainable parameter counts, and peak allocated CUDA memory rather than assuming equal cost. The stored Stage 1 artifact hash identifies the common starting point.
 
-Training writes `goal_interface.pt`, the resolved `config.json`, stepwise `metrics.jsonl`, and `run.json`. Export requires successful updates in both stages. It produces `policy.pt` and a checksum manifest `policy.json`, preserving the complete interface and both action/video LoRA states. The original immutable Zero-WAM checkpoint remains separately required, except for tiny-native artifacts, which carry their tiny base weights. This is not an original-format merged Zero-WAM checkpoint.
+Use `--resume` instead of `--initialize` for continuation of the same stage, interface type, index, seed, and cumulative budget. The trainer records deterministic sample order/cursor, successful updates, all random states (including separate action/future/video generators), complete FP32 model/interface state, optimizer state, constant-scheduler declaration, data identities, and hashes of consumed arrays and language caches. Training writes `goal_interface.pt`, `config.json`, `metrics.jsonl`, and `run.json`. Exact continuation depends on the same execution environment and deterministic settings. Stage transitions restore model parameters and construct a fresh optimizer.
 
-## Frozen inference
+A new run/export needs a fresh output directory. `--tiny-native` replaces `--checkpoint` for random small-model checks only; its two native blocks require `num_layer_groups: 1` (the production example has six groups for thirty blocks). It is not validation of trained full weights. Goal v1 data and old LoRA/one-shot interface artifacts are rejected rather than silently migrated.
 
-The public loading/prediction entry points are `load_goal_policy` and `predict_goal_actions` in [`goal_training.py`](../src/evo_wam/goal_training.py). The CLI uses those same functions:
+## Complete deployment export and frozen inference
 
 ```bash
+evo-wam export-goal-policy \
+  --artifact outputs/se3-stage2/goal_interface.pt \
+  --output outputs/se3-policy --dtype float32 --max-shard-size 2GB
+
 evo-wam predict-goal-policy \
-  --policy outputs/se3-policy --checkpoint /models/zero-wam \
+  --policy outputs/se3-policy \
   --observation /data/evo/current-observation.json --device cuda --seed 0 \
   --output outputs/se3-prediction.npz
 ```
 
-Inference accepts only a `GoalObservation`, not a supervised sample. Its `se3_goal_observation` JSON supplies the trained frame, units, effectors, state/action conventions, `current_time`, `control_dt`, `actions_per_frame`, visual `feature_space_id`, and native `latent_normalization`. Its observation NPZ contains exactly `state [S]`, `history_latent [C,F,H,W]`, and strictly increasing `history_times [F]`. A separate `demonstration` source record points to a native video NPZ containing `latent` and `frame_times`. The latest observed time must equal `current_time`; future video, goal poses, and action labels have no input fields.
+Export requires successful updates in both stages. It writes complete native/interface **safetensors shards** plus `policy.json`, with construction configuration, dtype, weight map, and shard checksums. `--dtype` selects `float32` (default) or `bfloat16`; this is a deployment choice, not a change to training master precision. Loading reconstructs the separate action K/V modules, strictly restores the full state, validates shard integrity, and freezes all parameters. **No external base checkpoint is needed to load this policy.** Cached language and visual inputs still need their corresponding preprocessing components when new raw inputs are prepared.
 
-All parameters are frozen during inference. Output NPZ fields are `actions`, diagnostic `goal_poses`, and `generated_future`. Actions retain the declared normalization and are not robot commands: this CLI sends zero commands and supplies no closed-loop robot controller. Use the dedicated policy loader; running an exported interface through the original raw Zero-WAM server would omit the required action-conditioning change.
+Training recovery and deployment export are distinct formats. A deployment bundle has no optimizer/RNG recovery state and cannot replace the full FP32 training artifact. The dedicated `load_goal_policy` and `predict_goal_actions` functions in [`goal_training.py`](../src/evo_wam/goal_training.py) execute the same per-layer conditions as training. An original unmodified Zero-WAM server is not a substitute for this loader.
 
-## What still needs evidence
+Prediction outputs `actions` and `generated_future`; the main latent route additionally outputs diagnostic `goal_poses` and `goal_gripper`. The direct-feature baseline has no goal decoder output. All weights stay frozen; changing a demonstration is test-time ICL, not task-specific fine-tuning. Actions are normalized model outputs, not robot commands. The CLI sends zero commands and supplies no closed-loop controller.
 
-Small checks can verify stage freezes, valid SE(3), gradient paths, leakage rejection, and persistence. They do not establish learned target transfer, interaction-only representations, novelty, or robot execution success. Formal training and real cross-view transfer remain unmeasured.
+## Acceptance evidence and remaining limits
 
-The first behavioral checks should hold robot observations/state and the random seed fixed while changing an operation-compatible reference's movement extent or necessary intermediate steps, and then measure both endpoint error and action/execution behavior. Compare generated-future performance with the raw ICL baseline; do not substitute a result that reads the true future for a deployment result.
+The [validation record](validation.md) separates current checks from earlier versions. Required checks include full parameter updates, layer-specific conditions, the main action branch's independence from substituted visual/stale caches, nonzero gradients in freshly recomputed demonstration/history features, detached sampling, exact resume, and standalone export/loading.
 
-One endpoint and the current state may not uniquely specify the path, gripper timing, contact sequence, or success. Action supervision remains necessary, and Stage 1's nonvisual conditions may themselves be insufficient for ambiguous blocks. Pose reconstruction also cannot prevent unused token dimensions from retaining background appearance. These are experimental limitations to test, not guarantees supplied by the interface.
+Leakage checks have two different interventions. Deployment tests hold observed inputs and initial noise fixed while changing supervision, and require identical generated futures, predicted goals, and sampled actions. Loss-isolation tests first hold already constructed network inputs—including noisy action/video tensors—fixed, then change loss targets; outputs must remain fixed while losses and gradients may change. Changing clean actions before constructing noisy actions is not such a test.
+
+Small-sample behavior checks must fit different goals/gripper requirements in Stage 1. In Stage 2 they must hold scene, state, **language**, and initial noise fixed while only changing the demonstration's operation requirement, then verify correct goal/action changes after training. Random-initialization differences and attention to latent tokens alone are insufficient evidence.
+
+Real robot data have not yet been collected for this experiment. Full-checkpoint training, distributed execution, actual hardware memory requirements, arbitrary-view transfer, and robot success remain unvalidated. Small native checks do not establish these results. A terminal pose/gripper state may also omit necessary path, contact, force, or timing information; reconstruction cannot prove interaction-only latents. External review, when available, is recorded separately and does not replace these checks.

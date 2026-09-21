@@ -1,14 +1,17 @@
 # Evo-WAM
 
-Training native Zero-WAM with additional human demonstration videos for in-context robot control.
+Training native Zero-WAM to use human or robot demonstrations through a robot-goal-supervised action interface.
 
-The current experiment adds **human-to-human cross-video prediction** to the existing robot ICL objective: watch demonstration A, observe the earlier part of an independent execution B, and predict B's continuation through Zero-WAM's native video pathway. A and B need audited task compatibility; each additional human video does not need a matching robot trajectory or human action labels. H1 preserves the raw demonstration baseline. H2 adds an ordered temporal bottleneck at the demonstration entrance; H3 adds audited appearance consistency. At deployment, the selected demonstration interface runs with fixed parameters.
+The current experiment places an **SE(3)-supervised interface between predicted robot video features and the Action Expert**. Stage 1 adapts the pretrained Action Expert to goal tokens and observed robot state, without images. Stage 2 uses a compatible reference video and observed robot history to generate a robot future, then learns goal-related tokens from its features using robot endpoint and action supervision. The action path receives those tokens and state, with no raw-video shortcut or true-future input. All parameters are frozen at deployment. This is an implemented experimental route; real transfer gains remain unmeasured.
 
+- [SE(3) interface: stages, supervision, and dedicated policy loading](docs/se3_interface.md)
 - [Native human-video ICL: data, training, controls, and export](docs/human_icl.md)
 - [Current scope and archived effect-interface specification](docs/spec.md)
 - [Validation record and unmeasured results](docs/validation.md)
 
-Earlier effect-interface experiments remain available as optional comparisons. B/P pretraining, G/Q requirements, relationship labels, and F ranking are not prerequisites for the current route:
+The independent H1/H2/H3 route remains available: H1 adds human-to-human cross-video prediction, H2 adds temporal demonstration compression, and H3 adds appearance consistency. Those extra human targets need no robot action labels. The new SE(3) route instead requires semantically compatible reference-to-robot pairs, with endpoint and action labels supplied by the target robot. Human references need no human 3D labels. The two interface designs are separate experiments.
+
+Earlier effect-interface experiments also remain available as optional comparisons. B/P pretraining, G/Q requirements, relationship labels, and F ranking are not prerequisites for the current route:
 
 - [Archived B/P pretraining and reader integration](docs/unpaired_video.md)
 - [Effect-interface stages and acceptance checks](docs/implementation.md)
@@ -42,7 +45,9 @@ evo-wam validate-data --index outputs/fixture/index.json
 evo-wam check-native
 ```
 
-The current route uses `preprocess-icl-video`, `train-native-icl`, and `export-native-icl`. It feeds normalized Wan latents into the native ICL context path and trains video/context attention LoRA. H2/H3 also train a shared demonstration compressor and adapter, while leaving target observations uncompressed. H1 exports merged weights in the original model format; enabled bottleneck runs export a deployment bundle containing the merged backbone and the required interface weights. Robot batches keep the native video/action objectives; human batches have no action branch or action loss. The action expert and base weights stay frozen during this adaptation.
+The current route uses `train-goal-interface --stage goal`, then `train-goal-interface --stage visual --initialize ...`, followed by `export-goal-policy` and `predict-goal-policy`. Video preprocessing still uses `preprocess-icl-video`. Stage 1 trains the goal/state interface and action LoRA; Stage 2 freezes them and trains video LoRA, the visual goal readout, and a pose decoder while retaining native video/IFP prediction loss. The [`configs/se3/goal_interface.json`](configs/se3/goal_interface.json) example retains **synthetic placeholders**, including `state_dim: 4`. Deployment requires the dedicated policy bundle loader and the original base checkpoint. See the [SE(3) guide](docs/se3_interface.md) for complete commands and data contracts.
+
+The independent ICL route uses `train-native-icl` and `export-native-icl`. It feeds normalized Wan latents into the native ICL context path and trains video/context attention LoRA. H2/H3 also train a shared demonstration compressor and adapter, while leaving target observations uncompressed. H1 exports merged weights in the original model format; enabled demonstration-bottleneck runs export a deployment bundle containing the merged backbone and the required interface weights. Robot batches keep the native video/action objectives; human batches have no action branch or action loss. The action expert and base weights stay frozen during that adaptation.
 
 `configs/icl/` contains R0 (robot-only adaptation), H0 (the same robot data plus ordinary human-video continuation), H1 (the same videos with raw human cross-video ICL), H2 (H1 plus temporal demonstration compression), and H3 (H2 plus appearance consistency). These are explicitly marked **for synthetic checks only**. They keep the robot update count fixed; H0/H1 additionally match human targets, losses, and update counts. H2 preserves H1's predictive losses; H3 changes only the consistency weight and requires an audited appearance variant for each conditioned sample. Candidate bottleneck dimensions are unvalidated. Real data, semantic pair audits, full-checkpoint validation, and measured resource budgets are still required. See the [native ICL guide](docs/human_icl.md) for the exact comparison and input contracts.
 

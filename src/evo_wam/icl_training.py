@@ -18,6 +18,11 @@ from .zerowam import DEFAULT_SOURCE, ZERO_WAM_COMMIT, load_native_class, unpack_
 
 def load_icl_config(path):
     config = json.loads(Path(path).read_text())
+    return validate_icl_config(config)
+
+
+def validate_icl_config(config):
+    """Shared validation for callers which already loaded a native configuration."""
     if config.get("schema_version") != 1 or config.get("kind") != "native_icl_experiment":
         raise ValueError("expected a native_icl_experiment configuration")
     if type(config.get("synthetic_dimensions_only")) is not bool:
@@ -104,7 +109,7 @@ def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda"
     return native, null, identity
 
 
-def prepare_icl_inputs(sample, config, native, null, generator):
+def prepare_icl_inputs(sample, config, native, null, generator, *, include_actions=True):
     """Use original scheduler/grid conventions; human actions are absent, not zero labels."""
     from wan_va.utils import get_mesh_id
 
@@ -155,7 +160,8 @@ def prepare_icl_inputs(sample, config, native, null, generator):
     if robot:
         if sample.actions is None or sample.actions.shape[1] != native.config.action_dim:
             raise ValueError("robot actions must match the checkpoint action dimension")
-        inputs["action_dict"] = stream(sample.actions, 1., action=True, mask=sample.actions_mask)
+        if include_actions:
+            inputs["action_dict"] = stream(sample.actions, 1., action=True, mask=sample.actions_mask)
     elif sample.actions is not None or sample.actions_mask is not None:
         raise ValueError("human examples cannot supply robot actions")
     if robot or config["human_context"] == "cross_video":
@@ -192,8 +198,8 @@ def prepare_icl_inputs(sample, config, native, null, generator):
     return inputs
 
 
-def native_icl_loss(native, inputs, config, *, human):
-    if human:
+def native_icl_loss(native, inputs, config, *, human, video_only=False):
+    if human or video_only:
         video, future = forward_video_only(native, inputs)
         action = None
     else:
@@ -211,7 +217,7 @@ def native_icl_loss(native, inputs, config, *, human):
         return masked.sum() / mask.sum().clamp_min(1) if valid_mean else masked.mean()
 
     losses = {"video": mse(video, inputs["latent_dict"], native.patch_size, valid_mean=human)}
-    if not human:
+    if not human and not video_only:
         losses["action"] = mse(action, inputs["action_dict"], (1, 1, 1), valid_mean=False)
     streams = inputs.get("mcp_latent_dicts", [])
     if len(future) != len(streams):

@@ -687,6 +687,29 @@ def main(argv=None):
     commands.add_parser("doctor")
     commands.add_parser("check-native")
     commands.add_parser("check")
+    goal_train = commands.add_parser("train-goal-interface", help="train the nonvisual goal/action or visual SE(3) interface stage")
+    goal_train.add_argument("--config", required=True)
+    goal_train.add_argument("--index", required=True)
+    goal_train.add_argument("--stage", required=True, choices=("goal", "visual"))
+    goal_train.add_argument("--checkpoint")
+    goal_train.add_argument("--tiny-native", action="store_true")
+    goal_train.add_argument("--steps", type=int, default=1)
+    goal_train.add_argument("--seed", type=int, default=0)
+    goal_train.add_argument("--device", default="cuda")
+    goal_train.add_argument("--output", required=True)
+    goal_restore = goal_train.add_mutually_exclusive_group()
+    goal_restore.add_argument("--resume")
+    goal_restore.add_argument("--initialize")
+    goal_export = commands.add_parser("export-goal-policy", help="export the complete trained SE(3) interface policy")
+    goal_export.add_argument("--artifact", required=True)
+    goal_export.add_argument("--output", required=True)
+    goal_predict = commands.add_parser("predict-goal-policy", help="predict normalized actions from observed-only SE(3) policy inputs")
+    goal_predict.add_argument("--policy", required=True)
+    goal_predict.add_argument("--observation", required=True)
+    goal_predict.add_argument("--checkpoint")
+    goal_predict.add_argument("--device", default="cuda")
+    goal_predict.add_argument("--seed", type=int, default=0)
+    goal_predict.add_argument("--output", required=True)
     icl_visual = commands.add_parser("preprocess-icl-video", help="cache one raw video for native ICL semantic pairing")
     icl_visual.add_argument("--manifest", required=True)
     icl_visual.add_argument("--output", required=True)
@@ -789,6 +812,15 @@ def main(argv=None):
         elif args.command == "preprocess-video":
             from .vision import preprocess_video
             result = preprocess_video(args.manifest, args.output, device=args.device)
+        elif args.command == "train-goal-interface":
+            from .goal_training import train_goal_interface
+            result = train_goal_interface(args)
+        elif args.command == "export-goal-policy":
+            from .goal_training import export_goal_policy
+            result = export_goal_policy(args)
+        elif args.command == "predict-goal-policy":
+            from .goal_training import predict_goal_cli
+            result = predict_goal_cli(args)
         elif args.command == "preprocess-icl-video":
             from .icl_preprocess import preprocess_icl_video
             result = preprocess_icl_video(args.manifest, args.output, device=args.device)

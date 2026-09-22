@@ -1,6 +1,18 @@
 # Evo-WAM scope and archived specification
 
-## Current experiment: full-parameter recurrent goal interface
+## Current experiment: observed-context dual features
+
+The primary route packs observed robot-history tokens before the complete human or robot demonstration. Both streams are available context; an explicit bidirectional attention mask permits their interaction and excludes padding. Separate position namespaces distinguish the two recordings. This order is not a claim of autoregressive video generation.
+
+One clean Wan forward supplies per-layer hidden features. At each layer a pose decoder reads the context, independent language, and measured state. It predicts the next robot action-block endpoint SE(3) and gripper value, and supplies its pre-coordinate hidden features alongside the corresponding Wan features to the Action Expert. Predicted coordinates themselves are not the expert's conditioning bottleneck. The final-layer pose/gripper is supervised; action gradients pass through both feature branches.
+
+`interface_type: observed_dual` uses one `joint` training stage with action plus endpoint pose/gripper losses. It forbids future-video sampling, video/latent reconstruction supervision and IFP loss. True goals and action labels never enter the observed conditioning function. Existing v2 paired training files may still contain future video arrays for compatibility; the direct path slices only observed history and never forwards or supervises those future arrays. Dedicated no-future training files can be introduced separately rather than silently changing existing data contracts.
+
+The route has its own architecture identity for recovery/export and never silently loads an old recurrent interface. It retains the existing frozen language/VAE preprocessing contract, normalized action contract, and full-weight export. The setup does not by itself prevent visual shortcuts or demonstration neglect. Required validation includes fixed-history demonstration swaps, task-disambiguating held-out data, and correct-reference versus mismatched-reference task success. Synthetic tests only validate code and controlled fitting.
+
+Commands, exact tensor flow, compatibility, and unmeasured limits: [observed_context.md](observed_context.md).
+
+## Retained comparison: full-parameter recurrent goal interface
 
 The primary route is a two-stage, LIT-style **soft latent interface**, initialized from pretrained Zero-WAM. Stage 1 receives explicit robot endpoint pose/gripper targets, independent language, and measured current state, and updates the complete Action Expert plus its goal/state/condition encoders. It reads no visual arrays or visual caches. This is nonvisual adaptation of existing action weights, not training an action expert from scratch or proof that prior visual biases were removed.
 

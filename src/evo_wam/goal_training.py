@@ -1,4 +1,4 @@
-"""Full-parameter, two-stage goal training with an explicit visual information boundary."""
+"""Goal-supervised action training, with legacy and observed-context routes."""
 
 from __future__ import annotations
 
@@ -16,14 +16,45 @@ from .cli import file_sha256, source_module, write_json
 from .goal_action import action_named_parameters, goal_action_forward, goal_action_sample, install_action_interface
 from .goal_data import GoalObservation, load_goal_index, load_goal_observation, load_goal_sample
 from .goal_future import generated_robot_features
+from .goal_context import observed_context_features
 from .goal_interface import GoalInterface, goal_pose_loss
+from .goal_observed_interface import ObservedGoalInterface
 from .icl_training import build_icl_model, native_icl_loss, prepare_icl_inputs, validate_icl_config
 from .video_data import patch_grid_coordinates, _source_components, _local_path
 from .zerowam import ZERO_WAM_COMMIT, load_native_class
 
 
-STAGES = {"goal", "visual"}
+STAGES = {"goal", "visual", "joint"}
 ARCHITECTURE = "recurrent_goal_full_v2"
+OBSERVED_ARCHITECTURE = "observed_goal_dual_v1"
+
+
+def goal_architecture(config):
+    return OBSERVED_ARCHITECTURE if config.get("interface_type") == "observed_dual" else ARCHITECTURE
+
+
+def _check_stage(config, stage):
+    allowed = {"joint"} if config["interface_type"] == "observed_dual" else {"goal", "visual"}
+    if stage not in allowed:
+        raise ValueError(f"interface_type {config['interface_type']} requires stage {sorted(allowed)}")
+
+
+def _has_visual_input(stage):
+    return stage in {"visual", "joint"}
+
+
+def _raw_visual_condition(config, stage):
+    return _has_visual_input(stage) and config["interface_type"] in {"direct_features", "observed_dual"}
+
+
+def _require_trained_policy(payload):
+    config = payload["config"]
+    _check_stage(config, payload["stage"])
+    if config["interface_type"] == "observed_dual":
+        if payload["updates"] < 1:
+            raise ValueError("observed-context export requires successful joint training updates")
+    elif payload["stage"] != "visual" or min(payload["updates"], payload["goal_stage_updates"]) < 1:
+        raise ValueError("policy requires both successfully trained stages")
 
 
 def autocast_for(native):
@@ -43,21 +74,32 @@ def validate_goal_config(config):
     if ("demo_bottleneck" in config or config["domain_schedule"] != ["robot"]
             or config["human_context"] != "cross_video"):
         raise ValueError("goal training requires cross-video robot targets without demo compression")
-    if config.get("interface_type") not in {"latent", "direct_features"}:
-        raise ValueError("interface_type must explicitly select latent or the direct_features comparison")
+    if config.get("interface_type") not in {"latent", "direct_features", "observed_dual"}:
+        raise ValueError("interface_type must explicitly select latent, direct_features or observed_dual")
+    observed = config["interface_type"] == "observed_dual"
     interface = config.get("goal_interface")
-    required = {"state_dim", "dim", "num_tokens", "num_heads", "translation_scale", "num_layer_groups", "num_pose_tokens"}
+    required = {"state_dim", "dim", "num_heads", "translation_scale"}
+    if not observed:
+        required |= {"num_tokens", "num_layer_groups", "num_pose_tokens"}
     if not isinstance(interface, dict) or set(interface) != required:
-        raise ValueError("goal_interface must declare dimensions, depth groups, pose tokens and translation_scale")
+        raise ValueError("goal_interface fields must match the selected interface dimensions and translation_scale")
     if any(type(interface[key]) is not int or interface[key] < 1 for key in required - {"translation_scale"}):
         raise ValueError("goal interface dimensions must be positive integers")
-    if interface["dim"] % interface["num_heads"] or interface["num_pose_tokens"] > interface["num_tokens"]:
+    if interface["dim"] % interface["num_heads"] or (not observed and interface["num_pose_tokens"] > interface["num_tokens"]):
         raise ValueError("invalid attention heads or pose-token count")
-    for value in (interface["translation_scale"], config["pose_weight"], config["video_weight"],
-                  config["training"]["backbone_learning_rate"]):
+    weights = [interface["translation_scale"], config["pose_weight"], config["training"]["backbone_learning_rate"]]
+    if observed:
+        if (type(config.get("video_weight")) not in (int, float) or config["video_weight"] != 0
+                or config["ifp"]["enabled"] or any(config["ifp"]["loss_weights"])):
+            raise ValueError("observed_dual requires video_weight=0 and disabled, zero-weight IFP; no video targets")
+        if "sampling_steps" in config:
+            raise ValueError("observed_dual has no video sampling_steps; use action_sampling_steps only")
+    else:
+        weights.append(config["video_weight"])
+    for value in weights:
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError("loss weights, translation scale and learning rates must be positive and finite")
-    for name in ("sampling_steps", "action_sampling_steps"):
+    for name in (("action_sampling_steps",) if observed else ("sampling_steps", "action_sampling_steps")):
         if type(config[name]) is not int or config[name] < 1:
             raise ValueError("sampling steps must be positive integers")
     return config
@@ -75,12 +117,21 @@ def _interface(native, config, registry):
         raise ValueError("goal action dimension differs from native checkpoint")
     if registry["language_identity"]["text_dim"] != native.config.text_dim:
         raise ValueError("language encoder width differs from native checkpoint")
+    if config["interface_type"] == "observed_dual":
+        return ObservedGoalInterface(native_dim=native.inner_dim, effectors=len(registry["end_effectors"]),
+            **config["goal_interface"]).to(native.action_embedder.weight)
     return GoalInterface(native_dim=native.inner_dim, feature_dim=native.inner_dim,
         num_layers=len(native.blocks), effectors=len(registry["end_effectors"]),
         **config["goal_interface"]).to(native.action_embedder.weight)
 
 
 def _set_training(native, interface, stage, interface_type):
+    if interface_type == "observed_dual":
+        if stage != "joint":
+            raise ValueError("observed_dual trains jointly from observed context")
+        native.requires_grad_(True).train()
+        interface.requires_grad_(True).train()
+        return
     native.requires_grad_(stage == "visual")
     if stage == "goal":
         for _, parameter in action_named_parameters(native):
@@ -98,8 +149,7 @@ def _set_training(native, interface, stage, interface_type):
 
 
 def build_goal_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda"):
-    if stage not in STAGES:
-        raise ValueError("stage must be goal or visual")
+    _check_stage(config, stage)
     native, _, identity = build_icl_model(config, checkpoint=checkpoint, tiny_native=tiny_native,
                                         device=device, adaptation=False, dtype=torch.float32)
     install_action_interface(native)
@@ -172,6 +222,38 @@ def visual_goal_tokens(native, interface, demonstration, history, state, languag
     return conditions, tokens, generated
 
 
+def observed_goal_conditions(native, interface, demonstration, history, state, language, config, *,
+                             feature_layers, demo_times=None):
+    """One clean context pass: Wan and pose-decoder features condition actions.
+
+    No future video, goal labels, action labels, or sampler enter this path.
+    The final decoder supplies SE(3)/gripper outputs; its hidden features and
+    the corresponding Wan features both condition every action layer.
+    """
+    if config["interface_type"] != "observed_dual":
+        raise ValueError("observed context requires the observed_dual interface")
+    if feature_layers != list(range(len(native.blocks))):
+        raise ValueError("the observed interface requires every native layer in order")
+    weight = native.action_embedder.weight
+    language = language.to(weight)
+    state = state.to(weight)
+    language_hidden = native.condition_embedder_action.text_embedder(language)
+    conditions, predictions = [], []
+
+    def read_layer(index, features):
+        if index != len(conditions):
+            raise ValueError("observed feature callbacks must follow native layer order")
+        condition, prediction = interface.condition_from_features(features, state, language_hidden)
+        conditions.append(condition)
+        predictions[:] = [prediction]
+
+    observed_context_features(native, demonstration, history, language,
+        {**config, "feature_layers": feature_layers}, demo_times=demo_times, on_layer=read_layer)
+    if len(conditions) != len(native.blocks) or not predictions:
+        raise ValueError("not every action layer received observed-context features")
+    return conditions, predictions[0]
+
+
 def _clear_video_cache(native):
     names = {"pos"} | {name for block in native.blocks for name in block.attn1.attn_caches}
     for name in names:
@@ -180,38 +262,50 @@ def _clear_video_cache(native):
 
 def goal_training_loss(native, interface, unused, sample, config, generators, *, stage, feature_layers):
     del unused
+    _check_stage(config, stage)
     device = native.action_embedder.weight.device
     state, language = sample.state.to(device), sample.language.to(device)
     with autocast_for(native):
+        decoded = None
         if stage == "goal":
             tokens = interface.encode_goal(sample.goal_poses.to(device), sample.goal_gripper.to(device))
             language_hidden = native.condition_embedder_action.text_embedder(language)
             condition = interface.condition(tokens, state, language_hidden)
             conditions = [condition] * len(native.blocks)
-        elif stage == "visual":
+        elif _has_visual_input(stage):
             if sample.visual is None:
                 raise ValueError("visual training requires an operation-compatible reference and observed history")
             pair = sample.visual
-            conditions, tokens, _ = visual_goal_tokens(native, interface, pair.demonstration,
-                pair.target[:, :, :pair.history_frames], state, language, config, generators["future"],
-                feature_layers=feature_layers, current_time=sample.metadata["current_time"],
-                control_dt=sample.metadata["control_dt"], actions_per_frame=sample.actions.shape[3],
-                demo_times=pair.demonstration_times)
+            if stage == "joint":
+                conditions, decoded = observed_goal_conditions(native, interface, pair.demonstration,
+                    pair.target[:, :, :pair.history_frames], state, language, config,
+                    feature_layers=feature_layers, demo_times=pair.demonstration_times)
+                tokens = None
+            else:
+                conditions, tokens, _ = visual_goal_tokens(native, interface, pair.demonstration,
+                    pair.target[:, :, :pair.history_frames], state, language, config, generators["future"],
+                    feature_layers=feature_layers, current_time=sample.metadata["current_time"],
+                    control_dt=sample.metadata["control_dt"], actions_per_frame=sample.actions.shape[3],
+                    demo_times=pair.demonstration_times)
         else:
-            raise ValueError("stage must be goal or visual")
+            raise ValueError("stage must be goal, visual or joint")
         noisy, times, target, mask = _action_noise(sample.actions, sample.actions_mask, generators["action"], device)
         predicted = goal_action_forward(native, noisy, times, conditions)
         losses = {"action": masked_action_loss(predicted, target, mask)}
         losses["total"] = losses["action"]
-        if stage == "visual":
+        if _has_visual_input(stage):
             if tokens is not None:
                 decoded = interface.decode_goal(tokens)
+            if decoded is not None:
                 pose = goal_pose_loss(decoded["goal_poses"], sample.goal_poses.to(device), interface.translation_scale,
                     gripper_prediction=decoded["goal_gripper"], gripper_target=sample.goal_gripper.to(device))
                 for key, value in pose.items():
                     if key != "total":
                         losses[f"pose_{key}"] = value
                 losses["total"] = losses["total"] + config["pose_weight"] * pose["total"]
+            if stage == "joint":
+                # Deliberately do not construct video/IFP targets or forwards.
+                return losses
             # Teacher-forced video/IFP execution owns no cache from the deployment path.
             _clear_video_cache(native)
             try:
@@ -244,9 +338,12 @@ def _restore_system(native, interface, model, tiny=None):
 def read_goal_artifact(path, kind="se3_goal_training"):
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (not isinstance(payload, dict) or payload.get("format_version") != 2
-            or payload.get("kind") != kind or payload.get("architecture") != ARCHITECTURE
+            or payload.get("kind") != kind or not isinstance(payload.get("config"), dict)
+            or payload.get("architecture") != goal_architecture(payload["config"])
             or payload.get("upstream_commit") != ZERO_WAM_COMMIT or payload.get("precision") != "float32"):
         raise ValueError("expected a version-2 FP32 full training artifact; deployment and old adapters cannot resume")
+    validate_goal_config(payload["config"])
+    _check_stage(payload["config"], payload["stage"])
     return payload
 
 
@@ -276,10 +373,11 @@ def train_goal_interface(args):
     config, stage = load_goal_config(args.config), args.stage
     if stage not in STAGES or args.resume and args.initialize:
         raise ValueError("choose a stage and either resume or initialize")
+    _check_stage(config, stage)
     paths, sources = load_goal_index(args.index)
     if type(args.steps) is not int or args.steps < 1:
         raise ValueError("steps must be positive")
-    first = load_goal_sample(paths[0], visual=stage == "visual")
+    first = load_goal_sample(paths[0], visual=_has_visual_input(stage))
     registry = goal_registry(first)
     _check_sample(first, config, registry)
     previous = read_goal_artifact(args.resume or args.initialize) if args.resume or args.initialize else None
@@ -343,7 +441,7 @@ def train_goal_interface(args):
     with (output / "metrics.jsonl").open("a") as log:
         for step in range(start, start + args.steps):
             path = paths[step % len(paths)]
-            sample = load_goal_sample(path, visual=stage == "visual")
+            sample = load_goal_sample(path, visual=_has_visual_input(stage))
             _check_sample(sample, config, registry)
             if sample.visual is not None:
                 space = sample.visual.metadata["feature_space_id"]
@@ -363,16 +461,18 @@ def train_goal_interface(args):
             updates += 1
             log.write(json.dumps({**{key: float(value.detach()) for key, value in losses.items()},
                 "stage": stage, "step": step, "updated": True, "gradient_norm": float(norm),
-                "goal_source": registry["goal_source"], "goal_input": "true_goal" if stage == "goal" else "generated_future_only",
-                "interface_type": config["interface_type"], "raw_video_to_action": stage == "visual" and config["interface_type"] == "direct_features"},
+                "goal_source": registry["goal_source"], "goal_input": ("true_goal" if stage == "goal" else
+                    "observed_context" if stage == "joint" else "generated_future_only"),
+                "interface_type": config["interface_type"], "raw_video_to_action": _raw_visual_condition(config, stage),
+                "video_generation": stage == "visual", "video_supervision": stage == "visual"},
                 allow_nan=False) + "\n")
             log.flush()
     if str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
     elapsed = time.monotonic() - started
     numpy_state = np.random.get_state()
-    goal_updates = updates if stage == "goal" else previous["goal_stage_updates"]
-    payload = {"format_version": 2, "kind": "se3_goal_training", "architecture": ARCHITECTURE,
+    goal_updates = updates if stage == "goal" else previous["goal_stage_updates"] if previous else 0
+    payload = {"format_version": 2, "kind": "se3_goal_training", "architecture": goal_architecture(config),
         "precision": "float32", "upstream_commit": ZERO_WAM_COMMIT, "config": config, "stage": stage,
         "model": _system_state(native, interface), "native_config": {k: v for k, v in dict(native.config).items() if not k.startswith("_")},
         "base_identity": identity, "tiny_native": args.tiny_native, "feature_layers": layers,
@@ -393,7 +493,8 @@ def train_goal_interface(args):
         "trainable_parameters": sum(p.numel() for p in parameters), "precision": "float32", "lora": False,
         "optimizer_groups": [{"name": g["name"], "lr": g["lr"], "parameters": sum(p.numel() for p in g["params"])} for g in optimizer.param_groups],
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated() if str(args.device).startswith("cuda") else None,
-        "interface_type": config["interface_type"], "raw_video_to_action": stage == "visual" and config["interface_type"] == "direct_features",
+        "interface_type": config["interface_type"], "raw_video_to_action": _raw_visual_condition(config, stage),
+        "video_generation": stage == "visual", "video_supervision": stage == "visual",
         "ground_truth_future_for_goal": False, "robot_execution_evaluated": False}
     write_json(output / "run.json", report)
     return report
@@ -404,8 +505,7 @@ def export_goal_policy(args):
     from safetensors.torch import save_file
 
     payload = read_goal_artifact(args.artifact)
-    if payload["stage"] != "visual" or min(payload["updates"], payload["goal_stage_updates"]) < 1:
-        raise ValueError("export requires both successfully trained stages")
+    _require_trained_policy(payload)
     output = Path(args.output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("export requires a fresh directory")
@@ -431,7 +531,8 @@ def export_goal_policy(args):
                   source_artifact_sha256=file_sha256(args.artifact))
     write_json(output / "policy.json", policy)
     return {"policy": str(output.resolve()), "test_time_updates": False,
-            "raw_video_to_action": payload["config"]["interface_type"] == "direct_features", "precision": precision}
+            "raw_video_to_action": _raw_visual_condition(payload["config"], payload["stage"]), "precision": precision,
+            "video_generation": payload["stage"] == "visual"}
 
 
 def load_goal_policy(path, *, device="cuda"):
@@ -440,12 +541,13 @@ def load_goal_policy(path, *, device="cuda"):
     folder = Path(path)
     payload = json.loads((folder / "policy.json").read_text())
     if (payload.get("kind") != "se3_goal_policy" or payload.get("format_version") != 2
-            or payload.get("architecture") != ARCHITECTURE or payload.get("upstream_commit") != ZERO_WAM_COMMIT
+            or not isinstance(payload.get("config"), dict)
+            or payload.get("architecture") != goal_architecture(payload["config"])
+            or payload.get("upstream_commit") != ZERO_WAM_COMMIT
             or payload.get("precision") not in {"float32", "bfloat16"}):
         raise ValueError("expected a version-2 complete goal policy")
-    if payload["stage"] != "visual" or min(payload["updates"], payload["goal_stage_updates"]) < 1:
-        raise ValueError("policy requires both successful training stages")
     validate_goal_config(payload["config"])
+    _require_trained_policy(payload)
     dtype = getattr(torch, payload["precision"])
     native = load_native_class()(**payload["native_config"]).to(device=device, dtype=dtype)
     install_action_interface(native)
@@ -490,18 +592,29 @@ def predict_goal_actions(native, interface, unused, payload, observation, *, see
         raise ValueError("visual encoder differs from trained interface")
     weight = native.action_embedder.weight
     with autocast_for(native):
-        conditions, tokens, future = visual_goal_tokens(native, interface, observation.demonstration,
-            observation.history, observation.state.to(weight), observation.language.to(weight), config,
-            torch.Generator().manual_seed(seed + 1), feature_layers=payload["feature_layers"],
-            current_time=observation.metadata["current_time"], control_dt=registry["control_dt"],
-            actions_per_frame=registry["actions_per_frame"], demo_times=observation.demonstration_times)
+        decoded = None
+        if config["interface_type"] == "observed_dual":
+            conditions, decoded = observed_goal_conditions(native, interface, observation.demonstration,
+                observation.history, observation.state.to(weight), observation.language.to(weight), config,
+                feature_layers=payload["feature_layers"], demo_times=observation.demonstration_times)
+            tokens, future = None, None
+        else:
+            conditions, tokens, future = visual_goal_tokens(native, interface, observation.demonstration,
+                observation.history, observation.state.to(weight), observation.language.to(weight), config,
+                torch.Generator().manual_seed(seed + 1), feature_layers=payload["feature_layers"],
+                current_time=observation.metadata["current_time"], control_dt=registry["control_dt"],
+                actions_per_frame=registry["actions_per_frame"], demo_times=observation.demonstration_times)
         shape = (1, native.config.action_dim, config["chunk_size"], registry["actions_per_frame"], 1)
         mask = torch.tensor(registry["action_space"]["valid_channels"], dtype=torch.bool)[None, :, None, None, None]
         actions = goal_action_sample(native, conditions, shape, mask, torch.Generator().manual_seed(seed),
                                      steps=config["action_sampling_steps"])
-        result = {"actions": actions, "generated_future": future}
+        result = {"actions": actions}
+        if future is not None:
+            result["generated_future"] = future
         if tokens is not None:
-            result.update(interface.decode_goal(tokens))
+            decoded = interface.decode_goal(tokens)
+        if decoded is not None:
+            result.update(decoded)
     return result
 
 
@@ -515,4 +628,5 @@ def predict_goal_cli(args):
     np.savez_compressed(output, **{name: value.float().cpu().numpy() for name, value in result.items()})
     return {"output": str(output.resolve()), "coordinate_frame": payload["registry"]["coordinate_frame"],
         "goal_source": payload["registry"]["goal_source"], "test_time_updates": False, "commands_sent": 0,
-        "interface_type": payload["config"]["interface_type"]}
+        "interface_type": payload["config"]["interface_type"],
+        "video_generation": payload["config"]["interface_type"] != "observed_dual"}

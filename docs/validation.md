@@ -1,8 +1,24 @@
 # Validation record
 
-Updated: 2026-09-21. Code/graph checks, trained full-model results, simulation, and robot execution are separate evidence categories.
+Updated: 2026-09-22. Code/graph checks, trained full-model results, simulation, and robot execution are separate evidence categories.
 
-## Current full-parameter recurrent goal interface (v2)
+## Current observed-context dual-feature route
+
+The full regression passed **316 tests, no skips, in 270.949 seconds** using `taskset -c 0 .venv/bin/python -m unittest discover -s tests -q`. This includes 15 new checks: 4 observed-context reader checks, 6 pose/dual-feature interface checks, and 5 joint-training integration checks. Native tiny-model CUDA attention and autograd were exercised; no full pretrained checkpoint was trained and no robot commands were sent.
+
+Verified behavior:
+
+- The native context reader packs robot history before the demonstration, uses independent position namespaces, permits interaction between available context streams, and excludes padding. Both inputs influence the hidden features. Training keeps backbone gradients; cached encoder inputs remain detached.
+- Context reading never invokes a future-video sampler, native video output head, or teacher-forced video/IFP forward. Normal and exceptional exits restore attention masks/modes and clear stale KV state.
+- Pose-decoder hidden features and Wan features independently contribute action-conditioning gradients. The robot endpoint head supplies valid rotations and bounded gripper outputs. State, language, and all context tokens can affect the readout.
+- The `joint` objective consists only of action, position/rotation, and gripper terms. Its configuration rejects nonzero video weights, enabled/nonzero IFP, or a video sampler setting.
+- Replacing the recorded robot future video while keeping observed inputs and action noise fixed leaves losses and predictions unchanged. Replacing only endpoint labels changes the supervised pose loss, not the conditioning or predicted action flow.
+- A controlled two-example synthetic fit keeps history, state, language and noisy action input fixed, changes only the demonstration, and fits distinct action-flow targets, endpoint positions and grippers. This demonstrates fitting capacity, not held-out ICL generalization or resistance to real visual shortcuts.
+- Joint training resumes exactly, exports without an earlier goal-stage artifact after successful updates, and loads as a standalone frozen policy. A fresh-process CLI prediction returns actions, poses and grippers with no generated video. Mismatched architecture/stage metadata and zero-update deployment artifacts are rejected. Legacy routes remain covered by the complete regression.
+
+Full-model memory/throughput, converted real SO101 training data, held-out human-reference dependence, real task success, and flywheel orchestration remain unvalidated. The new route is documented in [observed_context.md](observed_context.md); its joint mode does not inherit the earlier route's video-prediction or latent-only-boundary claims.
+
+## Retained full-parameter recurrent goal interface (v2)
 
 The full regression run passed **301 tests, no skips, in 242.681 seconds** using `taskset -c 0 .venv/bin/python -m unittest discover -s tests -q`. CPU affinity avoids the host's cross-core clock issue; native CUDA attention was used. After that run, the strengthened joint goal/action fitting check and the three language-cache checks also passed. The historical **291-test** result below belongs to the previous LoRA/one-shot interface.
 

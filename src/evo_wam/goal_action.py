@@ -1,4 +1,4 @@
-"""Run the native Action Expert using only goal-interface and robot-state tokens."""
+"""Run the native Action Expert with explicit per-layer conditioning tokens."""
 
 from copy import deepcopy
 import math
@@ -73,8 +73,9 @@ def goal_action_forward(native, noisy_actions, timesteps, condition, *, cache_na
     """Denoise one action block with zero video tokens and zero video-cache access.
 
     ``condition`` contains one [1,K_layer,native.inner_dim] tensor per native
-    layer, combining that layer's latent with independent language/state tokens.
-    Training and inference use the same route, without raw visual K/V access.
+    layer, combining independent language/state with the selected feature route.
+    Training and inference use the same route, without reading video KV caches;
+    observed_dual supplies Wan and pose-decoder features as explicit conditions.
     Calls on the shared native model are sequential, as in upstream ICL.
     """
     if (not isinstance(noisy_actions, torch.Tensor) or noisy_actions.ndim != 5

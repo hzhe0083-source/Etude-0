@@ -239,12 +239,25 @@ def _context_impl(native, demonstration, history, config, *, demo_cache=None, ca
         text = native.g_pi_empty_text.to(native.condition_embedder.text_embedder.linear_1.weight)
         text_hidden = native.condition_embedder.text_embedder(text)
 
+        # Native dynamic FlexAttention captures tensors, not arithmetic on
+        # symbolic closure scalars. Pad metadata for its partial KV blocks.
+        query_positions = torch.arange(count + padding, device=weight.device) + offset
+        key_length = offset + count + padding
+        key_positions = torch.arange(((key_length + 127) // 128) * 128, device=weight.device)
+        query_valid, key_valid = query_positions < count + offset, key_positions < count + offset
+        query_demo, key_demo = query_positions < demo_tokens, key_positions < demo_tokens
+        chunk_tokens = spatial * config["chunk_size"]
+        query_chunks = (query_positions - demo_tokens) // chunk_tokens
+        key_chunks = (key_positions - demo_tokens) // chunk_tokens
+        text_valid = torch.arange(((text.shape[1] + 127) // 128) * 128,
+                                  device=weight.device) < text.shape[1]
+
         def visible(batch, head, query, key):
-            return _visible_pair(query + offset, key, demo_tokens, count + offset,
-                                 spatial * config["chunk_size"])
+            return query_valid[query] & key_valid[key] & (
+                key_demo[key] | (~query_demo[query] & (key_chunks[key] <= query_chunks[query])))
 
         def valid_text(batch, head, query, key):
-            return (query < count) & (key < text.shape[1])
+            return query_valid[query] & text_valid[key]
 
         self_mask = create_block_mask(visible, 1, 1, count + padding,
                                       offset + count + padding, device=weight.device)

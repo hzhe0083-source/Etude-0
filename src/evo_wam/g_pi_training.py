@@ -136,6 +136,11 @@ def validate_g_pi_config(config):
         raise ValueError("goal_noise scales must be finite nonnegative z/translation/rotation/gripper standard deviations")
     if config["interface_type"] == "g_translator" and any(noise.values()):
         raise ValueError("goal noise is only supported for hindsight pi training")
+    from .g_pi_distributed import distributed_settings
+
+    distributed_settings(config)
+    if "target_cache_index" in config and (not isinstance(config["target_cache_index"], str) or not config["target_cache_index"].strip()):
+        raise ValueError("target_cache_index must be a nonempty local index path")
     EventRules.from_metadata(config.get("event_rules"))
     if type(config.get("base_seed", 0)) is not int or not 0 <= config.get("base_seed", 0) < 2 ** 63:
         raise ValueError("base_seed must be a nonnegative integer smaller than 2**63")
@@ -191,8 +196,9 @@ def _set_training(native, interface, encoder, config):
             parameter.requires_grad_(True)
 
 
-def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda",
-                      video_precision=None):
+def build_g_pi_encoder(config, *, stage, checkpoint=None, tiny_native=False, device="cuda",
+                       video_precision=None):
+    """Build fixed E before training, without a goal decoder or task language."""
     from .g_pi_context import FrozenGoalEncoder, install_empty_text
 
     validate_g_pi_config(config)
@@ -230,9 +236,16 @@ def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=F
     encoder = FrozenGoalEncoder(native, layer=config["goal_encoder"]["layer"],
         grid_size=config["goal_encoder"].get("grid_size", [4, 4]),
         camera_layout=config["goal_encoder"]["camera_layout"], base_id=identity)
+    return native, encoder, identity, list(range(len(native.blocks)))
+
+
+def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda",
+                      video_precision=None):
+    native, encoder, identity, layers = build_g_pi_encoder(config, stage=stage, checkpoint=checkpoint,
+        tiny_native=tiny_native, device=device, video_precision=video_precision)
     interface = _interface(native, config, registry)
     _set_training(native, interface, encoder, config)
-    return native, interface, encoder, identity, list(range(len(native.blocks)))
+    return native, interface, encoder, identity, layers
 
 
 def _check_sample(sample, config, registry):
@@ -270,7 +283,7 @@ def _training_language(native, language, generator, probability):
     return language
 
 
-def g_pi_training_loss(native, interface, encoder, sample, config, generators, *, stage, feature_layers):
+def g_pi_training_loss(native, interface, encoder, sample, config, generators, *, stage, feature_layers, cached_z=None):
     from .g_pi_context import split_g_context_features, pi_context_features
     from .g_pi_interface import g_goal_loss
     from .goal_training import _action_noise, autocast_for, masked_action_loss
@@ -282,7 +295,7 @@ def g_pi_training_loss(native, interface, encoder, sample, config, generators, *
     state = sample.state.to(device=weight.device, dtype=torch.float32)
     # E shares the immutable video branch and owns its fixed compute precision.
     with torch.no_grad(), torch.autocast(device_type=weight.device.type, enabled=False):
-        goal = {"z": encoder(sample.target_frame), "goal_poses": sample.goal_poses.to(weight.device),
+        goal = {"z": encoder(sample.target_frame) if cached_z is None else cached_z.to(weight.device), "goal_poses": sample.goal_poses.to(weight.device),
                 "goal_gripper": sample.goal_gripper.to(weight.device)}
     with autocast_for(native):
         if stage == "g":
@@ -305,7 +318,7 @@ def g_pi_training_loss(native, interface, encoder, sample, config, generators, *
         return {"action": action, "total": action}
 
 
-def g_intent_training_loss(native, interface, encoder, records, entries, config, *, uncertain_pairs=()):
+def g_intent_training_loss(native, interface, encoder, records, entries, config, *, uncertain_pairs=(), cached_targets=None):
     """Each record is (complete demo, paired robot sample or None)."""
     from .g_pi_context import demo_context_features, split_g_context_features
     from .g_pi_interface import g_goal_loss
@@ -318,7 +331,7 @@ def g_intent_training_loss(native, interface, encoder, records, entries, config,
     layer = config["goal_encoder"]["layer"]
     paired, representations = [], []
     with autocast_for(native):
-        for demonstration, sample in records:
+        for record_index, (demonstration, sample) in enumerate(records):
             if sample is None:
                 if interface.intent_mode != "regression_only":
                     features = demo_context_features(native, demonstration, config)
@@ -329,7 +342,7 @@ def g_intent_training_loss(native, interface, encoder, records, entries, config,
             if prediction["u"] is not None:
                 representations.append(prediction["u"])
             with torch.no_grad(), torch.autocast(device_type=weight.device.type, enabled=False):
-                goal = {"z": encoder(sample.target_frame), "goal_poses": sample.goal_poses.to(weight.device),
+                goal = {"z": encoder(sample.target_frame) if cached_targets is None else cached_targets[record_index].to(weight.device), "goal_poses": sample.goal_poses.to(weight.device),
                         "goal_gripper": sample.goal_gripper.to(weight.device)}
             paired.append(g_goal_loss(prediction, goal, translation_scale=interface.translation_scale,
                                       pose_weight=config["pose_weight"]))
@@ -429,6 +442,9 @@ def validate_g_pi_artifact(payload, *, kind="g_pi_training", expected_encoder_id
             or payload.get("precision") != "float32" or payload.get("encoder_precision") not in {"float32", "bfloat16"}):
         raise ValueError("expected a version-4 intent G or version-3 pi lightweight artifact (old versions cannot resume) with FP32 trainables and a shared frozen base reference")
     config = validate_g_pi_config(payload["config"])
+    from .g_pi_distributed import validate_distributed_artifact
+
+    validate_distributed_artifact(payload, kind=kind)
     _check_stage(config, payload.get("stage"))
     if config["interface_type"] == "g_translator" and payload.get("demo_route") != config.get("demo_route", "one_way"):
         raise ValueError("G demo_route differs from the recorded one_way/via_u_only architecture")
@@ -546,6 +562,10 @@ def train_g_pi_interface(args):
         config["intent_training"] = {**config.get("intent_training", {}),
                                      "manifest": str(Path(args.intent_groups).resolve())}
     config = validate_g_pi_config(config)
+    from .g_pi_distributed import distributed_settings, train_distributed_pi
+
+    if distributed_settings(config)["enabled"]:
+        return train_distributed_pi(args, config)
     stage = args.stage
     _check_stage(config, stage)
     if getattr(args, "initialize", None):
@@ -616,6 +636,19 @@ def train_g_pi_interface(args):
         raise ValueError("E weights differ from the recorded frozen encoder identity")
     if previous and frozen != previous["frozen_checksums"]:
         raise ValueError("frozen backbone checksum changed in the resumed artifact")
+    target_cache = None
+    if config.get("target_cache_index"):
+        from .g_pi_targets import load_target_cache_index
+
+        cache_path = Path(config["target_cache_index"])
+        if not cache_path.is_absolute():
+            cache_path = Path(args.config).resolve().parent / cache_path
+        target_cache = load_target_cache_index(cache_path, encoder.identity, task_paths=paths)
+        for file in target_cache.files:
+            name, digest = str(file.resolve()), file_sha256(file)
+            if name in visited and visited[name] != digest:
+                raise ValueError("consumed target cache changed before resume")
+            visited[name] = digest
     optimizer = _optimizer(native, interface, encoder, config)
     parameters = [p for group in optimizer.param_groups for p in group["params"]]
     generators = {name: torch.Generator().manual_seed(args.seed + offset)
@@ -671,9 +704,12 @@ def train_g_pi_interface(args):
                     visited[name] = digest
             optimizer.zero_grad(set_to_none=True)
             losses = (g_intent_training_loss(native, interface, encoder, records, selected, config,
-                          uncertain_pairs=table.uncertain_pairs) if table is not None else
+                          uncertain_pairs=table.uncertain_pairs,
+                          cached_targets=([target_cache.goal(record[1], entry.paired_task) if record[1] is not None else None
+                                           for record, entry in zip(records, selected)] if target_cache is not None else None)) if table is not None else
                       g_pi_training_loss(native, interface, encoder, sample, config, generators,
-                                         stage=stage, feature_layers=layers))
+                                         stage=stage, feature_layers=layers,
+                                         cached_z=target_cache.goal(sample, path) if target_cache is not None else None))
             if not torch.isfinite(losses["total"]):
                 raise ValueError("nonfinite objective; optimizer not updated")
             supervised = bool(paired_samples) or (table is not None and intent["contrastive_weight"] > 0)
@@ -765,7 +801,7 @@ def export_g_pi_policy(args, *, payload=None):
         files[filename] = file_sha256(output / filename)
         weight_map.update({key: filename for key in keys})
     excluded = {"model", "optimizer", "scheduler", "rng", "torch_rng", "cuda_rng", "python_rng", "numpy_rng",
-                "visited_arrays", "data_identity", "data_cursor"}
+                "visited_arrays", "data_identity", "data_cursor", "rank_states"}
     policy = {key: value for key, value in payload.items() if key not in excluded}
     policy.update(kind="g_pi_policy", precision="float32", requested_dtype=requested, shards=files, weight_map=weight_map,
                   source_artifact_sha256=file_sha256(args.artifact), stop_thresholds=thresholds,

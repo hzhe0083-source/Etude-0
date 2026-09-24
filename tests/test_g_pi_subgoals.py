@@ -75,6 +75,23 @@ class SubgoalSourcesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "recomputed measured"):
             self.resolve("gripper", audit, arrays, check=True)
 
+    def test_command_gripper_cannot_become_measured_grasp_evidence(self):
+        arrays, _ = self.candidate()
+        arrays["gripper"][3:8] = .1
+        with self.assertRaisesRegex(ValueError, "requires measured"):
+            generate_candidates(arrays, EventRules(signal_source="command"))
+        metadata = {"event_rules": asdict(EventRules(signal_source="command")),
+                    "gripper_signal_source": "command",
+                    "gripper_source_evidence": "fixture commanded finger target"}
+        indices, audit = resolve_subgoal_indices(metadata, arrays)
+        self.assertEqual(audit["detector_version"], "command_gripper_v1")
+        self.assertEqual(audit["evidence"], "gripper:command")
+        self.assertTrue(audit["weak_label"])
+        self.assertEqual(indices.tolist(), [4, 9, 16])
+        for source in ("sim_relation", "candidate_match"):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "command gripper"):
+                resolve_subgoal_indices({**metadata, "subgoal_source": source}, arrays)
+
     def test_sim_geometry_recomputed_and_confirmed_without_backdating(self):
         arrays, audit = self.sim()
         indices, audit = self.resolve("sim_relation", audit, arrays)

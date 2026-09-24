@@ -27,8 +27,8 @@ class EventRules:
     debounce_steps: int = 2
 
     def __post_init__(self):
-        if self.signal_source != "measured":
-            raise ValueError("G/pi events must consistently use measured gripper values")
+        if not isinstance(self.signal_source, str) or self.signal_source not in {"measured", "command"}:
+            raise ValueError("G/pi events must consistently declare measured or command gripper values")
         if (any(type(x) not in (int, float) or not math.isfinite(x)
                 for x in (self.close_threshold, self.open_threshold))
                 or not 0 <= self.close_threshold < self.open_threshold <= 1):
@@ -67,7 +67,7 @@ def initial_event_state(effectors: int) -> EventState:
 def gripper_event_step(state: EventState, values: Tensor, time: float,
                        rules: EventRules) -> tuple[EventState, tuple[GripperEvent, ...]]:
     """Confirm transitions at the current step, never backdate them to onset."""
-    validate_gripper(values, (len(state.stable),), "measured gripper")
+    validate_gripper(values, (len(state.stable),), f"{rules.signal_source} gripper")
     if (type(time) not in (int, float) or not math.isfinite(time)
             or (state.last_time is not None and time <= state.last_time)):
         raise ValueError("event time must be finite and strictly increase")
@@ -104,7 +104,7 @@ def detect_gripper_events(gripper: Tensor, times: Tensor,
                           rules: EventRules = EventRules()) -> tuple[GripperEvent, ...]:
     if gripper.ndim != 2 or min(gripper.shape) < 1:
         raise ValueError("event gripper must be nonempty [T,E]")
-    validate_gripper(gripper, tuple(gripper.shape), "measured gripper")
+    validate_gripper(gripper, tuple(gripper.shape), f"{rules.signal_source} gripper")
     _times(times, gripper.shape[0], "control times")
     detector = GripperEventDetector(gripper.shape[1], rules)
     return tuple(event for values, time in zip(gripper, times.tolist())
@@ -163,7 +163,8 @@ def _metadata(path: Path) -> dict:
     if isinstance(metadata, dict) and metadata.get("format_version") == 2:
         raise ValueError("g_pi_task version 2 is unsupported; rebuild as version 3 with auditable subgoal sources")
     if (not isinstance(metadata, dict) or required - set(metadata)
-            or set(metadata) - required - {"language", "demonstration", "compatibility", "provenance", "subgoal_source", "subgoal_annotation"}
+            or set(metadata) - required - {"language", "demonstration", "compatibility", "provenance", "subgoal_source", "subgoal_annotation",
+                                           "gripper_signal_source", "gripper_source_evidence"}
             or type(metadata.get("format_version")) is not int or metadata["format_version"] != 3
             or metadata.get("kind") != "g_pi_task"):
         raise ValueError("expected an explicit version-3 g_pi_task schema")
@@ -199,7 +200,14 @@ def _metadata(path: Path) -> dict:
         raise ValueError("alignment must be zerowam_causal_first_then_four")
     if metadata["subgoal_encoding"] != "wan_vae_single_frame":
         raise ValueError("subgoal_encoding must be wan_vae_single_frame, independently encoded from sequence history")
-    EventRules.from_metadata(metadata["event_rules"])
+    rules = EventRules.from_metadata(metadata["event_rules"])
+    signal = metadata.get("gripper_signal_source", "measured")
+    if signal != rules.signal_source:
+        raise ValueError("gripper_signal_source must explicitly agree with event_rules.signal_source")
+    if signal == "command" or "gripper_source_evidence" in metadata:
+        _text(metadata, "gripper_source_evidence")
+    if signal == "command" and metadata.get("subgoal_source", "gripper") != "gripper":
+        raise ValueError("command gripper is only valid for weak gripper events, not measured relation/grasp evidence")
     if ("demonstration" in metadata) != ("compatibility" in metadata):
         raise ValueError("paired demonstrations require task compatibility evidence")
     if "demonstration" in metadata:
@@ -305,7 +313,7 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     if poses.shape != (frames, effectors, 4, 4):
         raise ValueError("poses must be [Tc,E,4,4] on control_times in the declared end_effectors order")
     validate_se3(poses)
-    validate_gripper(gripper, (frames, effectors), "measured gripper")
+    validate_gripper(gripper, (frames, effectors), f"{metadata['event_rules']['signal_source']} gripper")
     if actions.ndim != 2 or actions.shape[0] < 1 or actions.shape[1] != frames:
         raise ValueError("task actions must be unpadded [A,Tc] commands on the control_times grid")
     space = action_space(metadata, actions.shape[0])

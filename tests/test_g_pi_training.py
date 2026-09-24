@@ -658,6 +658,50 @@ class GPiNativeTrainingTest(unittest.TestCase):
                     self.assertFalse(changed)
                 self.assertFalse(encoder.state_dict())
 
+    def test_cached_targets_preserve_updates_and_resume_without_calling_E(self):
+        from evo_wam.g_pi_context import FrozenGoalEncoder
+        from evo_wam.g_pi_targets import build_target_cache_index, load_target_cache_index
+
+        for route in ROUTES:
+            with self.subTest(route=route):
+                config = config_for(route)
+                sample = load_g_pi_sample(self.path, route=route, generator=torch.Generator().manual_seed(0))
+                native, interface, encoder, _, _ = build_g_pi_system(config, goal_registry(sample),
+                    stage=ROUTES[route], tiny_native=True, device="cuda")
+                cache_path = build_target_cache_index(self.index, self.root / f"{route}-cache", encoder)
+                cache = load_target_cache_index(cache_path, encoder.identity, task_paths=[self.path])
+                if route == "g_translator":
+                    expected = g_intent_training_loss(native, interface, encoder,
+                        [(sample.demonstration, sample)], [None], config)
+                    with patch.object(FrozenGoalEncoder, "forward", side_effect=AssertionError("E was called")):
+                        actual = g_intent_training_loss(native, interface, encoder,
+                            [(sample.demonstration, sample)], [None], config,
+                            cached_targets=[cache.goal(sample, self.path)])
+                    for key in expected:
+                        torch.testing.assert_close(expected[key], actual[key], rtol=0, atol=0)
+                del native, interface, encoder
+                baseline = read_g_pi_artifact(train_g_pi_interface(self.args(route, f"{route}-online", steps=2))["artifact"])
+
+                def arguments(output, steps=1, resume=None):
+                    args = self.args(route, output, steps=steps, resume=resume)
+                    cached_config = json.loads(Path(args.config).read_text())
+                    cached_config["target_cache_index"] = str(cache_path)
+                    Path(args.config).write_text(json.dumps(cached_config))
+                    return args
+
+                with patch.object(FrozenGoalEncoder, "forward", side_effect=AssertionError("E was called")):
+                    partial = train_g_pi_interface(arguments(f"{route}-cached"))
+                    continued = train_g_pi_interface(arguments(f"{route}-cached", resume=partial["artifact"]))
+                cached = read_g_pi_artifact(continued["artifact"])
+                for key in ("model", "optimizer", "rng", "torch_rng", "cuda_rng", "frozen_checksums"):
+                    self.assert_same(baseline[key], cached[key])
+                self.assertTrue(set(map(lambda path: str(path.resolve()), cache.files)) <= set(cached["visited_arrays"]))
+                archive = next(path for path in cache.files if path.suffix == ".npz" and path.parent == cache_path.parent)
+                with archive.open("ab") as stream:
+                    stream.write(b"changed")
+                with self.assertRaisesRegex(ValueError, "consumed training inputs changed"):
+                    train_g_pi_interface(arguments(f"{route}-cached", resume=continued["artifact"]))
+
     def test_independent_exact_resume_and_changed_arrays_rejected(self):
         for route in ROUTES:
             with self.subTest(route=route):

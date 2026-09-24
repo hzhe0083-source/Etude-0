@@ -730,6 +730,22 @@ def main(argv=None):
     goal_candidates = commands.add_parser("generate-g-pi-candidates", help="build weak subgoal labels from measured gripper and visual robot poses")
     goal_candidates.add_argument("--manifest", required=True)
     goal_candidates.add_argument("--output", required=True)
+    target_cache = commands.add_parser("cache-g-pi-targets", help="encode independently observed subgoal frames with fixed E")
+    target_cache.add_argument("--index", required=True)
+    target_base = target_cache.add_mutually_exclusive_group(required=True)
+    target_base.add_argument("--artifact", help="G/pi training artifact identifying the fixed encoder")
+    target_base.add_argument("--config", help="fresh G/pi configuration, before the first training update")
+    target_cache.add_argument("--checkpoint", help="local base checkpoint")
+    target_cache.add_argument("--tiny-native", action="store_true")
+    target_cache.add_argument("--output", required=True)
+    target_cache.add_argument("--split", choices=("train", "validation", "test"), default="train")
+    target_cache.add_argument("--device", default="cuda")
+    human_convert = commands.add_parser("convert-humangen-g-pi", help="convert audited local HumanGen robot episodes and task-paired visual caches")
+    human_convert.add_argument("--manifest", required=True)
+    human_convert.add_argument("--output", required=True)
+    human_audit = commands.add_parser("audit-humangen-g-pi", help="check published robot/human caches and report missing conversion evidence")
+    human_audit.add_argument("--manifest", required=True)
+    human_audit.add_argument("--output", required=True)
     intent_probe = commands.add_parser("probe-g-pi-intent", help="fit a held-out purpose probe on frozen demonstration-only features")
     intent_probe.add_argument("--manifest", required=True)
     intent_probe.add_argument("--output", required=True)
@@ -862,6 +878,15 @@ def main(argv=None):
         elif args.command == "generate-g-pi-candidates":
             from .g_pi_subgoals import generate_candidate_annotation
             result = generate_candidate_annotation(args.manifest, args.output)
+        elif args.command == "cache-g-pi-targets":
+            from .g_pi_targets import cache_g_pi_targets
+            result = cache_g_pi_targets(args)
+        elif args.command == "convert-humangen-g-pi":
+            from .g_pi_humangen import convert_humangen_g_pi
+            result = convert_humangen_g_pi(args)
+        elif args.command == "audit-humangen-g-pi":
+            from .g_pi_humangen import audit_humangen_g_pi
+            result = audit_humangen_g_pi(args)
         elif args.command == "probe-g-pi-intent":
             from .g_pi_probe import probe_g_pi_intent
             result = probe_g_pi_intent(args)

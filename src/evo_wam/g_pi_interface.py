@@ -265,6 +265,8 @@ class GTranslator(nn.Module):
         self.goal_decoder = goal_decoder
         self.config, self.feature_layer = dict(config), feature_layer
         self._demo_cache, self._demo_reference = None, None
+        from .g_pi_context import RobotPrefixCache
+        self._prefix_cache = RobotPrefixCache("g")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -272,17 +274,23 @@ class GTranslator(nn.Module):
 
     def clear_demo_cache(self):
         self._demo_cache, self._demo_reference = None, None
+        self.clear_context_cache()
+
+    def clear_context_cache(self):
+        self._prefix_cache.clear()
 
     @torch.no_grad()
     def cache_demo(self, demo: Tensor):
         from .g_pi_context import build_demo_cache
+        self.clear_context_cache()
         self._demo_cache = build_demo_cache(self.native, demo, self.config)
         self._demo_reference = demo.detach().clone()
         return self._demo_cache
 
     @torch.no_grad()
     def predict(self, demo: Tensor, robot_frames_t0_to_t: Tensor, state: Tensor, *,
-                current_index: int | None = None, use_cache: bool = True) -> dict[str, Tensor]:
+                current_index: int | None = None, use_cache: bool = True,
+                use_prefix_cache: bool = False) -> dict[str, Tensor]:
         from .g_pi_context import split_g_context_features
         from .goal_training import autocast_for
         if use_cache and (self._demo_reference is None or not torch.equal(demo, self._demo_reference)):
@@ -290,7 +298,8 @@ class GTranslator(nn.Module):
         with autocast_for(self.native):
             demonstration, robot = split_g_context_features(
                 self.native, demo, robot_frames_t0_to_t, self.config,
-                demo_cache=self._demo_cache if use_cache else None, current_index=current_index)
+                demo_cache=self._demo_cache if use_cache else None, current_index=current_index,
+                prefix_cache=self._prefix_cache if use_prefix_cache else None)
             result = self.goal_decoder(demonstration[self.feature_layer], robot[self.feature_layer], state)
             return {name: value for name, value in result.items() if name != "u"}
 
@@ -379,6 +388,11 @@ class PiGoalPolicy(nn.Module):
         self.register_buffer("actions_mask", actions_mask.detach().clone())
         self.generator = torch.Generator(device="cpu").manual_seed(seed)
         self.video_native.eval()
+        from .g_pi_context import RobotPrefixCache
+        self._prefix_cache = RobotPrefixCache("pi")
+
+    def clear_context_cache(self):
+        self._prefix_cache.clear()
 
     @property
     def video_native(self):
@@ -392,13 +406,15 @@ class PiGoalPolicy(nn.Module):
     @torch.no_grad()
     def predict(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor | None = None,
                 goal: dict | None = None, *,
-                current_index: int | None = None, frame_times: Tensor | None = None) -> Tensor:
+                current_index: int | None = None, frame_times: Tensor | None = None,
+                use_prefix_cache: bool = False) -> Tensor:
         from .g_pi_context import pi_context_features, truncate_robot_history
         from .goal_training import autocast_for
         if not isinstance(goal, dict):
             raise ValueError("pi requires goal; when language is omitted, pass goal as a keyword")
         history = truncate_robot_history(robot_frames_t0_to_t, current_index)
-        features = pi_context_features(self.video_native, history, self.config)
+        features = pi_context_features(self.video_native, history, self.config,
+            prefix_cache=self._prefix_cache if use_prefix_cache else None)
         if frame_times is None:
             interval = self.config.get("latent_frame_dt", getattr(self.interface, "latent_frame_dt", None))
             if interval is None:

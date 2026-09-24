@@ -1,7 +1,7 @@
 """Frozen clean-video features and visual-goal rules over one shared base."""
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 
@@ -212,16 +212,108 @@ class DemoCache:
     keys_values: tuple
 
 
+@dataclass
+class RobotPrefixCache:
+    """Task-local closed-chunk K/V; G and pi never exchange this state."""
+
+    owner: str
+    identity: tuple | None = None
+    observed_frames: int = 0
+    history_hash: str | None = None
+    closed_frames: int = 0
+    features: dict = field(default_factory=dict)
+    keys_values: tuple = ()
+    demo_cache: DemoCache | None = None
+    processed_tokens: int = 0
+    last_processed_tokens: int = 0
+
+    def __post_init__(self):
+        if self.owner not in ("g", "pi"):
+            raise ValueError("robot prefix cache owner must be g or pi")
+
+    def clear(self):
+        self.identity, self.history_hash = None, None
+        self.observed_frames, self.closed_frames = 0, 0
+        self.features, self.keys_values, self.demo_cache = {}, (), None
+        self.processed_tokens, self.last_processed_tokens = 0, 0
+
+
+def _prefix_identity(native, demonstration, history, config, owner):
+    return (owner, id(native), _versions(native),
+            json.dumps(_json_identity(config), sort_keys=True),
+            json.dumps(_json_identity(getattr(native, "g_pi_empty_text_identity", None)), sort_keys=True),
+            None if demonstration is None else _tensor_hash(demonstration),
+            tuple(history.shape[:2]) + tuple(history.shape[3:]),
+            str(history.dtype), str(history.device))
+
+
+def _prefix_context(native, demonstration, history, config, cache, *, owner,
+                    demo_cache=None, conditioned=True):
+    """Only unseen/unfinished chunks enter native; validation precedes reuse."""
+    if not isinstance(cache, RobotPrefixCache) or cache.owner != owner:
+        raise ValueError("robot prefix cache owner mismatch; G and pi require separate caches")
+    assert_frozen_base(native)
+    _validate_config(native, config)
+    _validate_video(native, history, "history")
+    if "goal_encoder" in config:
+        _validate_camera_canvas(native, history, config["goal_encoder"].get("camera_layout"))
+    if demonstration is not None:
+        _validate_video(native, demonstration, "demonstration")
+    identity = _prefix_identity(native, demonstration, history, config, owner)
+    if cache.identity is not None and cache.identity != identity:
+        raise ValueError("robot prefix cache identity mismatch; clear it after changing base, demo, route, or config")
+    if (cache.observed_frames > history.shape[2] or (cache.observed_frames and
+            _tensor_hash(history[:, :, :cache.observed_frames]) != cache.history_hash)):
+        raise ValueError("robot prefix cache history mismatch; clear it when resetting or changing a task prefix")
+    actual_demo = demonstration if conditioned else None
+    if demonstration is not None:
+        if demo_cache is None:
+            demo_cache = cache.demo_cache or build_demo_cache(native, demonstration, config)
+        # Validate even when all queried robot frames are already cached.
+        demo_context_features(native, demonstration, config, demo_cache=demo_cache)
+    elif demo_cache is not None:
+        raise ValueError("robot-only prefix context cannot read a demonstration cache")
+    context_demo_cache = demo_cache if conditioned else None
+    spatial = (history.shape[3] // native.patch_size[1]) * (history.shape[4] // native.patch_size[2])
+    processed = (history.shape[2] - cache.closed_frames) * spatial
+    if processed:
+        features, keys_values = _context(native, actual_demo, history, config,
+            demo_cache=context_demo_cache, robot_prefix=cache, cache_robot=True)
+    else:
+        features = {layer: (value if context_demo_cache is None else
+                    torch.cat((context_demo_cache.features[layer], value), dim=1))
+                    for layer, value in cache.features.items()}
+        keys_values = cache.keys_values
+    closed_frames = history.shape[2] // config["chunk_size"] * config["chunk_size"]
+    demo_tokens = 0 if context_demo_cache is None else context_demo_cache.tokens
+    if closed_frames > cache.closed_frames:
+        closed_tokens = closed_frames * spatial
+        cache.features = {layer: value[:, demo_tokens:demo_tokens + closed_tokens].clone()
+                          for layer, value in features.items()}
+        cache.keys_values = tuple((key[:, demo_tokens:demo_tokens + closed_tokens].clone(),
+                                   value[:, demo_tokens:demo_tokens + closed_tokens].clone())
+                                  for key, value in keys_values)
+    cache.identity, cache.demo_cache = identity, demo_cache
+    cache.closed_frames, cache.observed_frames = closed_frames, history.shape[2]
+    cache.history_hash = _tensor_hash(history)
+    cache.last_processed_tokens = processed
+    cache.processed_tokens += processed
+    return features
+
+
 @torch.no_grad()
-def _context(native, demonstration, history, config, *, demo_cache=None, cache_demo=False):
+def _context(native, demonstration, history, config, *, demo_cache=None, cache_demo=False,
+             robot_prefix=None, cache_robot=False):
     # Native FlexAttention produces bf16 values even with fp32 checkpoint weights.
     device_type = native.patch_embedding_mlp.weight.device.type
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
         return _context_impl(native, demonstration, history, config,
-                             demo_cache=demo_cache, cache_demo=cache_demo)
+                             demo_cache=demo_cache, cache_demo=cache_demo,
+                             robot_prefix=robot_prefix, cache_robot=cache_robot)
 
 
-def _context_impl(native, demonstration, history, config, *, demo_cache=None, cache_demo=False):
+def _context_impl(native, demonstration, history, config, *, demo_cache=None, cache_demo=False,
+                  robot_prefix=None, cache_robot=False):
     assert_frozen_base(native)
     _validate_config(native, config)
     if not hasattr(native, "g_pi_empty_text") or not hasattr(native, "g_pi_empty_text_identity"):
@@ -253,12 +345,13 @@ def _context_impl(native, demonstration, history, config, *, demo_cache=None, ca
     demo_tokens = (0 if demonstration is None else
                    demonstration.shape[2] * (demonstration.shape[3] // ph) * (demonstration.shape[4] // pw))
     spatial = 1 if history is None else (history.shape[3] // ph) * (history.shape[4] // pw)
-    offset = demo_tokens if demo_cache is not None else 0
+    closed_frames = 0 if robot_prefix is None else robot_prefix.closed_frames
+    offset = (demo_tokens if demo_cache is not None else 0) + closed_frames * spatial
     streams = []
     if demonstration is not None and demo_cache is None:
-        streams.append((demonstration, config["icl_rope_h"]))
+        streams.append((demonstration, config["icl_rope_h"], 0))
     if history is not None:
-        streams.append((history, 0))
+        streams.append((history[:, :, closed_frames:], 0, closed_frames))
     modes = [(module, module.training) for module in native.modules()]
     previous = [(block.attn1.self_block_mask, block.attn2.cross_block_mask,
                  block.attn1.attn_caches.get("g_pi_context")) for block in native.blocks]
@@ -267,15 +360,17 @@ def _context_impl(native, demonstration, history, config, *, demo_cache=None, ca
     try:
         native.eval()
         hidden_parts, projection_parts, grids = [], [], []
-        for video, shift in streams:
+        for video, shift, frame_offset in streams:
             video = video.detach().to(weight)
             frames, height, width = video.shape[-3:]
             timestep = torch.zeros(1, frames, device=weight.device, dtype=torch.float32)
             hidden, _, projection = native._training_embed(video, timestep, "video")
             hidden_parts.append(hidden)
             projection_parts.append(projection)
-            grids.append(get_mesh_id(frames, height // ph, width // pw, 0,
-                                     h_shift=shift).to(weight.device))
+            grid = get_mesh_id(frames, height // ph, width // pw, 0,
+                               h_shift=shift).to(weight.device)
+            grid[0] += frame_offset
+            grids.append(grid)
         hidden = torch.cat(hidden_parts, dim=1)
         projection = torch.cat(projection_parts, dim=1)
         count = hidden.shape[1]
@@ -313,21 +408,31 @@ def _context_impl(native, demonstration, history, config, *, demo_cache=None, ca
         ICLAttentionBackend.self_mask, ICLAttentionBackend.cross_mask = self_mask, cross_mask
         for index, block in enumerate(native.blocks):
             block.attn1.clear_cache("g_pi_context")
+            prefix_parts = []
             if demo_cache is not None:
-                key, value = demo_cache.keys_values[index]
+                prefix_parts.append(demo_cache.keys_values[index])
+            if closed_frames:
+                prefix_parts.append(robot_prefix.keys_values[index])
+            if prefix_parts:
+                key, value = (torch.cat([pair[axis] for pair in prefix_parts], dim=1)
+                              for axis in range(2))
                 block.attn1.attn_caches["g_pi_context"] = {"k": key, "v": value}
             block.attn1.self_block_mask = self_mask
             block.attn2.cross_block_mask = cross_mask
             hidden, _ = block(hidden, None, pad, text_hidden, projection, None, rotary,
-                              update_cache=int(cache_demo), cache_name="g_pi_context")
+                              update_cache=int(cache_demo or cache_robot), cache_name="g_pi_context")
             if (hidden.shape != (1, count, native.inner_dim) or not torch.isfinite(hidden).all()):
                 raise ValueError("native block must return finite packed G/pi context features")
-            features[index] = (hidden if demo_cache is None else
-                               torch.cat((demo_cache.features[index], hidden), dim=1))
-            if cache_demo:
+            feature_parts = []
+            if demo_cache is not None:
+                feature_parts.append(demo_cache.features[index])
+            if closed_frames:
+                feature_parts.append(robot_prefix.features[index])
+            features[index] = torch.cat((*feature_parts, hidden), dim=1) if feature_parts else hidden
+            if cache_demo or cache_robot:
                 cached = block.attn1.attn_caches["g_pi_context"]
-                keys_values.append((cached["k"][:, :demo_tokens].clone(),
-                                    cached["v"][:, :demo_tokens].clone()))
+                keep = demo_tokens if cache_demo else offset + count
+                keys_values.append((cached["k"][:, :keep].clone(), cached["v"][:, :keep].clone()))
         return features, tuple(keys_values)
     finally:
         for block, (self_mask, cross_mask, previous_cache) in zip(native.blocks, previous):
@@ -346,11 +451,15 @@ def build_demo_cache(native, demonstration, config):
                      config["icl_rope_h"], features[0].shape[1], features, keys_values)
 
 
-def g_context_features(native, demonstration, history, config, *, demo_cache=None, current_index=None):
+def g_context_features(native, demonstration, history, config, *, demo_cache=None, current_index=None,
+                       prefix_cache=None):
     """Read [demo, observed robot]; calls sharing one native must be sequential."""
     if demonstration is None:
         raise ValueError("G context requires a complete task demonstration")
     history = truncate_robot_history(history, current_index)
+    if prefix_cache is not None:
+        return _prefix_context(native, demonstration, history, config, prefix_cache,
+                               owner="g", demo_cache=demo_cache)
     return _context(native, demonstration, history, config, demo_cache=demo_cache)[0]
 
 
@@ -372,25 +481,34 @@ def demo_context_features(native, demonstration, config, *, demo_cache=None):
 
 
 def split_g_context_features(native, demonstration, history, config, *, demo_cache=None,
-                             current_index=None):
+                             current_index=None, prefix_cache=None):
     """Split frozen demo/robot memories; optionally isolate the entire u path."""
+    if demonstration is None:
+        raise ValueError("G context requires a complete task demonstration")
     route = config.get("demo_route", "one_way")
     if route not in ("one_way", "via_u_only"):
         raise ValueError("demo_route must be one_way or via_u_only")
     history = truncate_robot_history(history, current_index)
     if route == "via_u_only":
+        if prefix_cache is not None:
+            robot = _prefix_context(native, demonstration, history, config, prefix_cache,
+                                    owner="g", demo_cache=demo_cache, conditioned=False)
+            return prefix_cache.demo_cache.features, robot
         demo = demo_context_features(native, demonstration, config, demo_cache=demo_cache)
         return demo, pi_context_features(native, history, config)
-    features = g_context_features(native, demonstration, history, config, demo_cache=demo_cache)
+    features = g_context_features(native, demonstration, history, config, demo_cache=demo_cache,
+                                  prefix_cache=prefix_cache)
     _, ph, pw = native.patch_size
     count = demonstration.shape[2] * (demonstration.shape[3] // ph) * (demonstration.shape[4] // pw)
     return ({layer: value[:, :count] for layer, value in features.items()},
             {layer: value[:, count:] for layer, value in features.items()})
 
 
-def pi_context_features(native, history, config, *, current_index=None):
+def pi_context_features(native, history, config, *, current_index=None, prefix_cache=None):
     """Read only observed robot frames using chunk-causal attention."""
     history = truncate_robot_history(history, current_index)
+    if prefix_cache is not None:
+        return _prefix_context(native, None, history, config, prefix_cache, owner="pi")
     return _context(native, None, history, config)[0]
 
 

@@ -43,3 +43,20 @@ class GPiCLIEntryTest(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(run.call_args.args[0].device, "cpu")
             self.assertTrue(getattr(run.call_args.args[0], attribute))
+
+    def test_target_cache_config_and_humangen_commands_dispatch(self):
+        with patch("evo_wam.g_pi_targets.cache_g_pi_targets", return_value={}) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            status = main(["cache-g-pi-targets", "--index", "index.json", "--config", "pi.json",
+                           "--tiny-native", "--split", "validation", "--output", "cache"])
+        self.assertEqual(status, 0)
+        self.assertTrue(run.call_args.args[0].tiny_native)
+        self.assertEqual(run.call_args.args[0].split, "validation")
+        self.assertIsNone(run.call_args.args[0].artifact)
+        for command, name in (("convert-humangen-g-pi", "convert_humangen_g_pi"),
+                              ("audit-humangen-g-pi", "audit_humangen_g_pi")):
+            with self.subTest(command=command), patch(f"evo_wam.g_pi_humangen.{name}", return_value={}) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                status = main([command, "--manifest", "conversion.json", "--output", "converted"])
+            self.assertEqual(status, 0)
+            self.assertEqual(run.call_args.args[0].manifest, "conversion.json")

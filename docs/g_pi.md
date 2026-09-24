@@ -1,8 +1,10 @@
-# G（做什么）与 π（怎么做）：阶段 A 与 B
+# G（做什么）与 π（怎么做）：阶段 A、B、C
 
 本轮实现 A2–A7；**A1 已取消**。G 不读任务文字，视觉 DiT 始终使用原生空提示词。π 保留 `main@88df563` 的语言指令通路：LIT 读 `[L,s,g]`，动作专家读 `[L,s,Z_l]`。A7 新增可关闭的语言置空消融与无语言推理，默认 `p_drop=0`；默认语言选择与传递路径不变。
 
 阶段 B 已加入目的分组对比学习、冻结探针和离线评测，见 [阶段 B 使用说明](g_pi_intent.md)。G 保留单向示范→机器人交互作为默认，另提供 `via_u_only` 消融；π 的阶段 A 行为不变。
+
+阶段 C 的独立前缀缓存、E 离线目标缓存、π FSDP 与 HumanGen 转换/预检见 [阶段 C 使用说明](g_pi_scaling.md)。
 
 示范只进入 G；π 的动作学习只使用成功机器人录像。不做人机动作、阶段或帧对齐，没有 done 头、未来视频损失或联合训练。关系名、物体状态、关系序号和标定分组均为离线标签，不能进入模型。旧 `latent`、`direct_features`、`observed_dual`、H0–H3 路线保留原契约。
 
@@ -154,7 +156,7 @@ checkpoint（G v4、π v3）仍只保存可训练 interface/action 权重、优�
 
 v3 observation 的公共元数据保留机器人动作/坐标/两网格约定；NPZ 只有 state、history_latent、latent_available_times。当前控制步可以位于两个 latent 之间，但历史只能含完整已可用前缀。G 观测提供 demonstration，π 提供 goal 文件及可选 language；关系、物体状态、阶段索引等字段均被拒绝。
 
-阶段 B 的换示范/错误目标评测默认使用空语言，并记录语言条件；具体工具见 [阶段 B 使用说明](g_pi_intent.md)。多时刻前缀缓存、目标缓存训练加速、FSDP 与 HumanGen 转换器留待阶段 C。
+阶段 B 的换示范/错误目标评测默认使用空语言，并记录语言条件；具体工具见 [阶段 B 使用说明](g_pi_intent.md)。缓存、FSDP 与数据转换的可用范围及真实数据缺项见 [阶段 C](g_pi_scaling.md)。
 
 ```bash
 taskset -c 0 .venv/bin/python -m unittest discover -s tests -q

@@ -97,8 +97,8 @@ def _inputs(arrays):
     _times(times, len(times), "control_times")
     poses, grip = arrays.get("poses"), arrays.get("gripper")
     if not isinstance(grip, Tensor) or grip.ndim != 2 or grip.shape[0] != len(times):
-        raise ValueError("subgoal evidence requires measured gripper [Tc,E]")
-    validate_gripper(grip, tuple(grip.shape), "measured gripper")
+        raise ValueError("subgoal evidence requires recorded gripper [Tc,E]")
+    validate_gripper(grip, tuple(grip.shape), "recorded gripper")
     if not isinstance(poses, Tensor) or poses.shape != (len(times), grip.shape[1], 4, 4):
         raise ValueError("subgoal evidence requires poses [Tc,E,4,4]")
     validate_se3(poses)
@@ -180,7 +180,7 @@ def generate_candidates(arrays: Mapping[str, Tensor], event_rules, thresholds=No
     from .g_pi_data import EventRules, detect_gripper_events
 
     rules = EventRules.from_metadata(event_rules) if isinstance(event_rules, dict) else event_rules
-    if not isinstance(rules, EventRules):
+    if not isinstance(rules, EventRules) or rules.signal_source != "measured":
         raise ValueError("candidate generation requires measured event_rules")
     if type(stable_steps) is not int or stable_steps < 1:
         raise ValueError("candidate stable_steps must be a positive integer")
@@ -281,12 +281,21 @@ def resolve_subgoal_indices(metadata: Mapping, arrays: Mapping[str, Tensor], *, 
         raise ValueError("subgoal_source must be gripper, sim_relation, pedal or candidate_match")
     times, poses, grip = _inputs(arrays)
     annotation = metadata.get("subgoal_annotation")
+    rules = EventRules.from_metadata(metadata["event_rules"])
+    if rules.signal_source == "command":
+        if metadata.get("gripper_signal_source") != "command":
+            raise ValueError("command events require explicit gripper_signal_source=command")
+        _string(metadata.get("gripper_source_evidence"), "gripper_source_evidence")
+        if source != "gripper":
+            raise ValueError("command gripper cannot establish measured candidate or visual relation evidence")
     if source == "gripper":
-        rules = EventRules.from_metadata(metadata["event_rules"])
         indices = subgoal_control_indices(grip, times, rules).tolist()
-        audit = {"detector_version": VERSIONS[source], "thresholds": asdict(rules),
+        version = VERSIONS[source] if rules.signal_source == "measured" else "command_gripper_v1"
+        audit = {"detector_version": version, "thresholds": asdict(rules),
                  "stable_steps": rules.debounce_steps, "control_indices": indices,
-                 "evidence": "gripper:measured", "weak_label": True}
+                 "evidence": f"gripper:{rules.signal_source}", "weak_label": True}
+        if rules.signal_source == "command":
+            audit["source_evidence"] = metadata["gripper_source_evidence"]
         if annotation is not None and annotation != audit:
             raise ValueError("gripper subgoal_annotation must match recomputed measured event rules and indices")
         return torch.tensor(indices, dtype=torch.long), audit

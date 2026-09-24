@@ -111,7 +111,7 @@ class GripperEventsTest(unittest.TestCase):
                 next_subgoal_time(time, 6., events)
 
     def test_invalid_rules_and_signals(self):
-        for values in ({"signal_source": "command"}, {"close_threshold": .8}, {"debounce_steps": True},
+        for values in ({"signal_source": "unknown"}, {"close_threshold": .8}, {"debounce_steps": True},
                        {"debounce_steps": 0}, {"open_threshold": float("nan")}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 EventRules(**values)
@@ -333,6 +333,26 @@ class GPiDataTest(unittest.TestCase):
         for times in (arrays["control_times"] + .1, arrays["control_times"] * 2):
             self.save(path, metadata, {**arrays, "control_times": times})
             with self.assertRaisesRegex(ValueError, "every control step"):
+                load_g_pi_sample(path, current_time=.4)
+
+    def test_command_gripper_requires_explicit_evidence_and_remains_weak(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        metadata["event_rules"]["signal_source"] = "command"
+        metadata["gripper_signal_source"] = "command"
+        self.save(path, metadata, arrays)
+        with self.assertRaisesRegex(ValueError, "gripper_source_evidence"):
+            load_g_pi_sample(path, current_time=.4)
+        metadata["gripper_source_evidence"] = "fixture collector stores commanded finger target"
+        self.save(path, metadata, arrays)
+        sample = load_g_pi_sample(path, current_time=.4)
+        self.assertEqual(sample.metadata["gripper_signal_source"], "command")
+        self.assertEqual(sample.metadata["subgoal_annotation"]["detector_version"], "command_gripper_v1")
+        self.assertTrue(sample.metadata["subgoal_annotation"]["weak_label"])
+        self.assertEqual(sample.metadata["subgoal_annotation"]["source_evidence"], metadata["gripper_source_evidence"])
+        torch.testing.assert_close(sample.goal_gripper, torch.ones(1, 1), rtol=0, atol=0)
+        for source in ("candidate_match", "sim_relation", "pedal"):
+            self.save(path, {**metadata, "subgoal_source": source}, arrays)
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "command gripper"):
                 load_g_pi_sample(path, current_time=.4)
 
     def test_rejects_latents_before_raw_coverage_is_available_and_missing_history(self):

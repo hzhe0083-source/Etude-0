@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "kind": "se3_goal_experiment",
+  "synthetic_dimensions_only": true,
+  "interface_type": "g_translator",
+  "human_context": "cross_video",
+  "domain_schedule": [
+    "robot"
+  ],
+  "lambda_human": 1.0,
+  "training": {
+    "max_steps": 1000,
+    "learning_rate": 0.0001,
+    "gradient_clip": 1.0
+  },
+  "chunk_size": 2,
+  "max_frame_chunk_size": 4,
+  "window_size": 32,
+  "icl_rope_h": 24,
+  "video_snr_shift": 5.0,
+  "mcp_snr_shift": 10.0,
+  "ifp": {
+    "enabled": false,
+    "loss_weights": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "future_chunk_stride": 2
+  },
+  "goal_interface": {
+    "state_dim": 4,
+    "dim": 768,
+    "num_heads": 8,
+    "num_layers": 2,
+    "translation_scale": 1.0,
+    "use_state": true
+  },
+  "action_sampling_steps": 4,
+  "pose_weight": 1.0,
+  "video_weight": 0.0,
+  "goal_encoder": {
+    "layer": 1,
+    "k_z": 8
+  },
+  "event_rules": {
+    "signal_source": "measured",
+    "close_threshold": 0.25,
+    "open_threshold": 0.75,
+    "debounce_steps": 2
+  },
+  "goal_noise": {
+    "z_std": 0.0,
+    "translation_std": 0.0,
+    "rotation_std": 0.0,
+    "gripper_std": 0.0
+  }
+}

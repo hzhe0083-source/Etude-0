@@ -24,16 +24,25 @@ from .video_data import patch_grid_coordinates, _source_components, _local_path
 from .zerowam import ZERO_WAM_COMMIT, load_native_class
 
 
-STAGES = {"goal", "visual", "joint"}
+STAGES = {"goal", "visual", "joint", "g", "pi"}
+G_PI_ROUTES = {"g_translator", "pi_goal"}
 ARCHITECTURE = "recurrent_goal_full_v2"
 OBSERVED_ARCHITECTURE = "observed_goal_dual_v1"
 
 
 def goal_architecture(config):
+    if config.get("interface_type") in G_PI_ROUTES:
+        from .g_pi_training import g_pi_architecture
+        return g_pi_architecture(config)
     return OBSERVED_ARCHITECTURE if config.get("interface_type") == "observed_dual" else ARCHITECTURE
 
 
 def _check_stage(config, stage):
+    if config["interface_type"] in G_PI_ROUTES:
+        expected = "g" if config["interface_type"] == "g_translator" else "pi"
+        if stage != expected:
+            raise ValueError(f"interface_type {config['interface_type']} requires stage {expected}")
+        return
     allowed = {"joint"} if config["interface_type"] == "observed_dual" else {"goal", "visual"}
     if stage not in allowed:
         raise ValueError(f"interface_type {config['interface_type']} requires stage {sorted(allowed)}")
@@ -67,6 +76,9 @@ def load_goal_config(path):
 
 
 def validate_goal_config(config):
+    if isinstance(config, dict) and config.get("interface_type") in G_PI_ROUTES:
+        from .g_pi_training import validate_g_pi_config
+        return validate_g_pi_config(config)
     if (not isinstance(config, dict) or config.get("kind") != "se3_goal_experiment"
             or config.get("schema_version") != 2 or "lora" in config):
         raise ValueError("expected version-2 full-parameter se3_goal_experiment without LoRA")
@@ -108,8 +120,11 @@ def validate_goal_config(config):
 def goal_registry(sample):
     keys = ("state_space_id", "coordinate_frame", "pose_units", "pose_representation", "tool_frames",
             "end_effectors", "gripper_space", "goal_source", "action_space", "control_dt")
-    return {**{key: sample.metadata[key] for key in keys}, "actions_per_frame": sample.actions.shape[3],
-            "language_identity": sample.language_identity}
+    registry = {**{key: sample.metadata[key] for key in keys}, "actions_per_frame": sample.actions.shape[3],
+                "language_identity": sample.language_identity}
+    if "event_rules" in sample.metadata:
+        registry["event_rules"] = sample.metadata["event_rules"]
+    return registry
 
 
 def _interface(native, config, registry):
@@ -149,6 +164,10 @@ def _set_training(native, interface, stage, interface_type):
 
 
 def build_goal_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda"):
+    if config.get("interface_type") in G_PI_ROUTES:
+        from .g_pi_training import build_g_pi_system
+        return build_g_pi_system(config, registry, stage=stage, checkpoint=checkpoint,
+                                 tiny_native=tiny_native, device=device)
     _check_stage(config, stage)
     native, _, identity = build_icl_model(config, checkpoint=checkpoint, tiny_native=tiny_native,
                                         device=device, adaptation=False, dtype=torch.float32)
@@ -261,6 +280,10 @@ def _clear_video_cache(native):
 
 
 def goal_training_loss(native, interface, unused, sample, config, generators, *, stage, feature_layers):
+    if config.get("interface_type") in G_PI_ROUTES:
+        from .g_pi_training import g_pi_training_loss
+        return g_pi_training_loss(native, interface, unused, sample, config, generators,
+                                  stage=stage, feature_layers=feature_layers)
     del unused
     _check_stage(config, stage)
     device = native.action_embedder.weight.device
@@ -337,6 +360,9 @@ def _restore_system(native, interface, model, tiny=None):
 
 def read_goal_artifact(path, kind="se3_goal_training"):
     payload = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(payload, dict) and payload.get("kind") == "g_pi_training":
+        from .g_pi_training import read_g_pi_artifact
+        return read_g_pi_artifact(path, payload=payload)
     if (not isinstance(payload, dict) or payload.get("format_version") != 2
             or payload.get("kind") != kind or not isinstance(payload.get("config"), dict)
             or payload.get("architecture") != goal_architecture(payload["config"])
@@ -371,6 +397,9 @@ def _sample_files(path, sample):
 
 def train_goal_interface(args):
     config, stage = load_goal_config(args.config), args.stage
+    if config["interface_type"] in G_PI_ROUTES:
+        from .g_pi_training import train_g_pi_interface
+        return train_g_pi_interface(args)
     if stage not in STAGES or args.resume and args.initialize:
         raise ValueError("choose a stage and either resume or initialize")
     _check_stage(config, stage)
@@ -505,6 +534,9 @@ def export_goal_policy(args):
     from safetensors.torch import save_file
 
     payload = read_goal_artifact(args.artifact)
+    if payload["config"]["interface_type"] in G_PI_ROUTES:
+        from .g_pi_training import export_g_pi_policy
+        return export_g_pi_policy(args, payload=payload)
     _require_trained_policy(payload)
     output = Path(args.output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
@@ -540,6 +572,9 @@ def load_goal_policy(path, *, device="cuda"):
 
     folder = Path(path)
     payload = json.loads((folder / "policy.json").read_text())
+    if payload.get("kind") == "g_pi_policy":
+        from .g_pi_training import load_g_pi_policy
+        return load_g_pi_policy(path, device=device)
     if (payload.get("kind") != "se3_goal_policy" or payload.get("format_version") != 2
             or not isinstance(payload.get("config"), dict)
             or payload.get("architecture") != goal_architecture(payload["config"])
@@ -619,6 +654,10 @@ def predict_goal_actions(native, interface, unused, payload, observation, *, see
 
 
 def predict_goal_cli(args):
+    manifest = json.loads((Path(args.policy) / "policy.json").read_text())
+    if manifest.get("kind") == "g_pi_policy":
+        from .g_pi_deployment import predict_g_pi_cli
+        return predict_g_pi_cli(args)
     output = Path(args.output)
     if output.exists() or output.suffix != ".npz":
         raise ValueError("prediction requires a fresh .npz output path")

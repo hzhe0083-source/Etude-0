@@ -73,7 +73,8 @@ def validate_icl_config(config, *, adaptation=True):
     return config
 
 
-def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda", adaptation=True, dtype=None):
+def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda", adaptation=True, dtype=None,
+                    empty_text_path=None):
     cls = load_native_class()
     dtype = dtype or (torch.bfloat16 if str(device).startswith("cuda") else torch.float32)
     if tiny_native:
@@ -100,10 +101,15 @@ def build_icl_model(config, *, checkpoint=None, tiny_native=False, device="cuda"
             for p in [folder / "config.json", *weights, *sorted(folder.glob("*.safetensors.index.json"))]}}
         native = cls.from_pretrained(str(folder), local_files_only=True, use_safetensors=True,
                                     torch_dtype=dtype).to(device)
-        null = torch.load(DEFAULT_SOURCE / "wan_va/assets/empty_text_emb.pt", weights_only=True, map_location=device)[None]
+        empty_path = Path(empty_text_path) if empty_text_path is not None else DEFAULT_SOURCE / "wan_va/assets/empty_text_emb.pt"
+        null = torch.load(empty_path, weights_only=True, map_location=device)
+        if isinstance(null, torch.Tensor) and null.ndim == 2:
+            null = null[None]
     if config["ifp"]["enabled"] and (not native.enable_mcp or len(native.mcp_blocks) != len(config["ifp"]["loss_weights"])):
         raise ValueError("IFP weights must match the native checkpoint's MCP groups")
-    if null.ndim != 3 or null.shape[-1] != native.config.text_dim or not torch.isfinite(null).all():
+    if (not isinstance(null, torch.Tensor) or null.ndim != 3 or null.shape[0] != 1
+            or null.shape[1] < 1 or null.shape[-1] != native.config.text_dim
+            or not null.is_floating_point() or not torch.isfinite(null).all()):
         raise ValueError("native empty-text embedding does not match the checkpoint")
     if adaptation:
         install_icl_lora(native, **config["lora"])

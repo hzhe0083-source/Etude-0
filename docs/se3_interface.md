@@ -2,6 +2,8 @@
 
 This page describes the retained two-stage **generated-future** comparison (`latent` / `direct_features`). The current direct observed-context route uses a single `joint` stage with no video generation or video loss; see [observed_context.md](observed_context.md).
 
+Independent task translation and goal policy: [G + π first version](g_pi.md).
+
 This experiment adapts Zero-WAM to interpret a compatible demonstration in the **target robot's current scene**. It uses a LIT-style soft latent interface, explicit language, and the target robot's endpoint pose, gripper state, and action labels. It is a modified experiment initialized from pretrained Zero-WAM, not an exact LIT reproduction or evidence of cross-view transfer.
 
 Each query represents exactly the **next action block**, with one group of recurrent interface tokens. The native execution path currently requires batch size 1. This route does not add subgoal segmentation, completion detection, additional action history, or the archived B/P, G/Q, F, and temporal demonstration compressors.

@@ -76,8 +76,10 @@ def worker():
     fixture = GPiNativeTrainingTest("test_independent_exact_resume_and_changed_arrays_rejected")
     fixture.setUp()
     try:
+        prior = train_g_pi_interface(fixture.stage_args("pi_prior", "fsdp-prior"))
         def args(output, steps=1, resume=None, ac=True):
-            value = fixture.args("pi_goal", output, steps=steps, resume=resume)
+            value = fixture.stage_args("pi", output, steps=steps, resume=resume,
+                                       initialize=None if resume else prior["artifact"])
             config = json.loads(Path(value.config).read_text())
             config["distributed"] = {"enabled": True, "activation_checkpointing": ac}
             Path(value.config).write_text(json.dumps(config))
@@ -93,6 +95,10 @@ def worker():
         fixture.assertEqual(full["distributed"]["world_size"], 1)
         fixture.assertEqual(set(full["model"]), {"interface", "action"})
         fixture.assertTrue(full["model"]["action"])
+        fixture.assertTrue(any(key.startswith("pose_decoder.") for key in full["model"]["interface"]))
+        fixture.assertFalse(any(key.startswith("endpoint_encoder.") for key in full["model"]["interface"]))
+        fixture.assertTrue(full["pi_training"]["goal_noise_enabled"])
+        fixture.assertIsNotNone(full["stage1_artifact_sha256"])
         fixture.assertFalse(any("_checkpoint_wrapped_module" in name for values in full["model"].values() for name in values))
         fixture.assertFalse(any("patch_embedding" in name for name in full["optimizer"]["state"]))
         fixture.assertTrue(all(value.dtype == torch.float32 for values in full["model"].values() for value in values.values()))

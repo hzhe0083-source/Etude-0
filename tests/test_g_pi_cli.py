@@ -44,6 +44,20 @@ class GPiCLIEntryTest(unittest.TestCase):
             self.assertEqual(run.call_args.args[0].device, "cpu")
             self.assertTrue(getattr(run.call_args.args[0], attribute))
 
+    def test_pi_prior_stage_and_noise_calibration_entry_points(self):
+        config = Path(__file__).parents[1] / "configs/se3/pi_prior.json"
+        with patch("evo_wam.g_pi_training.train_g_pi_interface", return_value={}) as train, \
+                contextlib.redirect_stdout(io.StringIO()):
+            status = main(["train-goal-interface", "--config", str(config), "--index", "index.json",
+                           "--stage", "pi_prior", "--tiny-native", "--output", "prior"])
+        self.assertEqual(status, 0)
+        self.assertEqual(train.call_args.args[0].stage, "pi_prior")
+        with patch("evo_wam.g_pi_noise.calibrate_g_pi_noise", return_value={}) as calibrate, \
+                contextlib.redirect_stdout(io.StringIO()):
+            status = main(["calibrate-g-pi-noise", "--manifest", "validation.json", "--output", "noise.json"])
+        self.assertEqual(status, 0)
+        self.assertEqual(calibrate.call_args.args[0].manifest, "validation.json")
+
     def test_target_cache_config_and_humangen_commands_dispatch(self):
         with patch("evo_wam.g_pi_targets.cache_g_pi_targets", return_value={}) as run, \
                 contextlib.redirect_stdout(io.StringIO()):

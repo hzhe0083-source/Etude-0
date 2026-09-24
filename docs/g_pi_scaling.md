@@ -2,6 +2,8 @@
 
 接续 [基础接口](g_pi.md)与[意图训练和评测](g_pi_intent.md)。默认仍是 `one_way`，G 不读任务文字，π 保留语言且 `p_drop=0`。本轮不改变训练目标、不增加 LoRA、done 头或在线执行。
 
+阶段 D 已为 π 增加非视觉 prior 和干净块终点监督，π 工件升级 v4；本页缓存/FSDP机制继续适用，新的初始化和噪声契约见 [阶段 D](g_pi.md#d子目标输入与块终点监督)。
+
 ## C1：任务内前缀与 E 目标缓存
 
 连续离线推理可以显式开启：
@@ -45,7 +47,8 @@ E 目标可在训练前离线生成，不需要先训练一个模型：
 taskset -c 0 .venv/bin/python -m torch.distributed.run --standalone \
   --nproc_per_node=1 -m evo_wam.cli train-goal-interface \
   --config configs/se3/pi_goal_fsdp.json --index /data/pi-index.json \
-  --stage pi --tiny-native --steps 2 --device cuda --output /tmp/evo-pi-fsdp
+  --stage pi --initialize /tmp/evo-pi-prior/goal_interface.pt \
+  --tiny-native --steps 2 --device cuda --output /tmp/evo-pi-fsdp
 # 四卡机器使用 --nproc_per_node=4，实际维度配置和本地 --checkpoint；去掉 --tiny-native。
 ```
 
@@ -55,7 +58,7 @@ taskset -c 0 .venv/bin/python -m torch.distributed.run --standalone \
 
 每个 rank 每步一个样本，全局 batch 大小等于 world size，按全局步轮转划分；极小数据集允许环回，并不是独立数据的证明。模型初始化相同，随后样本/动作/目标/语言随机流按 rank 分离。开始训练前各 rank 对配置、数据、基座和 E 身份达成一致；逐步合并输入哈希。精确续训要求 world size、配置、种子和输入一致，改变 GPU 数量会明确拒绝。
 
-所有 rank 参与模型/优化器状态收集，只有 rank 0 写文件。checkpoint 仍只含完整可训练参数、优化器、各 rank RNG 和基座引用；不保存冻结权重。导出仍使用原来的 `export-goal-policy`，分片 safetensors 不含优化器或 rank RNG，可在普通单卡 loader 中重建。G 工件仍 v4，π 工件仍 v3；启用 FSDP 的 π 工件额外校验分布式元数据。
+所有 rank 参与模型/优化器状态收集，只有 rank 0 写文件。checkpoint 仍只含完整可训练参数、优化器、各 rank RNG 和基座引用；不保存冻结权重。导出仍使用原来的 `export-goal-policy`，分片 safetensors 不含优化器或 rank RNG，可在普通单卡 loader 中重建。G 工件仍 v4，阶段 D 的 π 工件为 v4；启用 FSDP 的 π 工件额外校验分布式元数据。
 
 单卡 tiny 已验证真实 FSDP、AC、有无 AC 更新一致、训练更新后 E 不变、精确续训和分片导出。**没有验证 4×A800、多节点性能或真实 Wan 峰值显存**；单卡不能证明多 rank 的通信与数值表现。当前完整状态收集需要主机容纳可训练权重和优化器状态。
 

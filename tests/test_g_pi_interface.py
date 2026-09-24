@@ -236,11 +236,95 @@ class GPiInterfaceTests(unittest.TestCase):
         conditions = self.conditions()
         self.assertEqual(len(conditions), 2)
         self.assertTrue(all(value.shape == (2, 2 + 1 + 4, 12) for value in conditions))
-        self.assertFalse(hasattr(self.interface, "pose_decoder"))
+        self.assertIsInstance(self.interface.pose_decoder, _PoseDecoder)
+        self.assertEqual(self.interface.pose_decoder.num_pose_tokens, self.interface.num_tokens)
         self.assertTrue(all(isinstance(group, _RecurrentGroup) for group in self.interface.recurrent_groups))
         for value in conditions:
             torch.testing.assert_close(value[:, :2], self.language)
             torch.testing.assert_close(value[:, 2:3], self.interface.state_encoder(self.state))
+
+    def test_endpoint_prior_has_independent_encoder_and_never_reads_subgoal_or_images(self):
+        first = {id(value) for value in self.interface.goal_encoder.parameters()}
+        second = {id(value) for value in self.interface.endpoint_encoder.parameters()}
+        self.assertFalse(first & second)
+        poses = self.goal["goal_poses"].clone().requires_grad_()
+        gripper = self.goal["goal_gripper"].clone().requires_grad_()
+        with patch.object(self.interface, "goal_semantic", side_effect=AssertionError("subgoal read")), \
+             patch.object(self.interface, "read_layer", side_effect=AssertionError("visual read")), \
+             patch.object(self.interface, "decode_endpoint", side_effect=AssertionError("auxiliary readout")):
+            conditions = self.interface.endpoint_conditions(poses, gripper, self.state, self.language)
+        self.assertEqual(len(conditions), self.interface.num_layers)
+        expected = self.interface.condition(self.interface.encode_endpoint(poses, gripper), self.state, self.language)
+        for value in conditions:
+            torch.testing.assert_close(value, expected, rtol=0, atol=0)
+            torch.testing.assert_close(value[:, :2], self.language)
+        self.assertEqual(self.interface.encode_endpoint(poses, gripper).shape, (2, 4, 16))
+        conditions[-1].square().mean().backward()
+        for module in (self.interface.endpoint_encoder, self.interface.state_encoder, self.interface.condition_adapter):
+            self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters() if p.grad is not None), 0)
+        self.assertTrue(all(p.grad is None for module in (self.interface.goal_encoder, self.interface.recurrent_groups,
+                            self.interface.pose_decoder) for p in module.parameters()))
+        self.assertIsNone(self.interface.visual_queries.grad)
+        self.assertIsNone(poses.grad)
+        self.assertIsNone(gripper.grad)
+        self.assertEqual(set(inspect.signature(self.interface.endpoint_conditions).parameters),
+                         {"poses", "gripper", "state", "language_hidden"})
+
+    def test_clean_endpoint_readout_uses_final_visual_tokens_with_live_gradients(self):
+        clean_endpoint = self.goal["goal_poses"].clone()
+        clean_endpoint[..., :3, 3] += .2
+        captured = []
+        hook = self.interface.pose_decoder.register_forward_pre_hook(lambda _, args: captured.append(args[0]))
+        try:
+            conditions, tokens = self.interface.conditions(self.features, self.state, self.language,
+                self.goal, self.times, self.xy, return_tokens=True)
+            self.assertFalse(captured)
+            predicted = self.interface.decode_endpoint(tokens)
+        finally:
+            hook.remove()
+        self.assertIs(captured[0], tokens)
+        self.assertEqual(tokens.shape, (2, 4, 16))
+        self.assertEqual(self.interface.pose_decoder.queries.shape, (2, 16))
+        self.assertEqual(self.interface.pose_decoder.num_pose_tokens, 4)
+        torch.testing.assert_close(conditions[-1][:, 3:], self.interface.condition_adapter(tokens))
+        from evo_wam.goal_interface import goal_pose_loss
+        loss = goal_pose_loss(predicted["goal_poses"], clean_endpoint,
+            gripper_prediction=predicted["goal_gripper"], gripper_target=self.goal["goal_gripper"])["total"]
+        loss.backward()
+        for module in (self.interface.recurrent_groups, self.interface.pose_decoder):
+            self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters() if p.grad is not None), 0)
+        self.assertGreater(self.interface.visual_queries.grad.abs().sum().item(), 0)
+        self.assertTrue(all(p.grad is None for p in self.interface.endpoint_encoder.parameters()))
+        self.assertEqual(set(inspect.signature(self.interface.decode_endpoint).parameters), {"tokens"})
+        joint_conditions, joint_prediction = self.interface.stage2_conditions(self.features, self.state,
+            self.language, self.goal, self.times, self.xy)
+        for first, second in zip(conditions, joint_conditions):
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        for name in predicted:
+            torch.testing.assert_close(predicted[name], joint_prediction[name], rtol=0, atol=0)
+
+    def test_endpoint_decoder_can_fit_independent_bimanual_block_ends(self):
+        from evo_wam.goal_interface import goal_pose_loss
+        torch.manual_seed(624)
+        interface = PiGoalInterface(native_dim=12, feature_dim=12, state_dim=4, effectors=2,
+            d_z=12, k_z=3, dim=16, num_tokens=4, num_heads=4, num_layers=2,
+            num_layer_groups=1, num_pose_tokens=1)
+        self.assertEqual(interface.pose_decoder.num_pose_tokens, 4)
+        workspace = torch.randn(4, 4, 16)
+        poses = torch.eye(4).repeat(4, 2, 1, 1)
+        poses[..., 0, 3] = torch.tensor([[-.2, -.3], [-.2, .3], [.2, -.3], [.2, .3]])
+        gripper = torch.tensor([[.1, .1], [.1, .9], [.9, .1], [.9, .9]])
+        optimizer = torch.optim.Adam(interface.pose_decoder.parameters(), lr=.01)
+        for _ in range(300):
+            optimizer.zero_grad()
+            prediction = interface.decode_endpoint(workspace)
+            loss = goal_pose_loss(prediction["goal_poses"], poses,
+                gripper_prediction=prediction["goal_gripper"], gripper_target=gripper)
+            loss["total"].backward()
+            optimizer.step()
+        prediction = interface.decode_endpoint(workspace)
+        self.assertLess((prediction["goal_poses"][..., :3, 3] - poses[..., :3, 3]).abs().max().item(), .025)
+        self.assertLess((prediction["goal_gripper"] - gripper).abs().max().item(), .06)
 
     def test_goal_position_embeddings_distinguish_permuted_tokens(self):
         self.assertEqual(self.interface.z_position.shape, (1, 3, 12))
@@ -295,7 +379,8 @@ class GPiInterfaceTests(unittest.TestCase):
         zero = perturb_goal(self.goal)
         for name, value in zero.items():
             torch.testing.assert_close(value, original[name])
-        options = dict(z_std=.02, translation_std=.001, rotation_std=.01, gripper_std=.005)
+        options = dict(z_std=.02, translation_std=.001, rotation_std=.01, gripper_std=.005,
+                       translation_max_m=.005, rotation_max_deg=3., candidate_separation_m=.1)
         first = perturb_goal(self.goal, **options, generator=torch.Generator().manual_seed(19))
         second = perturb_goal(self.goal, **options, generator=torch.Generator().manual_seed(19))
         validate_goal_poses(first["goal_poses"])
@@ -468,6 +553,38 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires goal"):
             policy.predict(history, state)
 
+    def test_endpoint_diagnostic_is_opt_in_and_does_not_change_action_rng(self):
+        native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
+        policy = PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1),
+                              actions_mask=torch.ones(1, 3, 1, 2, 1, dtype=torch.bool))
+        goal = decoder(torch.randn(1, 4, 36), torch.randn(1, 4, 36), state)
+        features = {index: torch.randn(1, 6, 36) for index in range(2)}
+        def sample(_native, _conditions, shape, _mask, generator, **kwargs):
+            return torch.randn(shape, generator=generator)
+        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
+             patch("evo_wam.g_pi_interface.goal_action_sample", side_effect=sample), \
+             patch.object(interface.endpoint_encoder, "forward", side_effect=AssertionError("prior read")), \
+             patch.object(interface.pose_decoder, "forward", wraps=interface.pose_decoder.forward) as readout:
+            seed = policy.generator.get_state()
+            ordinary = policy.predict(history, state, language, goal)
+            self.assertEqual(readout.call_count, 0)
+            policy.generator.set_state(seed)
+            diagnostic = policy.predict(history, state, language, goal, return_endpoint=True)
+            self.assertEqual(readout.call_count, 1)
+        torch.testing.assert_close(diagnostic["actions"], ordinary, rtol=0, atol=0)
+        before = policy.generator.get_state()
+        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
+             patch("evo_wam.g_pi_interface.goal_action_sample", side_effect=AssertionError("action sampled")), \
+             patch.object(interface.endpoint_encoder, "forward", side_effect=AssertionError("prior read")):
+            standalone = policy.diagnose_endpoint(history, state, language, goal)
+        torch.testing.assert_close(policy.generator.get_state(), before, rtol=0, atol=0)
+        for name in standalone:
+            torch.testing.assert_close(standalone[name], diagnostic["endpoint"][name], rtol=0, atol=0)
+        self.assertEqual(set(diagnostic["endpoint"]), {"goal_poses", "goal_gripper"})
+        validate_goal_poses(diagnostic["endpoint"]["goal_poses"])
+        with self.assertRaisesRegex(ValueError, "return_endpoint"):
+            policy.predict(history, state, language, goal, return_endpoint="yes")
+
     def test_intent_diagnostic_holds_computed_robot_memory_fixed(self):
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
         translator = GTranslator(native, decoder, config)
@@ -523,8 +640,15 @@ class GPiNativeInterfaceTests(unittest.TestCase):
     def test_native_pi_step_changes_only_interface_and_action_expert(self):
         from evo_wam.g_pi_context import frozen_base_checksum, pi_context_features
         from evo_wam.goal_action import action_named_parameters, goal_action_forward
+        from evo_wam.g_pi_training import _set_training
+        from evo_wam.goal_interface import goal_pose_loss
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture("cuda")
+        _set_training(native, interface, encoder, {"interface_type": "pi_goal",
+            "pi_training": {"ablations": {"no_stage1": True, "exact_goal": True}}}, stage="pi")
         action_parameters = dict(action_named_parameters(native))
+        stage2_parameters = [value for name, value in interface.named_parameters()
+                             if not name.startswith("endpoint_encoder.")]
+        self.assertTrue(all(value.requires_grad for value in stage2_parameters))
         original = {name: value.detach().clone() for name, value in native.named_parameters()}
         decoder_before = {name: value.detach().clone() for name, value in decoder.named_parameters()}
         interface_before = {name: value.detach().clone() for name, value in interface.named_parameters()}
@@ -534,13 +658,17 @@ class GPiNativeInterfaceTests(unittest.TestCase):
             goal = {"z": before_z, "goal_poses": torch.eye(4, device="cuda").repeat(1, 1, 1, 1),
                     "goal_gripper": torch.ones(1, 1, device="cuda")}
             features = pi_context_features(encoder.native, history[:, :, :2], config)
-            conditions = interface.conditions(features, state,
+            conditions, endpoint = interface.stage2_conditions(features, state,
                 native.condition_embedder_action.text_embedder(language), goal,
                 torch.tensor([0., .2]), torch.tensor([[-.5, 0.], [.5, 0.]]))
             predicted = goal_action_forward(native, torch.randn(1, 3, 1, 2, 1, device="cuda"),
                                             torch.full((1, 1), 500., device="cuda"), conditions)
-            loss = predicted.float().square().mean()
-        optimizer = torch.optim.Adam([*interface.parameters(), *action_parameters.values()], lr=.01)
+            clean_endpoint = goal["goal_poses"].clone()
+            clean_endpoint[..., 0, 3] = .03
+            pose = goal_pose_loss(endpoint["goal_poses"], clean_endpoint,
+                gripper_prediction=endpoint["goal_gripper"], gripper_target=torch.full_like(goal["goal_gripper"], .25))
+            loss = predicted.float().square().mean() + .3 * pose["total"]
+        optimizer = torch.optim.Adam([*stage2_parameters, *action_parameters.values()], lr=.01)
         loss.backward()
         optimizer.step()
         changed = {name for name, value in native.named_parameters() if not torch.equal(value, original[name])}
@@ -549,7 +677,14 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         self.assertTrue(all(value.dtype == torch.float32 and value.grad is not None
                             and value.grad.dtype == torch.float32 for value in action_parameters.values()))
         self.assertTrue(all(value.dtype == torch.float32 and value.grad is not None
-                            and value.grad.dtype == torch.float32 for value in interface.parameters()))
+                            and value.grad.dtype == torch.float32 for value in stage2_parameters))
+        for name, value in interface.named_parameters():
+            if name.startswith("endpoint_encoder."):
+                self.assertFalse(value.requires_grad)
+                self.assertIsNone(value.grad)
+                torch.testing.assert_close(value, interface_before[name], rtol=0, atol=0)
+        self.assertTrue(any(not torch.equal(value, interface_before[name]) for name, value in interface.named_parameters()
+                            if name.startswith("pose_decoder.")))
         self.assertTrue(all(torch.equal(value, decoder_before[name]) for name, value in decoder.named_parameters()))
         self.assertTrue(any(not torch.equal(value, interface_before[name]) for name, value in interface.named_parameters()))
         self.assertEqual(frozen_base_checksum(encoder.native), checksum)

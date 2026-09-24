@@ -42,7 +42,7 @@ def validate_distributed_artifact(payload, *, kind):
         states = payload.get("rank_states")
         if (not isinstance(states, list) or len(states) != metadata["world_size"]
                 or any(not isinstance(state, dict) or set(state) != {"rng", "torch_rng", "cuda_rng", "python_rng", "numpy_rng", "visited_arrays"}
-                       or set(state["rng"]) != {"sample", "action", "goal", "language"} for state in states)):
+                       or not isinstance(state["rng"], dict) or set(state["rng"]) != {"sample", "action", "goal", "language"} for state in states)):
             raise ValueError("FSDP checkpoint requires one complete RNG and data state per rank")
 
 
@@ -96,7 +96,7 @@ def shard_pi(native, interface, config):
     shard_model(native, param_dtype=None, reduce_dtype=torch.float32)
     fully_shard(interface, mp_policy=MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32,
                                                         cast_forward_inputs=False))
-    register_fsdp_forward_method(interface, "conditions")
+    register_fsdp_forward_method(interface, "stage2_conditions")
 
     def loss(self, encoder, sample, generators, layers, cached_z):
         from .g_pi_training import g_pi_training_loss
@@ -127,10 +127,11 @@ def distributed_checksum(native):
 
 def trainable_state(native, interface):
     from .goal_action import action_named_parameters
+    from .g_pi_training import _interface_state
 
     # Every rank must participate in full_tensor's all-gathers, including when
     # only rank zero writes the portable (unsharded) artifact.
-    return {"interface": {canonical_name(k): full_tensor(v) for k, v in interface.state_dict().items()},
+    return {"interface": {canonical_name(k): full_tensor(v) for k, v in _interface_state(interface).items()},
             "action": {canonical_name(k): full_tensor(v) for k, v in action_named_parameters(native)}}
 
 
@@ -201,15 +202,14 @@ def _train(args, config, rank, world, device):
     from .cli import file_sha256, write_json
     from .g_pi_data import g_pi_sample_files, load_g_pi_index, load_g_pi_sample
     from .g_pi_training import (build_g_pi_system, _base_location, _base_reference, _check_sample,
-        _check_stage, _frozen_checksums, _optimizer, _restore_system, conditioning_mode,
+        _check_stage, _frozen_checksums, _optimizer, _restore_system, _initialization, _initialize_pi,
+        conditioning_mode, pi_stage_contract, pi_training_settings,
         g_pi_architecture, g_pi_artifact_version, language_drop_probability, read_g_pi_artifact)
     from .goal_training import goal_registry
     from .video_data import _source_components
     from .zerowam import ZERO_WAM_COMMIT
 
     _check_stage(config, args.stage)
-    if getattr(args, "initialize", None):
-        raise ValueError("G and pi train independently; stage initialization is unsupported")
     if type(args.steps) is not int or args.steps < 1:
         raise ValueError("steps must be positive")
     paths, sources = load_g_pi_index(args.index)
@@ -219,6 +219,7 @@ def _train(args, config, rank, world, device):
     registry = goal_registry(first)
     _check_sample(first, config, registry)
     previous = read_g_pi_artifact(args.resume) if args.resume else None
+    prior = _initialization(args, config, previous)
     distribution = {"kind": "fsdp2", "world_size": world,
                     "activation_checkpointing": distributed_settings(config)["activation_checkpointing"],
                     "batch_layout": "one_sample_per_rank_round_robin", "optimizer_format": "full_named_v1"}
@@ -231,8 +232,8 @@ def _train(args, config, rank, world, device):
             or previous["data_identity"] != identities or previous["seed"] != args.seed
             or previous.get("distributed") != distribution or len(previous.get("rank_states", [])) != world):
         raise ValueError("exact FSDP resume requires identical world size, route, config, data, conventions and seed")
-    if previous:
-        _source_components([*previous["source_records"], *sources])
+    if previous or prior:
+        _source_components([*(previous or prior)["source_records"], *sources])
     visited = dict(previous["rank_states"][rank]["visited_arrays"]) if previous else {}
     if any(file_sha256(path) != digest for path, digest in visited.items()):
         raise ValueError("consumed training inputs changed before resume")
@@ -242,10 +243,13 @@ def _train(args, config, rank, world, device):
     # Initialization identical across ranks; local RNG streams begin only after
     # model construction. A fixed world size is required for exact continuation.
     torch.manual_seed(args.seed)
-    checkpoint = _base_location(previous["base_reference"], args.checkpoint) if previous else args.checkpoint
+    origin = previous or prior
+    checkpoint = _base_location(origin["base_reference"], args.checkpoint) if origin else args.checkpoint
     native, interface, encoder, identity, layers = build_g_pi_system(config, registry, stage="pi",
         checkpoint=checkpoint, tiny_native=args.tiny_native, device=device,
-        video_precision=previous["encoder_precision"] if previous else None)
+        video_precision=origin["encoder_precision"] if origin else None)
+    if prior:
+        _initialize_pi(native, interface, encoder, config, registry, prior, identity, layers)
     if previous:
         if previous["base_identity"] != identity or previous["feature_layers"] != layers:
             raise ValueError("base checkpoint or feature layers changed")
@@ -269,7 +273,9 @@ def _train(args, config, rank, world, device):
                 raise ValueError("consumed target cache changed before resume")
             visited[name] = digest
     rank_consensus({"config": config, "registry": registry, "data_identity": identities,
-                    "base_reference": reference, "encoder_identity": encoder.identity})
+                    "base_reference": reference, "encoder_identity": encoder.identity,
+                    "stage1_sha256": file_sha256(args.initialize) if prior else None,
+                    "resume_sha256": file_sha256(args.resume) if previous else None})
     visited = merge_input_hashes({}, visited)
     model = shard_pi(native, interface, config)
     optimizer = _optimizer(native, interface, encoder, config)
@@ -310,18 +316,32 @@ def _train(args, config, rank, world, device):
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         if not finite.item():
             raise ValueError("nonfinite objective on an FSDP rank; optimizer not updated")
+        valid_count = losses["endpoint_valid_count"].detach().clone()
+        dist.all_reduce(valid_count, op=dist.ReduceOp.SUM)
+        # FSDP averages gradients over ranks. Normalize endpoint supervision by
+        # valid endpoints, independently of the global action batch size.
+        scale = world / valid_count.clamp_min(1)
+        losses["total"] = losses["action"] + pi_training_settings(config)["pose_weight"] * losses["lit_pose"] * scale
         losses["total"].backward()
         norm = torch.nn.utils.clip_grad_norm_(parameters, config["training"]["gradient_clip"],
                                              error_if_nonfinite=True, foreach=False)
         optimizer.step()
         updates += 1
-        metrics = torch.stack([losses["action"].detach().float(), norm.detach().float().full_tensor()]).to(device)
+        keys = list(losses)
+        metrics = torch.stack([losses[key].detach().float() for key in keys]).to(device)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-        metrics /= world
+        values = dict(zip(keys, metrics.tolist()))
+        for key in ("action", "total"):
+            values[key] /= world
+        for key in ("lit_pose", "endpoint_position_error_m", "endpoint_orientation_error_deg", "endpoint_gripper_error"):
+            values[key] /= max(values["endpoint_valid_count"], 1)
+        for group in ("before", "reaches"):
+            values[f"lit_pose_{group}"] /= max(values[f"lit_pose_{group}_count"], 1)
+        gradient_norm = float(norm.detach().full_tensor())
         if rank == 0:
             with (output / "metrics.jsonl").open("a") as log:
-                log.write(json.dumps({"step": step, "stage": "pi", "action": metrics[0].item(),
-                    "total": metrics[0].item(), "gradient_norm": metrics[1].item(), "paired_samples": world,
+                log.write(json.dumps({"step": step, "stage": "pi", **values,
+                    "gradient_norm": gradient_norm, "paired_samples": world,
                     "video_generation": False, "updated": True}) + "\n")
     checksum = distributed_checksum(native)
     if {"encoder": checksum, "native_video": checksum} != frozen:
@@ -358,7 +378,11 @@ def _train(args, config, rank, world, device):
             "data_cursor": ((start + args.steps) * world) % len(paths), "seed": args.seed, "optimizer": optim,
             "scheduler": {"kind": "constant", "state": None}, "rank_states": states, "distributed": distribution,
             **{key: value for key, value in state.items() if key != "cuda_rng"}, "cuda_rng": [state["cuda_rng"]],
-            "data_identity": identities, "source_records": previous["source_records"] if previous else sources}
+            "data_identity": identities,
+            "source_records": previous["source_records"] if previous else [*(prior["source_records"] if prior else []), *sources]}
+        source_sha = file_sha256(args.initialize) if prior else previous.get("stage1_artifact_sha256") if previous else None
+        payload["stage1_artifact_sha256"] = source_sha
+        payload["pi_training"] = pi_stage_contract(config, "pi", source_sha)
         temp = output / "goal_interface.pt.tmp"
         torch.save(payload, temp)
         temp.replace(output / "goal_interface.pt")

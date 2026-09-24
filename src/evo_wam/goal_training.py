@@ -24,7 +24,7 @@ from .video_data import patch_grid_coordinates, _source_components, _local_path
 from .zerowam import ZERO_WAM_COMMIT, load_native_class
 
 
-STAGES = {"goal", "visual", "joint", "g", "pi"}
+STAGES = {"goal", "visual", "joint", "g", "pi_prior", "pi"}
 G_PI_ROUTES = {"g_translator", "pi_goal"}
 ARCHITECTURE = "recurrent_goal_full_v2"
 OBSERVED_ARCHITECTURE = "observed_goal_dual_v1"
@@ -39,9 +39,9 @@ def goal_architecture(config):
 
 def _check_stage(config, stage):
     if config["interface_type"] in G_PI_ROUTES:
-        expected = "g" if config["interface_type"] == "g_translator" else "pi"
-        if stage != expected:
-            raise ValueError(f"interface_type {config['interface_type']} requires stage {expected}")
+        allowed = {"g"} if config["interface_type"] == "g_translator" else {"pi_prior", "pi"}
+        if stage not in allowed:
+            raise ValueError(f"interface_type {config['interface_type']} requires stage {sorted(allowed)}")
         return
     allowed = {"joint"} if config["interface_type"] == "observed_dual" else {"goal", "visual"}
     if stage not in allowed:

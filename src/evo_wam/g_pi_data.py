@@ -124,11 +124,11 @@ def next_subgoal_time(current_time: float, terminal_time: float,
 class PiGoalSample:
     metadata: Mapping
     state: Tensor
-    history: Tensor                # [1,C,F,H,W], physically sliced task-local history
-    history_times: Tensor
-    target_frame: Tensor           # [1,C,1,H,W], independently passed to frozen E
-    goal_poses: Tensor
-    goal_gripper: Tensor
+    history: Tensor | None         # [1,C,F,H,W]; absent from the nonvisual prior
+    history_times: Tensor | None
+    target_frame: Tensor | None    # [1,C,1,H,W], independently passed to frozen E
+    goal_poses: Tensor | None
+    goal_gripper: Tensor | None
     language: Tensor | None
     language_identity: Mapping | None
     actions: Tensor                # [1,A,F,N,1], padded only beyond terminal
@@ -136,6 +136,12 @@ class PiGoalSample:
     subgoal_time: float
     terminal_time: float
     events: tuple[GripperEvent, ...]
+    block_end_poses: Tensor | None
+    block_end_gripper: Tensor | None
+    block_end_time: float | None
+    block_end_index: int
+    block_end_valid: bool
+    reaches_subgoal: bool
 
 
 @dataclass(frozen=True)
@@ -264,11 +270,25 @@ def subgoal_control_indices(gripper: Tensor, times: Tensor,
     return torch.tensor([(times.double() == time).nonzero()[0].item() for time in subgoals])
 
 
+def _block_endpoint(mask: Tensor, current_index: int, poses: Tensor, gripper: Tensor,
+                    times: Tensor, subgoal_index: int) -> dict:
+    """Supervise the state after the last included command, respecting mask holes."""
+    if mask.dtype != torch.bool or mask.ndim != 2 or not mask.any():
+        raise ValueError("block endpoint requires nonempty Boolean [A,H] action supervision")
+    endpoint = current_index + mask.any(0).nonzero()[-1, 0].item() + 1
+    valid = 0 <= endpoint < min(len(poses), len(gripper), len(times))
+    return {"block_end_poses": poses[endpoint:endpoint + 1].clone() if valid else None,
+            "block_end_gripper": gripper[endpoint:endpoint + 1].clone() if valid else None,
+            "block_end_time": times[endpoint].item() if valid else None,
+            "block_end_index": endpoint, "block_end_valid": valid,
+            "reaches_subgoal": endpoint == subgoal_index}
+
+
 def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
                      current_time: float | None = None,
                      generator: torch.Generator | None = None,
                      read_language: bool = True) -> PiGoalSample:
-    """Sample a newly available causal latent; pi never opens the human archive.
+    """Sample a latent availability; the prior never reads visual array contents.
 
     Unpadded action column k is the command executed on (control_times[k],
     control_times[k + 1]]. Native Zero-WAM's initial N zero history slots are
@@ -276,13 +296,14 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     """
     from .cli import action_space
 
-    if route not in {"g_translator", "pi_goal"}:
-        raise ValueError("G/pi route must be g_translator or pi_goal")
+    if route not in {"g_translator", "pi_goal", "pi_prior"}:
+        raise ValueError("G/pi route must be g_translator, pi_goal or pi_prior")
+    prior = route == "pi_prior"
     if type(read_language) is not bool:
         raise ValueError("read_language must be boolean; disable only for offline goal measurements")
     path = Path(manifest_path)
     metadata = _metadata(path)
-    if route == "pi_goal" and read_language and "language" not in metadata:
+    if route != "g_translator" and read_language and "language" not in metadata:
         raise ValueError("pi training requires the language cache; G and offline goal measurements do not")
     expected = {"latent", "latent_available_times", "control_times", "states", "poses", "gripper",
                 "actions", "actions_mask", "subgoal_times", "subgoal_latents"}
@@ -294,17 +315,19 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
             raise ValueError("G/pi version-3 task NPZ requires latent, latent_available_times, control_times, "
                              "states, poses, gripper, actions, actions_mask, subgoal_times and subgoal_latents; "
                              "only declared offline object/pedal evidence fields are optional")
-        arrays = {name: torch.from_numpy(archive[name].copy()) for name in archive.files}
-    latent, latent_times, times, states, poses, gripper, actions, mask, subgoal_times, subgoal_latents = (
-        arrays[name] for name in ("latent", "latent_available_times", "control_times", "states", "poses",
-                                  "gripper", "actions", "actions_mask", "subgoal_times", "subgoal_latents"))
-    if (latent.ndim != 4 or min(latent.shape) < 1
+        visual = {"latent", "subgoal_latents"} if prior else set()
+        arrays = {name: torch.from_numpy(archive[name].copy()) for name in archive.files if name not in visual}
+    latent, subgoal_latents = arrays.get("latent"), arrays.get("subgoal_latents")
+    latent_times, times, states, poses, gripper, actions, mask, subgoal_times = (
+        arrays[name] for name in ("latent_available_times", "control_times", "states", "poses",
+                                  "gripper", "actions", "actions_mask", "subgoal_times"))
+    if not prior and (latent.ndim != 4 or min(latent.shape) < 1
             or not latent.is_floating_point() or not torch.isfinite(latent).all()):
         raise ValueError("task latent must be finite floating nonempty [C,Tl,H,W]")
     if times.ndim != 1 or times.numel() < 2:
         raise ValueError("control_times must contain at least two recorded control steps")
     frames, effectors = times.numel(), len(metadata["end_effectors"])
-    _times(latent_times, latent.shape[1], "latent_available_times")
+    _times(latent_times, latent_times.numel() if prior else latent.shape[1], "latent_available_times")
     actions_per_frame = metadata["actions_per_frame"]
     latent_indices = validate_latent_grid(metadata, times, latent_times)
     if (states.ndim != 2 or states.shape[0] != frames or states.shape[1] < 1
@@ -330,7 +353,7 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     if not torch.equal(subgoal_times.double(), expected_subgoals.double()):
         raise ValueError("subgoal_times must exactly match recomputed subgoal source times plus terminal, "
                          "with simultaneous events deduplicated")
-    if (subgoal_latents.shape != (subgoal_times.numel(), latent.shape[0], 1, *latent.shape[2:])
+    if not prior and (subgoal_latents.shape != (subgoal_times.numel(), latent.shape[0], 1, *latent.shape[2:])
             or not subgoal_latents.is_floating_point() or not torch.isfinite(subgoal_latents).all()):
         raise ValueError("subgoal_latents must be finite floating [K,C,1,H,W] independently encoded single frames")
     if current_time is None:
@@ -363,14 +386,19 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     block = _masked_values(block, block_mask, "actions")
     if not block_mask.any():
         raise ValueError("sample requires valid action supervision before subgoal_time")
+    endpoint = _block_endpoint(block_mask, index, poses, gripper, times, goal_index)
+    if prior and not endpoint["block_end_valid"]:
+        raise ValueError("pi_prior requires a recorded state after the last supervised action")
     language, language_identity = None, None
-    if route == "pi_goal" and read_language:
+    if route != "g_translator" and read_language:
         language, language_identity = load_goal_language(_local_path(path.parent, metadata["language"], ".json"))
     sample_metadata = {**metadata, "current_time": current_time, "subgoal_time": subgoal,
                        "terminal_time": terminal, "events": [asdict(event) for event in events],
                        "action_alignment": "control_step_start_unpadded",
-                       "subgoal_source": metadata.get("subgoal_source", "gripper"), "subgoal_annotation": audit}
-    if route == "pi_goal":
+                       "subgoal_source": metadata.get("subgoal_source", "gripper"), "subgoal_annotation": audit,
+                       **{key: endpoint[key] for key in ("block_end_time", "block_end_index",
+                                                         "block_end_valid", "reaches_subgoal")}}
+    if route != "g_translator":
         sample_metadata.pop("demonstration", None)
         sample_metadata.pop("compatibility", None)
     if language is None:
@@ -378,15 +406,15 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     shape = (1, actions.shape[0], metadata["action_frames"], actions_per_frame, 1)
     history_frames = index // actions_per_frame + 1
     values = dict(metadata=sample_metadata, state=states[index:index + 1].clone(),
-                  history=latent[:, :history_frames].clone().unsqueeze(0),
-                  history_times=latent_times[:history_frames].clone(),
-                  target_frame=subgoal_latents[target_index:target_index + 1].clone(),
-                  goal_poses=poses[goal_index:goal_index + 1].clone(),
-                  goal_gripper=gripper[goal_index:goal_index + 1].clone(),
+                  history=None if prior else latent[:, :history_frames].clone().unsqueeze(0),
+                  history_times=None if prior else latent_times[:history_frames].clone(),
+                  target_frame=None if prior else subgoal_latents[target_index:target_index + 1].clone(),
+                  goal_poses=None if prior else poses[goal_index:goal_index + 1].clone(),
+                  goal_gripper=None if prior else gripper[goal_index:goal_index + 1].clone(),
                   language=language, language_identity=language_identity,
                   actions=block.reshape(shape), actions_mask=block_mask.reshape(shape),
-                  subgoal_time=subgoal, terminal_time=terminal, events=events)
-    if route == "pi_goal":
+                  subgoal_time=subgoal, terminal_time=terminal, events=events, **endpoint)
+    if route != "g_translator":
         return PiGoalSample(**values)
     if "demonstration" not in metadata:
         raise ValueError("g_translator requires a task-paired human demonstration")

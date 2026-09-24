@@ -79,13 +79,9 @@
     "goal_source": "hindsight",
     "ablations": {
       "no_stage1": false,
-      "no_lit_pose": false,
+      "no_lit_pose": true,
       "exact_goal": false
     }
   },
-  "candidate_separation_m": 0.1,
-  "distributed": {
-    "enabled": true,
-    "activation_checkpointing": true
-  }
+  "candidate_separation_m": 0.1
 }

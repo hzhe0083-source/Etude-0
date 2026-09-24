@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from evo_wam.g_pi_data import (EventRules, GTranslatorSample, GripperEventDetector, PiGoalSample,
-                              detect_gripper_events, g_pi_sample_files, load_g_pi_index,
+                              _block_endpoint, detect_gripper_events, g_pi_sample_files, load_g_pi_index,
                               load_g_pi_sample, next_subgoal_time, subgoal_control_indices, validate_latent_grid)
 from evo_wam.icl_data import LATENT_NORMALIZATION
 from test_goal_language import write_goal_language
@@ -152,6 +152,123 @@ class GPiDataTest(unittest.TestCase):
         self.assertFalse(hasattr(sample, "demonstration"))
         self.assertNotIn("demonstration", inspect.signature(PiGoalSample).parameters)
         self.assertNotIn("demonstration", sample.metadata)
+
+    def test_block_endpoint_is_next_recorded_state_after_horizon(self):
+        path, _, arrays = write_g_pi_task(self.root, gripper=np.zeros((17, 1)))
+        sample = load_g_pi_sample(path, current_time=0.)
+        self.assertEqual(sample.actions_mask.any(1).sum().item(), 8)
+        self.assertEqual(sample.subgoal_time, 1.6)
+        self.assertEqual(sample.block_end_index, 8)
+        self.assertEqual(sample.block_end_time, .8)
+        self.assertTrue(sample.block_end_valid)
+        self.assertFalse(sample.reaches_subgoal)
+        torch.testing.assert_close(sample.block_end_poses[0], torch.from_numpy(arrays["poses"][8]), atol=0, rtol=0)
+        torch.testing.assert_close(sample.block_end_gripper[0], torch.from_numpy(arrays["gripper"][8]), atol=0, rtol=0)
+        self.assertFalse(torch.equal(sample.goal_poses, sample.block_end_poses))
+        self.assertEqual(sample.metadata["block_end_index"], 8)
+        self.assertNotIn("block_end_poses", sample.metadata)
+
+    def test_subgoal_cut_and_terminal_padding_determine_block_endpoint(self):
+        path, _, arrays = write_g_pi_task(self.root)
+        for time, endpoint in ((.4, 6), (1.2, 16)):
+            with self.subTest(current_time=time):
+                sample = load_g_pi_sample(path, current_time=time)
+                self.assertEqual(sample.block_end_index, endpoint)
+                self.assertTrue(sample.block_end_valid)
+                self.assertTrue(sample.reaches_subgoal)
+                self.assertEqual(sample.block_end_time, sample.subgoal_time)
+                torch.testing.assert_close(sample.block_end_poses, sample.goal_poses, atol=0, rtol=0)
+                torch.testing.assert_close(sample.block_end_gripper, sample.goal_gripper, atol=0, rtol=0)
+                torch.testing.assert_close(sample.block_end_poses[0], torch.from_numpy(arrays["poses"][endpoint]),
+                                           atol=0, rtol=0)
+
+    def test_mask_holes_use_last_supervised_step_not_count_or_disabled_channel(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        arrays["actions_mask"][0] = False
+        arrays["actions_mask"][0, [0, 3, 4]] = True
+        # Channel 1 has future labels but action_space declares it inactive.
+        self.save(path, metadata, arrays)
+        sample = load_g_pi_sample(path, current_time=0.)
+        self.assertEqual(sample.actions_mask.sum().item(), 3)
+        self.assertEqual(sample.block_end_index, 5)
+        self.assertEqual(sample.block_end_time, .5)
+        self.assertFalse(sample.reaches_subgoal)
+        metadata["action_space"]["valid_channels"][1] = True
+        arrays["actions_mask"][1] = False
+        arrays["actions_mask"][1, 5] = True
+        self.save(path, metadata, arrays)
+        sample = load_g_pi_sample(path, current_time=0.)
+        self.assertEqual(sample.block_end_index, 6)
+        self.assertTrue(sample.reaches_subgoal)
+        arrays["actions_mask"][:] = False
+        self.save(path, metadata, arrays)
+        with self.assertRaisesRegex(ValueError, "valid action supervision"):
+            load_g_pi_sample(path, current_time=0.)
+
+    def test_missing_post_action_measurement_marks_endpoint_invalid(self):
+        poses = torch.eye(4).repeat(3, 1, 1, 1)
+        gripper, times = torch.zeros(3, 1), torch.arange(3, dtype=torch.float64)
+        label = _block_endpoint(torch.tensor([[True, False, True]]), 0, poses, gripper, times, 4)
+        self.assertEqual(label["block_end_index"], 3)
+        self.assertFalse(label["block_end_valid"])
+        self.assertFalse(label["reaches_subgoal"])
+        for key in ("block_end_poses", "block_end_gripper", "block_end_time"):
+            self.assertIsNone(label[key])
+        with self.assertRaisesRegex(ValueError, "nonempty Boolean"):
+            _block_endpoint(torch.zeros(1, 3, dtype=torch.bool), 0, poses, gripper, times, 2)
+
+    def test_prior_never_fetches_visual_arrays_or_demonstration_and_has_no_g(self):
+        path, metadata, _ = write_g_pi_task(self.root)
+        visual = load_g_pi_sample(path, current_time=.4)
+        (self.root / metadata["demonstration"]["arrays"]).unlink()
+        original = np.lib.npyio.NpzFile.__getitem__
+        accessed = []
+
+        def read(archive, key):
+            accessed.append(key)
+            if key in {"latent", "subgoal_latents"}:
+                raise AssertionError("the nonvisual prior must not fetch video or goal latents")
+            return original(archive, key)
+
+        with patch.object(np.lib.npyio.NpzFile, "__getitem__", read):
+            prior = load_g_pi_sample(path, route="pi_prior", current_time=.4)
+        self.assertIn("language", accessed)
+        self.assertIn("latent_available_times", accessed)
+        for field in ("history", "history_times", "target_frame", "goal_poses", "goal_gripper"):
+            self.assertIsNone(getattr(prior, field))
+        self.assertNotIn("demonstration", prior.metadata)
+        for field in ("state", "actions", "actions_mask", "block_end_poses", "block_end_gripper", "language"):
+            torch.testing.assert_close(getattr(prior, field), getattr(visual, field), atol=0, rtol=0)
+        self.assertEqual(prior.block_end_index, visual.block_end_index)
+        self.assertEqual(len(g_pi_sample_files(path, prior)), 4)
+
+    def test_prior_preserves_grid_boundary_and_schema_validation(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        for key, value, message in (("latent_available_times", arrays["latent_available_times"] + .1, "causal grid"),
+                                    ("subgoal_times", arrays["subgoal_times"] + .1, "recomputed")):
+            self.save(path, metadata, {**arrays, key: value})
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, message):
+                load_g_pi_sample(path, route="pi_prior", current_time=.4)
+        missing = {key: value for key, value in arrays.items() if key != "subgoal_latents"}
+        self.save(path, metadata, missing)
+        with self.assertRaisesRegex(ValueError, "version-3 task NPZ requires"):
+            load_g_pi_sample(path, route="pi_prior", current_time=.4)
+        self.save(path, metadata, arrays)
+        with self.assertRaisesRegex(ValueError, "latent availability"):
+            load_g_pi_sample(path, route="pi_prior", current_time=.3)
+        with patch("evo_wam.g_pi_data._block_endpoint", return_value={"block_end_valid": False}):
+            with self.assertRaisesRegex(ValueError, "recorded state after"):
+                load_g_pi_sample(path, route="pi_prior", current_time=.4)
+
+    def test_prior_random_time_and_action_mask_match_visual_route(self):
+        path, _, _ = write_g_pi_task(self.root)
+        one, two = torch.Generator().manual_seed(74), torch.Generator().manual_seed(74)
+        for _ in range(8):
+            visual = load_g_pi_sample(path, generator=one)
+            prior = load_g_pi_sample(path, route="pi_prior", generator=two)
+            self.assertEqual(visual.metadata["current_time"], prior.metadata["current_time"])
+            self.assertEqual(visual.block_end_index, prior.block_end_index)
+            torch.testing.assert_close(visual.actions_mask, prior.actions_mask, atol=0, rtol=0)
 
     def test_after_last_event_uses_terminal_including_remaining_motion(self):
         path, _, _ = write_g_pi_task(self.root)

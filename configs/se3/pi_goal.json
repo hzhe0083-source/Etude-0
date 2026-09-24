@@ -65,11 +65,23 @@
     "debounce_steps": 2
   },
   "goal_noise": {
-    "z_std": 0.0,
-    "translation_std": 0.0,
-    "rotation_std": 0.0,
-    "gripper_std": 0.0
+    "z_std": 0.03,
+    "translation_std": 0.005,
+    "rotation_std": 0.03,
+    "gripper_std": 0.02,
+    "translation_max_m": 0.02,
+    "rotation_max_deg": 10.0
   },
   "conditioning_mode": "language_state_goal",
-  "p_drop": 0.0
+  "p_drop": 0.0,
+  "pi_training": {
+    "pose_weight": 0.3,
+    "goal_source": "hindsight",
+    "ablations": {
+      "no_stage1": false,
+      "no_lit_pose": false,
+      "exact_goal": false
+    }
+  },
+  "candidate_separation_m": 0.1
 }

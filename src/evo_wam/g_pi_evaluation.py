@@ -15,6 +15,7 @@ import torch
 from .cli import file_sha256, write_json
 from .g_pi_controller import GoalThresholds, goal_distances, goal_reached
 from .g_pi_deployment import load_g_pi_observation, load_goal_prediction
+from .goal_interface import validate_goal_poses, validate_gripper
 from .goal_language import load_goal_language
 from .video_data import _local_path
 
@@ -75,6 +76,55 @@ def delta_metrics(prediction, truth, current):
             "reference_change": {key: value.tolist() for key, value in reference.items()},
             "predicted_magnitude": goal_distances(prediction, current),
             "reference_magnitude": goal_distances(truth, current)}
+
+
+def endpoint_swap_metrics(original, swapped, original_goal, swapped_goal):
+    """Compare final-Z readout motion to the supplied change in goal position."""
+    values = []
+    for value in (original, swapped, original_goal, swapped_goal):
+        if not isinstance(value, dict) or not {"goal_poses", "goal_gripper"} <= value.keys():
+            raise ValueError("endpoint diagnostic requires goal_poses and goal_gripper")
+        poses = value["goal_poses"]
+        validate_goal_poses(poses)
+        validate_gripper(value["goal_gripper"], poses.shape[:2])
+        if poses.shape[0] != 1:
+            raise ValueError("endpoint diagnostic requires one case per readout")
+        values.append(poses.detach().double().cpu())
+    if any(value.shape != values[0].shape for value in values[1:]):
+        raise ValueError("endpoint readouts and swapped goals must share the effector shape")
+    motion = (values[1] - values[0])[0, :, :3, 3]
+    goal_delta = (values[3] - values[2])[0, :, :3, 3]
+    lengths, goal_lengths = motion.norm(dim=-1), goal_delta.norm(dim=-1)
+    if not torch.isfinite(lengths).all() or not torch.isfinite(goal_lengths).all():
+        raise ValueError("endpoint displacement magnitudes must be finite")
+    effectors = []
+    for index in range(len(lengths)):
+        zero_goal, zero_motion = bool(goal_lengths[index] == 0), bool(lengths[index] == 0)
+        valid = not (zero_goal or zero_motion)
+        cosine = float(((motion[index] / lengths[index]) * (goal_delta[index] / goal_lengths[index])).sum().clamp(-1, 1)) if valid else None
+        effectors.append({"effector_index": index, "endpoint_delta_m": motion[index].tolist(),
+            "goal_delta_m": goal_delta[index].tolist(), "displacement_m": float(lengths[index]),
+            "goal_displacement_m": float(goal_lengths[index]), "cosine_alignment": cosine,
+            "valid": valid, "zero_goal_delta": zero_goal, "zero_endpoint_motion": zero_motion})
+    cosines = [row["cosine_alignment"] for row in effectors if row["valid"]]
+    return {"per_effector": effectors, "aggregate": {
+        "displacement_m": float(lengths.mean()), "goal_displacement_m": float(goal_lengths.mean()),
+        "cosine_alignment": sum(cosines) / len(cosines) if cosines else None,
+        "valid": bool(cosines), "valid_effectors": len(cosines), "effectors": len(effectors),
+        "all_effectors_valid": len(cosines) == len(effectors)},
+        "aggregation": "Lengths average all effectors; cosine averages only nondegenerate effectors."}
+
+
+def _endpoint_swap_summary(rows):
+    metrics = ("displacement_m", "goal_displacement_m", "cosine_alignment")
+    return {"aggregate": {metric: grouped_statistics(
+        [{**row, "value": row["aggregate"][metric]} for row in rows], "value") for metric in metrics},
+        "per_effector": {str(index): {metric: grouped_statistics(
+            [{**row, "value": effector[metric]} for row in rows for effector in row["per_effector"]
+             if effector["effector_index"] == index], "value") for metric in metrics}
+            for index in sorted({effector["effector_index"] for row in rows for effector in row["per_effector"]})},
+        "valid_effectors": sum(row["aggregate"]["valid_effectors"] for row in rows),
+        "degenerate_effectors": sum(row["aggregate"]["effectors"] - row["aggregate"]["valid_effectors"] for row in rows)}
 
 
 def _regions(case, cases):
@@ -215,12 +265,15 @@ def _validate_cases(cases):
 
 @torch.no_grad()
 def evaluate_records(cases, training_goals, *, g_predict, thresholds, pi_predict=None,
-                     pairs=(), quadruples=(), diagnose_intent=None):
+                     pairs=(), quadruples=(), diagnose_intent=None, diagnose_endpoint=None,
+                     endpoint_seed=None, endpoint_pose_weight=None):
     """Run model callbacks on observed tensors; offline grouping never reaches G/π.
 
     g_predict receives (demo, history, state). pi_predict receives
     (history, state, language, goal, history_times); its stochastic seed must be
     reset for each invocation to make counterfactual replay comparisons paired.
+    diagnose_endpoint has the same inputs as pi_predict and reads final visual
+    Z through the endpoint decoder, without action sampling or endpoint labels.
     """
     if not isinstance(thresholds, GoalThresholds):
         raise ValueError("evaluation requires explicit calibrated/noise-floor goal thresholds")
@@ -229,7 +282,12 @@ def evaluate_records(cases, training_goals, *, g_predict, thresholds, pi_predict
     modal = scene_modal_goals(training_goals, thresholds)
     if {case.source_id for case in cases} & {row["source_id"] for row in training_goals}:
         raise ValueError("training modal-goal sources must be disjoint from evaluation sources")
-    predictions, rows, prefixes, replays, bypass = {}, [], [], [], []
+    if endpoint_seed is not None and (type(endpoint_seed) is not int or endpoint_seed < 0):
+        raise ValueError("endpoint diagnostic seed must be a nonnegative integer")
+    if endpoint_pose_weight is not None and (type(endpoint_pose_weight) not in (int, float)
+            or not math.isfinite(endpoint_pose_weight) or endpoint_pose_weight < 0):
+        raise ValueError("endpoint pose supervision weight must be finite and nonnegative")
+    predictions, rows, prefixes, replays, bypass, endpoint_swaps = {}, [], [], [], [], []
     for case in cases:
         key = (case.scene, case.subgoal)
         if key not in modal:
@@ -282,6 +340,13 @@ def evaluate_records(cases, training_goals, *, g_predict, thresholds, pi_predict
                         replays.append({"id": case.id, "scene": case.scene, "task": case.task,
                             "path": "instruction_goal_2x2", "language": language_name, "goal": goal_name,
                             **_replay_error(actions, case.actions, case.actions_mask)})
+        if case.wrong_goal is not None and diagnose_endpoint is not None:
+            original = diagnose_endpoint(case.history, case.state, case.language, case.truth, case.history_times)
+            swapped = diagnose_endpoint(case.history, case.state, case.language, case.wrong_goal, case.history_times)
+            endpoint_swaps.append({"id": case.id, "scene": case.scene, "task": case.task,
+                "language": "correct" if case.language is not None else "empty", "seed": endpoint_seed,
+                "readout": "final_visual_Z_pose_decoder", "action_noise_used": False,
+                **endpoint_swap_metrics(original, swapped, case.truth, case.wrong_goal)})
     indexed = {case.id: case for case in cases}
     pair_rows = []
     for pair in pairs:
@@ -345,11 +410,21 @@ def evaluate_records(cases, training_goals, *, g_predict, thresholds, pi_predict
         replay_summary.append({"path": path, "language": language, "goal": goal,
             "masked_mse": grouped_statistics(selected, "masked_mse"),
             "masked_mae": grouped_statistics(selected, "masked_mae")})
+    endpoint_status = {"status": "measured" if endpoint_swaps else
+        "not_requested" if diagnose_endpoint is not None else "unavailable",
+        "pose_supervision_enabled": endpoint_pose_weight > 0 if endpoint_pose_weight is not None else None,
+        "pose_weight": endpoint_pose_weight}
+    if endpoint_swaps and endpoint_pose_weight == 0:
+        endpoint_status.update(status="untrained_readout",
+            reason="The effective endpoint pose loss weight is zero; raw readout motion is not supervised endpoint behavior.")
     return {"format_version": 1, "kind": "g_pi_evaluation_result", "thresholds": asdict(thresholds),
             "summary": summary, "cases": rows, "pairs": pair_rows, "pair_summary": typed,
             "quadruples": quad_rows, "quadruple_summary": grouped_statistics(quad_rows, "all_correct"),
             "resolution_curve": resolution, "prefix_curve": prefix_curve, "prefix_cases": prefixes,
             "action_replays": replays, "action_replay_summary": replay_summary,
+            "swap_goal_endpoints": endpoint_swaps,
+            "swap_goal_endpoint_summary": _endpoint_swap_summary(endpoint_swaps),
+            "swap_goal_endpoint_status": endpoint_status,
             "intent_bypass": bypass,
             "intent_bypass_status": {"status": "measured" if diagnose_intent is not None else "not_requested"},
             "intent_bypass_summary": {name: {measurement: {metric: grouped_statistics(
@@ -362,6 +437,8 @@ def evaluate_records(cases, training_goals, *, g_predict, thresholds, pi_predict
                 "Goal-region exclusion covers only the competing intent references provided.",
                 "Scene/task macro means treat repeated views and seeds as dependent observations.",
                 "Intent interventions measure sensitivity, not causal necessity or pathway usage proof.",
+                "Swapped-goal endpoint motion is a decoder readout, not an executed endpoint or task success.",
+                "Alternate-goal scene compatibility relies on the supplied case's goal provenance.",
                 "u_permuted holds robot features fixed; robot_without_demo recomputes native robot features with u fixed."]}
 
 
@@ -524,13 +601,22 @@ def evaluate_g_pi_cli(args):
     def pi_predict(history, state, language, target, times):
         pi.generator.manual_seed(seed)
         return pi.predict(history, state, language, target, frame_times=times)
+    endpoint_readout = None
+    if (pi is not None and getattr(interface, "pose_decoder", None) is not None
+            and callable(getattr(pi, "diagnose_endpoint", None))):
+        def endpoint_readout(history, state, language, target, times):
+            pi.generator.manual_seed(seed)
+            return pi.diagnose_endpoint(history, state, language, target, frame_times=times)
     result = evaluate_records(cases, training, g_predict=g.predict, thresholds=thresholds,
         pi_predict=pi_predict if pi is not None else None, pairs=manifest["pairs"], quadruples=manifest["quadruples"],
-        diagnose_intent=g.diagnose_intent if decoder.intent_mode == "connected" else None)
+        diagnose_intent=g.diagnose_intent if decoder.intent_mode == "connected" else None,
+        diagnose_endpoint=endpoint_readout, endpoint_seed=seed,
+        endpoint_pose_weight=pi_payload["pi_training"]["pose_weight"] if pi is not None else None)
     if decoder.intent_mode != "connected":
         result["intent_bypass_status"] = {"status": "not_applicable", "intent_mode": decoder.intent_mode,
                                           "reason": "The goal path has no connected u in this ablation."}
     result.update(encoder_identity=encoder.identity, registry=registry, seed=seed, split=manifest["split"],
+                  endpoint_effector_order=registry["end_effectors"],
                   shared_video_base=pi is not None and native is pi_native and encoder is pi_encoder,
                   input_sha256={str(filename.resolve()): file_sha256(filename) for filename in sorted(files)})
     output.parent.mkdir(parents=True, exist_ok=True)

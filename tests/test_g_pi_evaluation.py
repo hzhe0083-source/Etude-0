@@ -10,7 +10,8 @@ import torch
 
 from evo_wam.g_pi_controller import GoalThresholds
 from evo_wam.g_pi_evaluation import (EvaluationCase, _load_replay, delta_metrics, evaluate_g_pi_cli,
-    evaluate_records, grouped_statistics, scene_modal_goals, valid_goal_region, write_evaluation_plots)
+    endpoint_swap_metrics, evaluate_records, grouped_statistics, scene_modal_goals,
+    valid_goal_region, write_evaluation_plots)
 
 
 def goal(position=0., grip=0.):
@@ -155,6 +156,131 @@ class EvaluationMetricsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside"):
             self.run_records([replace(item, wrong_goal=item.truth)], pi_predict=pi)
 
+    def test_endpoint_swap_reports_per_effector_motion_and_direction(self):
+        def dual(left, right):
+            result = goal()
+            result["goal_poses"] = result["goal_poses"].repeat(1, 2, 1, 1)
+            result["goal_poses"][0, :, 0, 3] = torch.tensor([left, right])
+            result["goal_gripper"] = torch.zeros(1, 2)
+            return result
+        result = endpoint_swap_metrics(dual(0., 0.), dual(.5, -2.), dual(1., 1.), dual(2., 2.))
+        self.assertEqual([row["displacement_m"] for row in result["per_effector"]], [.5, 2.])
+        self.assertEqual([row["cosine_alignment"] for row in result["per_effector"]], [1., -1.])
+        self.assertEqual(result["aggregate"]["displacement_m"], 1.25)
+        self.assertEqual(result["aggregate"]["cosine_alignment"], 0.)
+        self.assertEqual(result["aggregate"]["valid_effectors"], 2)
+        self.assertTrue(result["aggregate"]["all_effectors_valid"])
+        partial = endpoint_swap_metrics(dual(0., 0.), dual(.5, 0.), dual(1., 1.), dual(2., 2.))
+        self.assertEqual(partial["aggregate"]["valid_effectors"], 1)
+        self.assertEqual(partial["aggregate"]["cosine_alignment"], 1.)
+        self.assertFalse(partial["aggregate"]["all_effectors_valid"])
+        self.assertIsNone(partial["per_effector"][1]["cosine_alignment"])
+
+    def test_endpoint_swap_zero_deltas_are_explicit_and_json_finite(self):
+        for old_q, new_q, old_g, new_g, zero_g, zero_q in (
+                (goal(), goal(1.), goal(), goal(), True, False),
+                (goal(), goal(), goal(), goal(1.), False, True),
+                (goal(), goal(), goal(), goal(), True, True)):
+            with self.subTest(zero_goal=zero_g, zero_motion=zero_q):
+                result = endpoint_swap_metrics(old_q, new_q, old_g, new_g)
+                row = result["per_effector"][0]
+                self.assertFalse(row["valid"])
+                self.assertIsNone(row["cosine_alignment"])
+                self.assertEqual(row["zero_goal_delta"], zero_g)
+                self.assertEqual(row["zero_endpoint_motion"], zero_q)
+                self.assertFalse(result["aggregate"]["valid"])
+                self.assertIsNone(result["aggregate"]["cosine_alignment"])
+                json.dumps(result, allow_nan=False)
+
+    def test_endpoint_readout_is_wired_without_changing_language_goal_replay(self):
+        actions = torch.ones(1, 1, 1, 2, 1)
+        mask = torch.ones_like(actions, dtype=torch.bool)
+        item = case(actions=actions, actions_mask=mask, language=torch.ones(1, 3, 2), wrong_goal=goal(2.))
+        replay_calls, endpoint_calls = [], []
+        def pi(history, state, language, target, times):
+            replay_calls.append((language is None, float(target["goal_poses"][0, 0, 0, 3])))
+            return torch.full_like(actions, float(target["goal_poses"][0, 0, 0, 3]))
+        def readout(history, state, language, target, times):
+            endpoint_calls.append((history, state, language, target, times))
+            return goal(float(target["goal_poses"][0, 0, 0, 3]) * .25)
+        report = self.run_records([item], pi_predict=pi, diagnose_endpoint=readout, endpoint_seed=17)
+        self.assertEqual(replay_calls, [(True, 1.), (True, 1.), (False, 1.), (False, 2.), (True, 1.), (True, 2.)])
+        self.assertEqual(len(report["action_replays"]), 6)
+        self.assertEqual(len(endpoint_calls), 2)
+        for values in endpoint_calls:
+            self.assertIs(values[0], item.history)
+            self.assertIs(values[1], item.state)
+            self.assertIs(values[2], item.language)
+            self.assertIs(values[4], item.history_times)
+        self.assertIs(endpoint_calls[0][3], item.truth)
+        self.assertIs(endpoint_calls[1][3], item.wrong_goal)
+        row = report["swap_goal_endpoints"][0]
+        self.assertEqual(row["seed"], 17)
+        self.assertFalse(row["action_noise_used"])
+        self.assertEqual(row["aggregate"]["displacement_m"], .25)
+        self.assertEqual(row["aggregate"]["cosine_alignment"], 1.)
+        self.assertEqual(report["swap_goal_endpoint_status"]["status"], "measured")
+        self.assertEqual(report["swap_goal_endpoint_summary"]["aggregate"]["cosine_alignment"]["macro_mean"], 1.)
+        self.assertIsNone(report["policy_success"])
+        json.dumps(report, allow_nan=False)
+
+    def test_endpoint_readout_runs_without_action_labels_and_skips_missing_swaps(self):
+        calls = []
+        def readout(history, state, language, target, times):
+            calls.append((history, state, language, target))
+            return goal()
+        report = self.run_records([case(wrong_goal=goal(2.))], diagnose_endpoint=readout)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(report["action_replays"], [])
+        self.assertIsNone(report["swap_goal_endpoint_summary"]["aggregate"]["cosine_alignment"]["macro_mean"])
+        self.assertEqual(report["swap_goal_endpoint_summary"]["degenerate_effectors"], 1)
+        self.assertEqual(report["swap_goal_endpoints"][0]["language"], "empty")
+        report = self.run_records([case()], diagnose_endpoint=readout)
+        self.assertEqual(report["swap_goal_endpoint_status"]["status"], "not_requested")
+        self.assertEqual(len(calls), 2)
+        report = self.run_records([case(wrong_goal=goal(2.))])
+        self.assertEqual(report["swap_goal_endpoint_status"]["status"], "unavailable")
+        self.assertEqual(report["swap_goal_endpoints"], [])
+
+    def test_endpoint_readout_rejects_invalid_pose_shapes_and_seed(self):
+        missing = {"goal_gripper": torch.zeros(1, 1)}
+        with self.assertRaisesRegex(ValueError, "goal_poses"):
+            endpoint_swap_metrics(missing, goal(), goal(), goal())
+        dual = goal()
+        dual["goal_poses"] = dual["goal_poses"].repeat(1, 2, 1, 1)
+        dual["goal_gripper"] = torch.zeros(1, 2)
+        with self.assertRaisesRegex(ValueError, "effector shape"):
+            endpoint_swap_metrics(dual, goal(), goal(), goal())
+        for seed in (-1, True):
+            with self.subTest(seed=seed), self.assertRaisesRegex(ValueError, "seed"):
+                self.run_records([case()], endpoint_seed=seed)
+
+    def test_no_lit_pose_contract_marks_unsupervised_endpoint_readout(self):
+        from evo_wam.g_pi_training import pi_stage_contract
+        from test_g_pi_training import config_for
+
+        config = config_for("pi_goal")
+        config["pi_training"]["ablations"]["no_lit_pose"] = True
+        payload = {"pi_training": pi_stage_contract(config, "pi")}
+        self.assertEqual(payload["pi_training"]["pose_weight"], 0.)
+        def readout(history, state, language, target, times):
+            return goal(float(target["goal_poses"][0, 0, 0, 3]))
+        report = self.run_records([case(wrong_goal=goal(2.))], diagnose_endpoint=readout,
+                                 endpoint_pose_weight=payload["pi_training"]["pose_weight"])
+        self.assertEqual(len(report["swap_goal_endpoints"]), 1)
+        status = report["swap_goal_endpoint_status"]
+        self.assertEqual(status["status"], "untrained_readout")
+        self.assertFalse(status["pose_supervision_enabled"])
+        self.assertEqual(status["pose_weight"], 0.)
+        self.assertIn("not supervised", status["reason"])
+        supervised = self.run_records([case(wrong_goal=goal(2.))], diagnose_endpoint=readout,
+                                      endpoint_pose_weight=.3)
+        self.assertEqual(supervised["swap_goal_endpoint_status"]["status"], "measured")
+        self.assertTrue(supervised["swap_goal_endpoint_status"]["pose_supervision_enabled"])
+        for weight in (-1., float("nan"), True):
+            with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "pose supervision weight"):
+                self.run_records([case()], endpoint_pose_weight=weight)
+
     def test_bypass_reports_separate_goal_change_and_truth_errors(self):
         report = self.run_records([case()], diagnose_intent=lambda *args: {
             "baseline": goal(1.), "u_permuted": goal(2.), "robot_without_demo": goal(3.)})
@@ -258,6 +384,26 @@ class EvaluationNativeTest(unittest.TestCase):
         self.assertTrue(output.with_suffix(".svg").is_file())
         self.assertEqual(len(result["prefix_cases"]), 10)
         self.assertEqual(len(result["action_replays"]), 6)
+        self.assertEqual(len(result["swap_goal_endpoints"]), 1)
+        self.assertEqual(result["swap_goal_endpoint_status"]["status"], "measured")
+        self.assertTrue(result["swap_goal_endpoint_status"]["pose_supervision_enabled"])
+        self.assertGreater(result["swap_goal_endpoint_status"]["pose_weight"], 0.)
+        endpoint = result["swap_goal_endpoints"][0]
+        self.assertEqual(endpoint["seed"], result["seed"])
+        self.assertFalse(endpoint["action_noise_used"])
+        self.assertEqual(endpoint["readout"], "final_visual_Z_pose_decoder")
+        self.assertEqual(result["endpoint_effector_order"], registry["end_effectors"])
+        self.assertEqual(len(endpoint["per_effector"]), len(registry["end_effectors"]))
+        goal_displacements = (wrong["goal_poses"].double()[..., :3, 3]
+                              - truth["goal_poses"].double()[..., :3, 3]).norm(dim=-1)[0].tolist()
+        for effector, expected_displacement in zip(endpoint["per_effector"], goal_displacements):
+            self.assertGreaterEqual(effector["displacement_m"], 0.)
+            self.assertEqual(effector["goal_displacement_m"], expected_displacement)
+            if effector["valid"]:
+                self.assertGreaterEqual(effector["cosine_alignment"], -1.)
+                self.assertLessEqual(effector["cosine_alignment"], 1.)
+            else:
+                self.assertIsNone(effector["cosine_alignment"])
         self.assertEqual(len(result["intent_bypass"]), 2)
         self.assertTrue(any(name.endswith("policy.json") for name in result["input_sha256"]))
         self.assertTrue(any(name.endswith(".safetensors") for name in result["input_sha256"]))

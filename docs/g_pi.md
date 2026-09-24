@@ -1,16 +1,82 @@
-# G（做什么）与 π（怎么做）：阶段 A、B、C
+# G（做什么）与 π（怎么做）：阶段 A–D
 
-本轮实现 A2–A7；**A1 已取消**。G 不读任务文字，视觉 DiT 始终使用原生空提示词。π 保留 `main@88df563` 的语言指令通路：LIT 读 `[L,s,g]`，动作专家读 `[L,s,Z_l]`。A7 新增可关闭的语言置空消融与无语言推理，默认 `p_drop=0`；默认语言选择与传递路径不变。
+阶段 A 已实现 A2–A7；**A1 已取消**。G 不读任务文字，视觉 DiT 始终使用原生空提示词。π 保留 `main@88df563` 的语言指令通路：LIT 读 `[L,s,g]`，动作专家读 `[L,s,Z_l]`。A7 新增可关闭的语言置空消融与无语言推理，默认 `p_drop=0`；默认语言选择与传递路径不变。
 
-阶段 B 已加入目的分组对比学习、冻结探针和离线评测，见 [阶段 B 使用说明](g_pi_intent.md)。G 保留单向示范→机器人交互作为默认，另提供 `via_u_only` 消融；π 的阶段 A 行为不变。
+阶段 B 已加入目的分组对比学习、冻结探针和离线评测，见 [阶段 B 使用说明](g_pi_intent.md)。G 保留单向示范→机器人交互作为默认，另提供 `via_u_only` 消融；π 的阶段 A 语言行为不变。
 
 阶段 C 的独立前缀缓存、E 离线目标缓存、π FSDP 与 HumanGen 转换/预检见 [阶段 C 使用说明](g_pi_scaling.md)。
 
 示范只进入 G；π 的动作学习只使用成功机器人录像。不做人机动作、阶段或帧对齐，没有 done 头、未来视频损失或联合训练。关系名、物体状态、关系序号和标定分组均为离线标签，不能进入模型。旧 `latent`、`direct_features`、`observed_dual`、H0–H3 路线保留原契约。
 
+## D：子目标输入与块终点监督
+
+π 现在分成 `pi_prior` 和 `pi` 两个训练阶段。**g=(z,p) 与 q_t 不是同一个角色**：g 是下一子目标 t′ 的输入条件，q_t 是当前实际监督动作块执行结束后的记录状态，仅用于训练。D 不修改 G 的阶段和输入。
+
+q 的控制索引是 `last_nonzero_action_mask_step + 1`，在有效动作通道和 t′ 截断完成之后计算，不从动作向量反推位姿。若块在 t′ 前结束，q 是中间状态；若最后受监督动作是 t′ 前一步，q 就是 t′ 状态。数据样本额外返回 `block_end_poses/gripper/time/index/valid`、`reaches_subgoal`，无需改现有 task v3 数组。
+
+选择的越界策略是 **屏蔽 L_q**，保留动作监督，并令 q 的位姿/夹爪为 None；prior 因需要 q 作条件会明确拒绝这种样本。现有合法 v3 事件/terminal 掩码通常已排除越界，保护分支仍独立测试。动作 mask 的空洞和尾部无效步会改变真实块终点，不能一律用 t+H 代替。
+
+| 阶段 | 动作条件 | 训练目标 | 更新范围 |
+| --- | --- | --- | --- |
+| `pi_prior` | `[L,s,E_eta(q)]`，每层同一组 token | 原掩码 flow action loss | 完整动作专家、独立 endpoint_encoder、共享 state/condition 投影及动作侧语言投影 |
+| `pi` | `[L,s,Z_l]`；Z_l 顺序读取 `[L,s,noisy_g]` 与机器人特征 | `L_action + lambda * goal_pose_loss(q_hat,q)` | 完整动作专家、LIT、子目标编码/投影、共享投影、端点解码器 |
+
+E_eta 是与语义子目标 `goal_encoder` **参数完全分开的 MLP**，输出与 Z 相同的 `[B,num_tokens,dim]`；默认 100 个。阶段一不读取视觉数组内容、人手示范或 g，不运行 E、视频分支或目标噪声；仍加载共享 native/E 对象以复用动作专家和基座身份，未另做纯动作权重加载器。
+
+阶段二从成功的 prior 工件迁移动作专家与共享 state/condition 投影，并创建新优化器；LIT、语义子目标编码器和 D_omega 新初始化。E_eta 不进入阶段二预测、优化器或 checkpoint，原 prior 工件哈希保留来源。D_omega 复用 `_PoseDecoder`，每末端一个查询，读取最后一层**全部 Z token**，避免单 key 双臂耦合；旧 SE(3)/G 解码方式保持不变。
+
+λ 配置为 `pi_training.pose_weight`，默认 **0.3**。损失复用现有米制平移缩放 MSE、旋转矩阵距离和夹爪 MSE；不是 LIT 的分位数归一化目标损失。日志给出 `lit_pose_before/reaches` 及各自 count，还有端点位置误差（米）、角度误差（度）和夹爪误差。FSDP 对有效 q 数量归一，before/reaches 分别按对应计数归一。
+
+```json
+"pi_training": {
+  "pose_weight": 0.3,
+  "goal_source": "hindsight",
+  "ablations": {"no_stage1": false, "no_lit_pose": false, "exact_goal": false}
+}
+```
+
+三个开关默认全关。`no_stage1` 允许明确跳过 prior；`no_lit_pose` 将有效 λ 置 0；`exact_goal` 跳过输入噪声。没有 prior 初始化且未声明 no_stage1，或阶段二噪声全零却未声明 exact_goal，均报错。对应示例配置为 `pi_goal_no_stage1.json`、`pi_goal_no_lit_pose.json`、`pi_goal_exact_goal.json`。`goal_source` 预留交叉拟合来源入口，当前只接受 hindsight；其他值明确报未实现。
+
+## D4：带噪 g，干净 q
+
+`goal_noise` 保留四个尺度：z_std、translation_std（米）、rotation_std（弧度）、gripper_std；增加 translation_max_m 和 rotation_max_deg（度）。z 先逐 token 归一化再加高斯噪声，沿用原有行为，不再二次归一化；夹爪加噪后限制在 `[0,1]`。平移和旋转轴角采用真正的球内截断高斯，不把大样本直接裁到边界；采用独立可恢复的 CPU goal RNG。
+
+正平移噪声必须同时声明 `candidate_separation_m` 与半径上限，且严格满足 `translation_max_m < candidate_separation_m / 2`；缺失或不满足就报错。candidate_separation_m 应为数据集中相关候选的经审核最小间距，不从末端轨迹猜测。旋转标准差为正时也必须指定有效角度上限。
+
+示例配置的尺度为 z=.03、平移=.005 m、旋转=.03 rad、夹爪=.02，上限 .02 m/10°，候选间距 .1 m。**这些只是 synthetic_dimensions_only 配置的手工示例，不是 G 的实测误差，也不适用于未经核查的真实数据。** 干净 q 永远不加噪、不进入阶段二网络。
+
+```bash
+.venv/bin/python -m evo_wam.cli calibrate-g-pi-noise \
+  --manifest /data/g-validation-residuals.json --output /tmp/pi-noise.json
+```
+
+标定 manifest 为 `g_pi_noise_validation` v1、`split:validation`，含 encoder_identity、registry、candidate_separation_m 和 records；每条 record 为 sample_id/source_group/prediction/reference，后两项指向已带 E/坐标身份的目标 JSON。至少两个独立来源组，可选 scale_quantile（默认 .95）。工具读取位置米、角度度、夹爪和 z 距离；各来源组等权，分位数除以维度平方根作为每坐标经验尺度，最大观测残差作为硬上限。任何位置残差达到候选间距的一半都会拒绝标定，不静默裁小错误物体预测。输出 `config` 字段可合入 π 配置，保留单位、原始残差与文件哈希；它不是高斯拟合或置信度保证。
+
+## D：两阶段命令、工件与换 g 诊断
+
+```bash
+.venv/bin/python -m evo_wam.cli train-goal-interface \
+  --config configs/se3/pi_prior.json --index /data/pi-index.json \
+  --stage pi_prior --tiny-native --steps 2 --device cuda --output /tmp/evo-pi-prior
+.venv/bin/python -m evo_wam.cli train-goal-interface \
+  --config configs/se3/pi_goal.json --index /data/pi-index.json \
+  --stage pi --initialize /tmp/evo-pi-prior/goal_interface.pt \
+  --tiny-native --steps 2 --device cuda --output /tmp/evo-pi
+```
+
+两阶段各自用 `--resume` 精确续训；初始化和续训互斥。prior 当前只支持单卡，启用 FSDP 明确报错。阶段二可使用 `pi_goal_fsdp.json` 和原 torchrun 入口，同样需 `--initialize`；D_omega 与 LIT 位于同一 FSDP 前向范围，包含在轻量保存与导出中。prior 工件只能续训/初始化，不能导出成需要输入 q 的部署策略。
+
+π 工件升为 v4，记录 stage、有效 λ、噪声配置、candidate_separation_m、消融及 prior 来源哈希；拒绝旧 π v3 静默加载。每阶段只存参与该阶段学习的接口/动作权重，冻结视频和 E 不入文件。G 仍用原 v4，数据/配置/观测仍为 v3。
+
+普通 `pi.predict(...)` 不执行 E_eta 或 D_omega。`pi.diagnose_endpoint(history,state,language,goal,frame_times=...)` 可仅解码 q_hat，不采动作、不消耗动作 RNG、不接收 q 标签；也可用 `predict(..., return_endpoint=True)` 请求附带诊断。
+
+现有 `evaluate-g-pi` 在 case 提供 wrong_goal 且加载 π 时增加换 g 读出：固定画面、状态、语言和 seed，报告每个末端 `q_hat(new)-q_hat(original)` 的位移米数、与目标 `p(new)-p(original)` 的方向余弦，以及分组汇总。零目标位移或零预测位移时余弦为 None，并记录有效性标志；不制造 NaN 或完美得分。不需要动作标签或真实机器人。λ=0 时标记 untrained_readout，不能把未监督头的位移解释成经过标定的块终点。
+
+与 [LIT 原文](https://arxiv.org/html/2609.12641v1)仍有差异：这里共享且冻结视频/E，π 额外接收子目标 g，动作专家直接读取语言和 state；阶段一从 Zero-WAM 动作权重初始化，而不是从头训练动作专家。L_q 的量纲也不同。输入噪声和辅助重建不能单独保证消除视觉捷径，效果仍需真实留出数据与诊断验证。
+
 ## 两套时间网格与 v3 数据
 
-G/π task、observation、实验配置及 π 工件为 **version/schema 3**；阶段 B 的 G 工件为 **version 4**，以区分新意图解码器。产品路线称 v2，与磁盘格式编号不同。旧工件不静默续训，旧的一维 E 缓存也因身份不一致被拒绝。本轮不提供旧模型权重初始化转换器。`g_pi_index` 仍为 version 1，保留 `samples`、source aliases 和 bridge split 审计。
+G/π task、observation、实验配置为 **version/schema 3**；G 和阶段 D 的 π 工件均为 **version 4**，分别记录各自架构。产品路线称 v2，与磁盘格式编号不同。旧工件不静默续训，旧的一维 E 缓存也因身份不一致被拒绝。本轮不提供旧模型权重初始化转换器。`g_pi_index` 仍为 version 1，保留 `samples`、source aliases 和 bridge split 审计。
 
 机器人 NPZ 的基础字段保持如下：
 
@@ -144,7 +210,8 @@ z 停止阈值没有默认值。程序调用需显式 GoalThresholds(z=...)；po
   --stage g --tiny-native --steps 2 --device cuda --output /tmp/evo-g
 .venv/bin/python -m evo_wam.cli train-goal-interface \
   --config configs/se3/pi_goal.json --index /data/pi-index.json \
-  --stage pi --tiny-native --steps 2 --device cuda --output /tmp/evo-pi
+  --stage pi --initialize /tmp/evo-pi-prior/goal_interface.pt \
+  --tiny-native --steps 2 --device cuda --output /tmp/evo-pi
 # 续训保留同配置/index/seed并添加 --resume 对应 goal_interface.pt。
 # 本轮仅验证 tiny；真实训练还需审计配置并提供本地 --checkpoint。
 .venv/bin/python -m evo_wam.cli predict-goal-policy \
@@ -152,7 +219,7 @@ z 停止阈值没有默认值。程序调用需显式 GoalThresholds(z=...)；po
   --device cuda --seed 0 --output /data/actions.npz
 ```
 
-checkpoint（G v4、π v3）仍只保存可训练 interface/action 权重、优化器/RNG/数据指纹与原始基座引用；E 和所有冻结参数不复制进文件。conditioning_mode 为 G 的 demo_robot_state_internal_empty、π 的 language_state_goal，p_drop 独立记录。原始基座与空提示词文件必须保留，--checkpoint 可迁移同哈希基座路径。旧工件因结构或身份不匹配被明确拒绝，不静默恢复。
+checkpoint（G v4、π v4）仍只保存各阶段可训练 interface/action 权重、优化器/RNG/数据指纹与原始基座引用；E 和所有冻结参数不复制进文件。conditioning_mode 为 G 的 demo_robot_state_internal_empty、π 的 language_state_goal，π 另有明确 stage 和监督角色，p_drop 独立记录。原始基座与空提示词文件必须保留，--checkpoint 可迁移同哈希基座路径。旧工件因结构或身份不匹配被明确拒绝，不静默恢复。
 
 v3 observation 的公共元数据保留机器人动作/坐标/两网格约定；NPZ 只有 state、history_latent、latent_available_times。当前控制步可以位于两个 latent 之间，但历史只能含完整已可用前缀。G 观测提供 demonstration，π 提供 goal 文件及可选 language；关系、物体状态、阶段索引等字段均被拒绝。
 

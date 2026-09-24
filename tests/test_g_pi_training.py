@@ -13,7 +13,7 @@ import torch
 from evo_wam.g_pi_context import frozen_base_checksum
 from evo_wam.g_pi_data import EventRules, load_g_pi_sample
 from evo_wam.g_pi_training import (ROUTES, _training_language, language_drop_probability, _base_location, _base_reference, _frozen_checksums, _optimizer, _restore_system, _set_precision, _system_state,
-    build_g_pi_system, export_g_pi_policy, g_pi_architecture, g_pi_artifact_version, g_pi_training_loss, g_intent_training_loss, intent_training_settings,
+    build_g_pi_system, export_g_pi_policy, g_pi_architecture, g_pi_artifact_version, g_pi_training_loss, g_intent_training_loss, intent_training_settings, pi_training_settings, pi_stage_contract, _check_stage, _interface_state, _initialization, _initialize_pi, _endpoint_losses,
     load_g_pi_policy, conditioning_mode, load_g_pi_encoder, read_g_pi_artifact, train_g_pi_interface, validate_g_pi_artifact, validate_g_pi_config)
 from evo_wam.goal_action import action_named_parameters
 from evo_wam.goal_training import goal_registry
@@ -40,6 +40,7 @@ def config_for(route):
         config["goal_interface"].update(num_layers=2, use_state=True)
     else:
         config["p_drop"] = .4
+        config["pi_training"] = {"ablations": {"no_stage1": True, "exact_goal": True}}
         config["goal_interface"].update(num_tokens=4, num_layer_groups=1, num_pose_tokens=1)
     return config
 
@@ -52,7 +53,8 @@ def contract_payload(route="g_translator"):
                 "base_id": {"kind": "fixture"}, "base_sha256": "a" * 64,
                 "empty_text_identity": {"source": {"kind": "fixture"}, "sha256": "b" * 64}}
     return {"format_version": g_pi_artifact_version(config), "kind": "g_pi_training", "config": config,
-            **({"demo_route": config.get("demo_route", "one_way")} if route == "g_translator" else {}),
+            **({"demo_route": config.get("demo_route", "one_way")} if route == "g_translator" else
+               {"pi_training": pi_stage_contract(config, "pi"), "stage1_artifact_sha256": None}),
             "interface_type": route, "conditioning_mode": conditioning_mode(config),
             "p_drop": language_drop_probability(config),
             "architecture": g_pi_architecture(config), "upstream_commit": ZERO_WAM_COMMIT,
@@ -68,6 +70,37 @@ def contract_payload(route="g_translator"):
 
 
 class GPiTrainingContractTest(unittest.TestCase):
+    def test_pi_stages_require_explicit_initialization_and_noise_ablations(self):
+        config = config_for("pi_goal")
+        config.pop("pi_training")
+        self.assertEqual(pi_training_settings(config)["pose_weight"], .3)
+        self.assertFalse(any(pi_training_settings(config)["ablations"].values()))
+        _check_stage(config, "pi_prior")
+        with self.assertRaisesRegex(ValueError, "exact_goal"):
+            _check_stage(config, "pi")
+        config["goal_noise"] = {"z_std": .03}
+        _check_stage(config, "pi")
+        with self.assertRaisesRegex(ValueError, "pi_prior.*initialize"):
+            _initialization(SimpleNamespace(stage="pi", initialize=None), config, None)
+        config["distributed"] = {"enabled": True}
+        with self.assertRaisesRegex(ValueError, "single-GPU"):
+            _check_stage(config, "pi_prior")
+        config.pop("distributed")
+        config["pi_training"] = {"goal_source": "crossfit"}
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            validate_g_pi_config(config)
+        for settings in ({"pose_weight": 0.}, {"ablations": {"no_stage1": 1}}, {"extra": True}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                validate_g_pi_config({**config, "pi_training": settings})
+        config["pi_training"] = {"ablations": {"no_lit_pose": True}}
+        self.assertEqual(pi_training_settings(config)["pose_weight"], 0.)
+        payload = contract_payload("pi_goal")
+        with self.assertRaisesRegex(ValueError, "old versions"):
+            read_g_pi_artifact(None, payload={**payload, "format_version": 3})
+        payload["pi_training"]["pose_weight"] = 9.
+        with self.assertRaisesRegex(ValueError, "endpoint loss"):
+            read_g_pi_artifact(None, payload=payload)
+
     def test_intent_config_modes_route_and_artifact_version_are_explicit(self):
         for mode in ("regression_only", "independent", "connected"):
             config = config_for("g_translator")
@@ -88,7 +121,7 @@ class GPiTrainingContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "never sees"):
             validate_g_pi_config({**config_for("pi_goal"), "intent_training": {}})
         self.assertEqual(g_pi_artifact_version(config_for("g_translator")), 4)
-        self.assertEqual(g_pi_artifact_version(config_for("pi_goal")), 3)
+        self.assertEqual(g_pi_artifact_version(config_for("pi_goal")), 4)
         payload = contract_payload()
         with self.assertRaisesRegex(ValueError, "demo_route"):
             read_g_pi_artifact(None, payload={**payload, "demo_route": "via_u_only"})
@@ -321,7 +354,9 @@ class GPiBaseConstructionTest(unittest.TestCase):
             history=torch.zeros(1, 4, 1, 1, 2), history_times=torch.zeros(1),
             language=torch.full((1, 5, 8), -3.), goal_poses=torch.eye(4)[None, None],
             goal_gripper=torch.zeros(1, 1), actions=torch.zeros(1, 3, 2, 4, 1),
-            actions_mask=torch.ones(1, 3, 2, 4, 1, dtype=torch.bool))
+            actions_mask=torch.ones(1, 3, 2, 4, 1, dtype=torch.bool),
+            block_end_valid=True, block_end_poses=torch.eye(4)[None, None],
+            block_end_gripper=torch.zeros(1, 1), reaches_subgoal=False)
         features = {layer: torch.zeros(1, 2, native.inner_dim) for layer in layers}
         z = torch.nn.functional.normalize(torch.ones(1, encoder.k_z, encoder.d_z), dim=-1)
         projection = native.condition_embedder_action.text_embedder
@@ -657,6 +692,112 @@ class GPiNativeTrainingTest(unittest.TestCase):
                 else:
                     self.assertFalse(changed)
                 self.assertFalse(encoder.state_dict())
+
+    def stage_args(self, stage, output, *, steps=1, resume=None, initialize=None):
+        args = self.args("pi_goal", output, steps=steps, resume=resume)
+        args.stage, args.initialize = stage, initialize
+        config = json.loads(Path(args.config).read_text())
+        config["pi_training"] = {}
+        config["goal_noise"] = ({"z_std": .03, "translation_std": .005, "rotation_std": .02,
+            "gripper_std": .01, "translation_max_m": .02, "rotation_max_deg": 5.} if stage == "pi" else {})
+        if stage == "pi":
+            config["candidate_separation_m"] = .1
+        Path(args.config).write_text(json.dumps(config))
+        return args
+
+    def test_prior_has_no_visual_forward_and_exact_resume_owns_only_prior_parameters(self):
+        from evo_wam.g_pi_context import FrozenGoalEncoder
+
+        forbidden = AssertionError("stage 1 accessed a visual path")
+        with patch.object(FrozenGoalEncoder, "forward", side_effect=forbidden), \
+             patch("evo_wam.g_pi_context.pi_context_features", side_effect=forbidden), \
+             patch("evo_wam.g_pi_context.split_g_context_features", side_effect=forbidden):
+            complete = train_g_pi_interface(self.stage_args("pi_prior", "prior-full", steps=2))
+            partial = train_g_pi_interface(self.stage_args("pi_prior", "prior-part"))
+            resumed = train_g_pi_interface(self.stage_args("pi_prior", "prior-part", resume=partial["artifact"]))
+        full, continued = read_g_pi_artifact(complete["artifact"]), read_g_pi_artifact(resumed["artifact"])
+        for key in ("model", "optimizer", "rng", "torch_rng", "cuda_rng", "frozen_checksums"):
+            self.assert_same(full[key], continued[key])
+        self.assertEqual(full["stage"], "pi_prior")
+        self.assertTrue(all(key.startswith(("endpoint_encoder.", "state_encoder.", "condition_adapter."))
+                            for key in full["model"]["interface"]))
+        self.assertTrue(any(key.startswith("endpoint_encoder.") for key in full["model"]["interface"]))
+        self.assertFalse(full["pi_training"]["goal_noise_enabled"])
+        self.assertEqual(full["pi_training"]["pose_weight"], 0.)
+        with self.assertRaisesRegex(ValueError, "not goal-policy deployment"):
+            export_g_pi_policy(SimpleNamespace(artifact=complete["artifact"], output=self.root / "prior-export",
+                                               stop_thresholds=explicit_thresholds()))
+
+    def test_stage2_transfers_only_shared_parameters_and_resumes_noisy_endpoint_training(self):
+        prior_report = train_g_pi_interface(self.stage_args("pi_prior", "prior"))
+        prior = read_g_pi_artifact(prior_report["artifact"])
+        args = self.stage_args("pi", "visual-full", steps=2, initialize=prior_report["artifact"])
+        config = json.loads(Path(args.config).read_text())
+        sample = load_g_pi_sample(self.path, route="pi_goal", generator=torch.Generator().manual_seed(0))
+        native, interface, encoder, identity, layers = build_g_pi_system(config, goal_registry(sample),
+            stage="pi", tiny_native=True, device="cuda")
+        before = {key: value.detach().clone() for key, value in interface.state_dict().items()}
+        _initialize_pi(native, interface, encoder, config, goal_registry(sample), prior, identity, layers)
+        for key, value in interface.state_dict().items():
+            if key.startswith(("state_encoder.", "condition_adapter.")):
+                torch.testing.assert_close(value.cpu(), prior["model"]["interface"][key], rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+        for key, value in action_named_parameters(native):
+            torch.testing.assert_close(value.cpu(), prior["model"]["action"][key], rtol=0, atol=0)
+        self.assertFalse(any(value.requires_grad for value in interface.endpoint_encoder.parameters()))
+        self.assertFalse(_optimizer(native, interface, encoder, config).state)
+        self.assertFalse(any(key.startswith("endpoint_encoder.") for key in _system_state(native, interface, encoder)["interface"]))
+        del native, interface, encoder
+        complete = train_g_pi_interface(args)
+        partial = train_g_pi_interface(self.stage_args("pi", "visual-part", initialize=prior_report["artifact"]))
+        resumed = train_g_pi_interface(self.stage_args("pi", "visual-part", resume=partial["artifact"]))
+        full, continued = read_g_pi_artifact(complete["artifact"]), read_g_pi_artifact(resumed["artifact"])
+        for key in ("model", "optimizer", "rng", "torch_rng", "cuda_rng", "frozen_checksums", "pi_training"):
+            self.assert_same(full[key], continued[key])
+        self.assertEqual(full["stage1_artifact_sha256"], file_sha256(prior_report["artifact"]))
+        self.assertEqual(full["pi_training"]["pose_weight"], .3)
+        self.assertTrue(full["pi_training"]["goal_noise_enabled"])
+        self.assertTrue(any(key.startswith("pose_decoder.") for key in full["model"]["interface"]))
+        metrics = [json.loads(line) for line in (self.root / "visual-full/metrics.jsonl").read_text().splitlines()]
+        self.assertTrue(all(row["endpoint_valid_count"] == 1 for row in metrics))
+        self.assertTrue(all(row["lit_pose_before_count"] + row["lit_pose_reaches_count"] == 1 for row in metrics))
+        self.assertTrue(all(row["endpoint_position_error_m"] >= 0 and row["endpoint_orientation_error_deg"] >= 0
+                            and row["endpoint_gripper_error"] >= 0 for row in metrics))
+        exported = export_g_pi_policy(SimpleNamespace(artifact=complete["artifact"], output=self.root / "stage2-policy",
+            stop_thresholds=explicit_thresholds(), dtype="bfloat16", max_shard_size="20KB"))
+        native, interface, encoder, _ = load_g_pi_policy(exported["policy"], device="cuda")
+        self.assert_same(full["model"], _system_state(native, interface, encoder))
+
+    def test_endpoint_labels_never_enter_stage2_conditions_and_invalid_labels_are_masked(self):
+        from dataclasses import replace
+
+        args = self.stage_args("pi", "loss-only")
+        config = json.loads(Path(args.config).read_text())
+        sample = load_g_pi_sample(self.path, route="pi_goal", generator=torch.Generator().manual_seed(0))
+        native, interface, encoder, _, layers = build_g_pi_system(config, goal_registry(sample),
+            stage="pi", tiny_native=True, device="cuda")
+        clean_pose, clean_grip = sample.block_end_poses.clone(), sample.block_end_gripper.clone()
+        def loss(current):
+            generators = {name: torch.Generator().manual_seed(i) for i, name in enumerate(("sample", "action", "goal", "language"))}
+            return g_pi_training_loss(native, interface, encoder, current, config, generators, stage="pi", feature_layers=layers)
+        first = loss(sample)
+        other_pose = clean_pose.clone()
+        other_pose[..., :3, 3] += .8
+        second = loss(replace(sample, block_end_poses=other_pose))
+        torch.testing.assert_close(first["action"], second["action"], rtol=0, atol=0)
+        self.assertNotEqual(float(first["lit_pose"].detach()), float(second["lit_pose"].detach()))
+        torch.testing.assert_close(sample.block_end_poses, clean_pose, rtol=0, atol=0)
+        torch.testing.assert_close(sample.block_end_gripper, clean_grip, rtol=0, atol=0)
+        masked = loss(replace(sample, block_end_valid=False, block_end_poses=None, block_end_gripper=None))
+        self.assertEqual(float(masked["lit_pose"]), 0.)
+        self.assertEqual(float(masked["endpoint_valid_count"]), 0.)
+        torch.testing.assert_close(masked["total"], masked["action"], rtol=0, atol=0)
+        native.zero_grad(set_to_none=True)
+        interface.zero_grad(set_to_none=True)
+        masked["total"].backward()
+        self.assertTrue(all(p.grad is not None and not p.grad.any() for p in interface.pose_decoder.parameters()))
+        self.assertTrue(all(p.grad is None for p in interface.endpoint_encoder.parameters()))
 
     def test_cached_targets_preserve_updates_and_resume_without_calling_E(self):
         from evo_wam.g_pi_context import FrozenGoalEncoder

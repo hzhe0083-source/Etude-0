@@ -696,7 +696,7 @@ def main(argv=None):
     goal_train.add_argument("--config", required=True)
     goal_train.add_argument("--index", required=True)
     goal_train.add_argument("--intent-groups", help="offline whole-demonstration purpose table for G contrastive training")
-    goal_train.add_argument("--stage", required=True, choices=("goal", "visual", "joint", "g", "pi"))
+    goal_train.add_argument("--stage", required=True, choices=("goal", "visual", "joint", "g", "pi_prior", "pi"))
     goal_train.add_argument("--checkpoint")
     goal_train.add_argument("--tiny-native", action="store_true")
     goal_train.add_argument("--steps", type=int, default=1)
@@ -727,6 +727,9 @@ def main(argv=None):
     goal_calibrate.add_argument("--artifact", help="G/pi training artifact for encoding uncached validation goals")
     goal_calibrate.add_argument("--checkpoint", help="local base checkpoint override")
     goal_calibrate.add_argument("--device", default="cuda")
+    noise_calibrate = commands.add_parser("calibrate-g-pi-noise", help="calibrate bounded subgoal input noise from G validation residuals")
+    noise_calibrate.add_argument("--manifest", required=True)
+    noise_calibrate.add_argument("--output", required=True)
     goal_candidates = commands.add_parser("generate-g-pi-candidates", help="build weak subgoal labels from measured gripper and visual robot poses")
     goal_candidates.add_argument("--manifest", required=True)
     goal_candidates.add_argument("--output", required=True)
@@ -875,6 +878,9 @@ def main(argv=None):
         elif args.command == "calibrate-g-pi-stop":
             from .g_pi_calibration import calibrate_g_pi_thresholds
             result = calibrate_g_pi_thresholds(args)
+        elif args.command == "calibrate-g-pi-noise":
+            from .g_pi_noise import calibrate_g_pi_noise
+            result = calibrate_g_pi_noise(args)
         elif args.command == "generate-g-pi-candidates":
             from .g_pi_subgoals import generate_candidate_annotation
             result = generate_candidate_annotation(args.manifest, args.output)

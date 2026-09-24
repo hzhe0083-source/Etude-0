@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 
 import torch
 from torch import Tensor, nn
@@ -154,40 +155,15 @@ def g_goal_loss(prediction: dict, target: dict, translation_scale: float = 1.,
 
 def perturb_goal(goal: dict, *, z_std: float = 0., translation_std: float = 0.,
                  rotation_std: float = 0., gripper_std: float = 0.,
+                 translation_max_m: float | None = None, rotation_max_deg: float | None = None,
+                 candidate_separation_m: float | None = None,
                  generator: torch.Generator | None = None) -> dict[str, Tensor]:
-    """Perturb detached goals; rotation_std is in radians, translation in metres."""
-    scales = (z_std, translation_std, rotation_std, gripper_std)
-    if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in scales):
-        raise ValueError("goal noise scales must be finite and nonnegative")
-    if not isinstance(goal, dict) or not {"z", "goal_poses", "goal_gripper"} <= goal.keys():
-        raise ValueError("goal must contain z, goal_poses and goal_gripper")
-    validate_goal_poses(goal["goal_poses"])
-    validate_gripper(goal["goal_gripper"], goal["goal_poses"].shape[:2])
-    z = normalize_z(goal["z"]).detach()
-    poses, gripper = goal["goal_poses"].detach().clone(), goal["goal_gripper"].detach().clone()
-    if z.shape[0] != poses.shape[0]:
-        raise ValueError("z and poses must share a batch")
-    if generator is not None and (not isinstance(generator, torch.Generator) or generator.device.type != "cpu"):
-        raise ValueError("goal noise requires a CPU torch.Generator")
-
-    def noise_like(value):
-        return torch.randn(value.shape, generator=generator, device="cpu").to(value)
-
-    if z_std:
-        z = z + z_std * noise_like(z)
-    if translation_std:
-        poses[..., :3, 3] += translation_std * noise_like(poses[..., :3, 3])
-    if rotation_std:
-        vector = rotation_std * noise_like(poses[..., :3, 3]).float()
-        x, y, z_axis = vector.unbind(-1)
-        zeros = torch.zeros_like(x)
-        skew = torch.stack((zeros, -z_axis, y, z_axis, zeros, -x, -y, x, zeros), -1).unflatten(-1, (3, 3))
-        rotation = torch.matrix_exp(skew) @ poses[..., :3, :3].float()
-        poses = poses.float()
-        poses[..., :3, :3] = rotation
-    if gripper_std:
-        gripper = (gripper + gripper_std * noise_like(gripper)).clamp(0, 1)
-    return {"z": z, "goal_poses": poses, "goal_gripper": gripper}
+    """Detached hindsight goal noise with explicit spatial/angular support."""
+    from .g_pi_noise import perturb_goal_bounded
+    return perturb_goal_bounded(goal, z_std=z_std, translation_std=translation_std,
+        rotation_std=rotation_std, gripper_std=gripper_std, translation_max_m=translation_max_m,
+        rotation_max_deg=rotation_max_deg, candidate_separation_m=candidate_separation_m,
+        generator=generator)
 
 
 class PiGoalInterface(GoalInterface):
@@ -199,10 +175,36 @@ class PiGoalInterface(GoalInterface):
             raise ValueError("d_z and k_z must be positive integers")
         super().__init__(native_dim, feature_dim, state_dim, effectors, **kwargs)
         self.d_z, self.k_z = d_z, k_z
-        # No auxiliary pose prediction is used by the robot-only action route.
-        del self.pose_decoder
+        # The prior encoder and semantic subgoal encoder never share parameters.
+        self.endpoint_encoder = deepcopy(self.goal_encoder)
+        # Every effector query reads the complete final workspace, not one key.
+        self.pose_decoder = _PoseDecoder(self.dim, effectors, self.num_heads,
+                                         self.translation_scale, self.num_tokens)
         self.z_projection = nn.Linear(d_z, native_dim)
         self.z_position = nn.Parameter(torch.randn(1, k_z, native_dim) / math.sqrt(native_dim))
+
+    def encode_endpoint(self, poses: Tensor, gripper: Tensor) -> Tensor:
+        """Encode the clean executed-block endpoint for the image-free prior."""
+        validate_goal_poses(poses)
+        if poses.shape[1] != self.effectors:
+            raise ValueError("block endpoint poses must contain the configured number of effectors")
+        validate_gripper(gripper, poses.shape[:2], "block endpoint gripper")
+        value = poses.detach().to(self.endpoint_encoder[0].weight)
+        rotation = value[..., :3, :2].transpose(-1, -2).flatten(-2)
+        endpoint = torch.cat((value[..., :3, 3] / self.translation_scale, rotation,
+                              gripper.detach().to(value).unsqueeze(-1)), -1)
+        return self.endpoint_encoder(endpoint.flatten(1))
+
+    def endpoint_conditions(self, poses: Tensor, gripper: Tensor, state: Tensor,
+                            language_hidden: Tensor) -> list[Tensor]:
+        """Stage 1 reads [language,state,E_eta(q)] without images or subgoals."""
+        tokens = self.encode_endpoint(poses, gripper)
+        condition = self.condition(tokens, state, language_hidden)
+        return [condition] * self.num_layers
+
+    def decode_endpoint(self, tokens: Tensor) -> dict[str, Tensor]:
+        """Diagnostic/auxiliary readout from final visual tokens only."""
+        return self.pose_decoder(self._tokens(tokens))
 
     def goal_semantic(self, language_hidden: Tensor, state: Tensor, goal: dict) -> Tensor:
         semantic = self.semantic(language_hidden, state)
@@ -222,7 +224,10 @@ class PiGoalInterface(GoalInterface):
                           self.condition_adapter(poses)), dim=1)
 
     def conditions(self, features: dict[int, Tensor], state: Tensor, language_hidden: Tensor,
-                   goal: dict, frame_times: Tensor, patch_coordinates: Tensor) -> list[Tensor]:
+                   goal: dict, frame_times: Tensor, patch_coordinates: Tensor, *,
+                   return_tokens: bool = False) -> list[Tensor] | tuple[list[Tensor], Tensor]:
+        if type(return_tokens) is not bool:
+            raise ValueError("return_tokens must be Boolean")
         if not isinstance(features, dict) or list(features) != list(range(self.num_layers)):
             raise ValueError("robot features must contain every configured layer in depth order")
         if (not isinstance(frame_times, Tensor) or frame_times.ndim != 1
@@ -239,7 +244,16 @@ class PiGoalInterface(GoalInterface):
             visual = feature.detach().unflatten(1, (frames, patches))
             tokens = self.read_layer(tokens, visual, semantic, frame_times, patch_coordinates, index)
             conditions.append(self.condition(tokens, state, language_hidden))
-        return conditions
+        return (conditions, tokens) if return_tokens else conditions
+
+    def stage2_conditions(self, features: dict[int, Tensor], state: Tensor, language_hidden: Tensor,
+                          goal: dict, frame_times: Tensor, patch_coordinates: Tensor) -> tuple[list[Tensor], dict]:
+        """Keep the auxiliary readout inside the same FSDP forward scope."""
+        # Bypass a separately registered conditions wrapper while inside this
+        # FSDP scope; its post-forward hook must not reshard before the readout.
+        conditions, tokens = PiGoalInterface.conditions(self, features, state, language_hidden, goal,
+                                                       frame_times, patch_coordinates, return_tokens=True)
+        return conditions, self.decode_endpoint(tokens)
 
 
 class GTranslator(nn.Module):
@@ -403,11 +417,10 @@ class PiGoalPolicy(nn.Module):
         self.video_native.eval()
         return self
 
-    @torch.no_grad()
-    def predict(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor | None = None,
-                goal: dict | None = None, *,
-                current_index: int | None = None, frame_times: Tensor | None = None,
-                use_prefix_cache: bool = False) -> Tensor:
+    def _read_conditions(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor | None,
+                         goal: dict | None, *, current_index: int | None = None,
+                         frame_times: Tensor | None = None, use_prefix_cache: bool = False,
+                         return_tokens: bool = False):
         from .g_pi_context import pi_context_features, truncate_robot_history
         from .goal_training import autocast_for
         if not isinstance(goal, dict):
@@ -442,7 +455,36 @@ class PiGoalPolicy(nn.Module):
         with autocast_for(self.native):
             projection = self.native.condition_embedder_action.text_embedder
             language_hidden = projection(language.to(projection.linear_1.weight))
-            conditions = self.interface.conditions(features, state, language_hidden, goal, frame_times, coordinates)
-            return goal_action_sample(self.native, conditions, self.action_shape, self.actions_mask,
-                                      self.generator, steps=self.config.get("action_sampling_steps", 4),
-                                      shift=self.config.get("action_sampling_shift", 1.))
+            return self.interface.conditions(features, state, language_hidden, goal, frame_times, coordinates,
+                                             return_tokens=return_tokens)
+
+    @torch.no_grad()
+    def diagnose_endpoint(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor | None = None,
+                          goal: dict | None = None, *, current_index: int | None = None,
+                          frame_times: Tensor | None = None, use_prefix_cache: bool = False) -> dict:
+        """Read the inferred clean block endpoint without sampling an action."""
+        from .goal_training import autocast_for
+        _, tokens = self._read_conditions(robot_frames_t0_to_t, state, language, goal,
+            current_index=current_index, frame_times=frame_times, use_prefix_cache=use_prefix_cache,
+            return_tokens=True)
+        with autocast_for(self.native):
+            return self.interface.decode_endpoint(tokens)
+
+    @torch.no_grad()
+    def predict(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor | None = None,
+                goal: dict | None = None, *,
+                current_index: int | None = None, frame_times: Tensor | None = None,
+                use_prefix_cache: bool = False, return_endpoint: bool = False) -> Tensor | dict:
+        from .goal_training import autocast_for
+        if type(return_endpoint) is not bool:
+            raise ValueError("return_endpoint must be Boolean")
+        result = self._read_conditions(robot_frames_t0_to_t, state, language, goal,
+            current_index=current_index, frame_times=frame_times, use_prefix_cache=use_prefix_cache,
+            return_tokens=return_endpoint)
+        conditions, tokens = result if return_endpoint else (result, None)
+        with autocast_for(self.native):
+            actions = goal_action_sample(self.native, conditions, self.action_shape, self.actions_mask,
+                                         self.generator, steps=self.config.get("action_sampling_steps", 4),
+                                         shift=self.config.get("action_sampling_shift", 1.))
+            return ({"actions": actions, "endpoint": self.interface.decode_endpoint(tokens)}
+                    if return_endpoint else actions)

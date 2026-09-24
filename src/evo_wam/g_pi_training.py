@@ -22,11 +22,11 @@ ROUTES = {"g_translator": "g", "pi_goal": "pi"}
 
 
 def g_pi_architecture(config):
-    return {"g_translator": "g_translator_intent_v4", "pi_goal": "pi_goal_grid_v3"}[config["interface_type"]]
+    return {"g_translator": "g_translator_intent_v4", "pi_goal": "pi_goal_endpoint_v4"}[config["interface_type"]]
 
 
 def g_pi_artifact_version(config):
-    return 4 if isinstance(config, dict) and config.get("interface_type") == "g_translator" else 3
+    return 4
 
 
 def intent_training_settings(config):
@@ -46,9 +46,45 @@ def language_drop_probability(config):
     return config.get("p_drop", 0.)
 
 
+def pi_training_settings(config):
+    values = config.get("pi_training", {})
+    if (not isinstance(values, dict) or values.keys() - {"pose_weight", "ablations", "goal_source"}):
+        raise ValueError("pi_training requires pose_weight, ablations and goal_source only")
+    ablations = values.get("ablations", {})
+    if (not isinstance(ablations, dict) or ablations.keys() - {"no_stage1", "no_lit_pose", "exact_goal"}
+            or any(type(value) is not bool for value in ablations.values())):
+        raise ValueError("pi ablations require Boolean no_stage1, no_lit_pose and exact_goal")
+    result = {"pose_weight": .3, "goal_source": "hindsight", **values,
+              "ablations": {"no_stage1": False, "no_lit_pose": False, "exact_goal": False, **ablations}}
+    weight = result["pose_weight"]
+    if type(weight) not in (int, float) or not math.isfinite(weight) or weight < 0:
+        raise ValueError("pi pose_weight must be finite and nonnegative")
+    if result["ablations"]["no_lit_pose"]:
+        result["pose_weight"] = 0.
+    elif weight == 0:
+        raise ValueError("zero pi pose_weight requires explicit no_lit_pose ablation")
+    if result["goal_source"] != "hindsight":
+        raise ValueError("pi goal_source supports hindsight only; cross-fitted G predictions are reserved and unsupported")
+    return result
+
+
 def _check_stage(config, stage):
-    if stage != ROUTES.get(config.get("interface_type")):
-        raise ValueError("g_translator requires stage g; pi_goal requires independent stage pi")
+    valid = {"g_translator": {"g"}, "pi_goal": {"pi_prior", "pi"}}
+    if stage not in valid.get(config.get("interface_type"), set()):
+        raise ValueError("g_translator requires stage g; pi_goal requires stage pi_prior or pi")
+    if stage == "pi" and not pi_training_settings(config)["ablations"]["exact_goal"]:
+        if not any(config.get("goal_noise", {}).get(key, 0.) for key in
+                   ("z_std", "translation_std", "rotation_std", "gripper_std")):
+            raise ValueError("pi stage 2 requires goal noise or the explicit exact_goal ablation")
+    if stage == "pi_prior":
+        from .g_pi_distributed import distributed_settings
+
+        if distributed_settings(config)["enabled"]:
+            raise ValueError("pi_prior currently supports single-GPU training only, without FSDP")
+        if config.get("target_cache_index"):
+            raise ValueError("pi_prior never reads image targets or an E target cache")
+        if pi_training_settings(config)["ablations"]["no_stage1"]:
+            raise ValueError("pi_prior cannot run with the no_stage1 ablation")
 
 
 def validate_g_pi_config(config):
@@ -131,11 +167,17 @@ def validate_g_pi_config(config):
     if type(config.get("action_sampling_steps")) is not int or config["action_sampling_steps"] < 1:
         raise ValueError("action_sampling_steps must be a positive integer")
     noise = config.get("goal_noise", {})
-    if (not isinstance(noise, dict) or noise.keys() - {"z_std", "translation_std", "rotation_std", "gripper_std"}
-            or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in noise.values())):
-        raise ValueError("goal_noise scales must be finite nonnegative z/translation/rotation/gripper standard deviations")
-    if config["interface_type"] == "g_translator" and any(noise.values()):
-        raise ValueError("goal noise is only supported for hindsight pi training")
+    if config["interface_type"] == "pi_goal":
+        from .g_pi_noise import validate_goal_noise
+
+        pi_training_settings(config)
+        validate_goal_noise(noise, candidate_separation_m=config.get("candidate_separation_m"))
+    else:
+        if "pi_training" in config or "candidate_separation_m" in config:
+            raise ValueError("G does not use pi stage, endpoint or goal-noise training settings")
+        if (not isinstance(noise, dict) or noise.keys() - {"z_std", "translation_std", "rotation_std", "gripper_std"}
+                or any(type(v) not in (int, float) or not math.isfinite(v) or v != 0 for v in noise.values())):
+            raise ValueError("goal noise is only supported for hindsight pi training")
     from .g_pi_distributed import distributed_settings
 
     distributed_settings(config)
@@ -187,11 +229,35 @@ def _set_precision(native, *, video_precision, route):
     return native
 
 
-def _set_training(native, interface, encoder, config):
+def _interface_state(interface, *, stage=None):
+    from .g_pi_interface import PiGoalInterface
+
+    values = interface.state_dict()
+    if not isinstance(interface, PiGoalInterface):
+        return values
+    stage = stage or getattr(interface, "_g_pi_stage", "pi")
+    if stage == "pi_prior":
+        return {name: value for name, value in values.items()
+                if name.startswith(("endpoint_encoder.", "state_encoder.", "condition_adapter."))}
+    if stage == "pi":
+        return {name: value for name, value in values.items() if not name.startswith("endpoint_encoder.")}
+    raise ValueError("pi interface checkpoint ownership requires pi_prior or pi stage")
+
+
+def _set_training(native, interface, encoder, config, stage=None):
+    stage = stage or ROUTES[config["interface_type"]]
+    _check_stage(config, stage)
     native.eval().requires_grad_(False)
     encoder.eval().requires_grad_(False)
+    interface._g_pi_stage = stage
     interface.train().requires_grad_(True)
     if config["interface_type"] == "pi_goal":
+        if stage == "pi_prior":
+            interface.requires_grad_(False)
+            for name in ("endpoint_encoder", "state_encoder", "condition_adapter"):
+                getattr(interface, name).requires_grad_(True)
+        else:
+            interface.endpoint_encoder.requires_grad_(False)
         for _, parameter in action_named_parameters(native):
             parameter.requires_grad_(True)
 
@@ -244,7 +310,7 @@ def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=F
     native, encoder, identity, layers = build_g_pi_encoder(config, stage=stage, checkpoint=checkpoint,
         tiny_native=tiny_native, device=device, video_precision=video_precision)
     interface = _interface(native, config, registry)
-    _set_training(native, interface, encoder, config)
+    _set_training(native, interface, encoder, config, stage)
     return native, interface, encoder, identity, layers
 
 
@@ -261,10 +327,10 @@ def _check_sample(sample, config, registry):
         raise ValueError("event_rules differ between configuration and task data")
 
 
-def noisy_goal(goal, generator, settings):
-    from .g_pi_interface import perturb_goal
+def noisy_goal(goal, generator, settings, *, candidate_separation_m=None):
+    from .g_pi_noise import perturb_goal_bounded
 
-    return perturb_goal(goal, generator=generator, **settings)
+    return perturb_goal_bounded(goal, generator=generator, candidate_separation_m=candidate_separation_m, **settings)
 
 
 def _training_language(native, language, generator, probability):
@@ -283,6 +349,30 @@ def _training_language(native, language, generator, probability):
     return language
 
 
+def _endpoint_losses(prediction, sample, interface):
+    from .goal_interface import goal_pose_loss
+
+    anchor = (prediction["goal_poses"].sum() + prediction["goal_gripper"].sum()) * 0
+    valid = sample.block_end_valid
+    if valid:
+        loss = goal_pose_loss(prediction["goal_poses"], sample.block_end_poses,
+            translation_scale=interface.translation_scale, gripper_prediction=prediction["goal_gripper"],
+            gripper_target=sample.block_end_gripper)
+    else:
+        loss = {name: anchor for name in ("total", "position_error_m", "orientation_error_deg", "gripper_error")}
+    reaches = valid and sample.reaches_subgoal
+    before = valid and not sample.reaches_subgoal
+    return {"lit_pose": loss["total"],
+        "lit_pose_before": loss["total"] if before else anchor,
+        "lit_pose_reaches": loss["total"] if reaches else anchor,
+        "lit_pose_before_count": anchor.detach() + int(before),
+        "lit_pose_reaches_count": anchor.detach() + int(reaches),
+        "endpoint_valid_count": anchor.detach() + int(valid),
+        "endpoint_position_error_m": loss["position_error_m"],
+        "endpoint_orientation_error_deg": loss["orientation_error_deg"],
+        "endpoint_gripper_error": loss["gripper_error"]}
+
+
 def g_pi_training_loss(native, interface, encoder, sample, config, generators, *, stage, feature_layers, cached_z=None):
     from .g_pi_context import split_g_context_features, pi_context_features
     from .g_pi_interface import g_goal_loss
@@ -293,10 +383,25 @@ def g_pi_training_loss(native, interface, encoder, sample, config, generators, *
         raise ValueError("G/pi feature layers must follow every native block")
     weight = native.action_embedder.weight
     state = sample.state.to(device=weight.device, dtype=torch.float32)
+    if stage == "pi_prior":
+        if not sample.block_end_valid:
+            raise ValueError("pi_prior requires a valid recorded endpoint after the last supervised action")
+        if cached_z is not None:
+            raise ValueError("pi_prior never consumes E targets or a hindsight subgoal")
+        with autocast_for(native):
+            language = _training_language(native, sample.language, generators.get("language"),
+                                          language_drop_probability(config))
+            language = native.condition_embedder_action.text_embedder(language.to(weight))
+            conditions = interface.endpoint_conditions(sample.block_end_poses, sample.block_end_gripper,
+                                                        state, language)
+            noisy, times, target, mask = _action_noise(sample.actions, sample.actions_mask, generators["action"], weight.device)
+            prediction = goal_action_forward(native, noisy, times, conditions)
+            action = masked_action_loss(prediction, target, mask)
+        return {"action": action, "total": action}
     # E shares the immutable video branch and owns its fixed compute precision.
     with torch.no_grad(), torch.autocast(device_type=weight.device.type, enabled=False):
-        goal = {"z": encoder(sample.target_frame) if cached_z is None else cached_z.to(weight.device), "goal_poses": sample.goal_poses.to(weight.device),
-                "goal_gripper": sample.goal_gripper.to(weight.device)}
+        goal = {"z": encoder(sample.target_frame) if cached_z is None else cached_z.to(weight.device),
+                "goal_poses": sample.goal_poses.to(weight.device), "goal_gripper": sample.goal_gripper.to(weight.device)}
     with autocast_for(native):
         if stage == "g":
             demo, robot = split_g_context_features(native, sample.demonstration, sample.history, config)
@@ -305,17 +410,23 @@ def g_pi_training_loss(native, interface, encoder, sample, config, generators, *
             return g_goal_loss(prediction, goal, translation_scale=interface.translation_scale,
                                pose_weight=config["pose_weight"])
         features = pi_context_features(encoder.native, sample.history, config)
-        goal = noisy_goal(goal, generators["goal"], config.get("goal_noise", {}))
+        settings = pi_training_settings(config)
+        if not settings["ablations"]["exact_goal"]:
+            goal = noisy_goal(goal, generators["goal"], config.get("goal_noise", {}),
+                              candidate_separation_m=config.get("candidate_separation_m"))
         language = _training_language(native, sample.language, generators.get("language"),
                                       language_drop_probability(config))
         language = native.condition_embedder_action.text_embedder(language.to(weight))
         coordinates = patch_grid_coordinates([sample.history.shape[-2] // native.patch_size[1],
                                                sample.history.shape[-1] // native.patch_size[2]]).to(weight.device)
-        conditions = interface.conditions(features, state, language, goal, sample.history_times, coordinates)
+        conditions, endpoint = interface.stage2_conditions(features, state, language, goal,
+                                                           sample.history_times, coordinates)
         noisy, times, target, mask = _action_noise(sample.actions, sample.actions_mask, generators["action"], weight.device)
         prediction = goal_action_forward(native, noisy, times, conditions)
         action = masked_action_loss(prediction, target, mask)
-        return {"action": action, "total": action}
+        endpoint_losses = _endpoint_losses(endpoint, sample, interface)
+        return {"action": action, **endpoint_losses,
+                "total": action + settings["pose_weight"] * endpoint_losses["lit_pose"]}
 
 
 def g_intent_training_loss(native, interface, encoder, records, entries, config, *, uncertain_pairs=(), cached_targets=None):
@@ -380,20 +491,73 @@ def _action_state(native, interface):
 def _system_state(native, interface, encoder):
     if encoder.state_dict():
         raise ValueError("E must share the base without registering or serializing its weights")
-    modules = {"interface": interface.state_dict(), "action": _action_state(native, interface)}
+    modules = {"interface": _interface_state(interface), "action": _action_state(native, interface)}
     return {name: {key: value.detach().cpu() for key, value in values.items()} for name, values in modules.items()}
 
 
 def _restore_system(native, interface, encoder, model):
     if encoder.state_dict() or not isinstance(model, dict) or set(model) != {"interface", "action"}:
         raise ValueError("G/pi artifacts contain only trainable interface/action weights, never frozen native or E weights")
-    for name, expected in (("interface", interface.state_dict()), ("action", _action_state(native, interface))):
+    for name, expected in (("interface", _interface_state(interface)), ("action", _action_state(native, interface))):
         if (model[name].keys() != expected.keys() or any(model[name][key].shape != value.shape
                 or model[name][key].dtype != value.dtype for key, value in expected.items())):
             raise ValueError("G/pi trainable keys, shapes and FP32 precision must match")
         with torch.no_grad():
             for key, value in expected.items():
                 value.copy_(model[name][key])
+
+
+def pi_stage_contract(config, stage, stage1_sha256=None):
+    from .g_pi_noise import validate_goal_noise
+
+    settings = pi_training_settings(config)
+    return {"stage": stage, "pose_weight": settings["pose_weight"] if stage == "pi" else 0.,
+            "ablations": settings["ablations"], "goal_source": settings["goal_source"],
+            "goal_noise": validate_goal_noise(config.get("goal_noise", {}),
+                                               candidate_separation_m=config.get("candidate_separation_m")),
+            "candidate_separation_m": config.get("candidate_separation_m"),
+            "goal_noise_enabled": stage == "pi" and not settings["ablations"]["exact_goal"],
+            "stage1_artifact_sha256": stage1_sha256}
+
+
+def _initialization(args, config, previous):
+    source = getattr(args, "initialize", None)
+    if source and previous:
+        raise ValueError("choose either resume or stage-1 initialization")
+    if source and (config["interface_type"] != "pi_goal" or args.stage != "pi"):
+        raise ValueError("initialization is only pi_prior -> pi stage 2")
+    if config["interface_type"] != "pi_goal" or args.stage != "pi":
+        return None
+    if pi_training_settings(config)["ablations"]["no_stage1"]:
+        if source:
+            raise ValueError("no_stage1 ablation cannot initialize from a prior checkpoint")
+        return None
+    if previous:
+        return None
+    if not source:
+        raise ValueError("pi stage 2 requires a successful pi_prior --initialize artifact or explicit no_stage1 ablation")
+    prior = read_g_pi_artifact(source)
+    if prior["interface_type"] != "pi_goal" or prior["stage"] != "pi_prior" or prior["updates"] < 1:
+        raise ValueError("pi stage 2 requires a successfully trained pi_prior artifact")
+    return prior
+
+
+def _initialize_pi(native, interface, encoder, config, registry, prior, identity, layers):
+    keys = ("goal_interface", "goal_encoder", "base_seed", "chunk_size", "max_frame_chunk_size", "window_size", "icl_rope_h")
+    if (any(prior["config"].get(key) != config.get(key) for key in keys)
+            or prior["registry"] != registry or prior["base_identity"] != identity or prior["feature_layers"] != layers):
+        raise ValueError("pi stage transition requires identical model, base and robot/language conventions")
+    encoder.validate_identity(prior["encoder_identity"])
+    wanted = {name: value for name, value in _interface_state(interface).items()
+              if name.startswith(("state_encoder.", "condition_adapter."))}
+    source = {name: value for name, value in prior["model"]["interface"].items() if name in wanted}
+    for expected, values in ((wanted, source), (_action_state(native, interface), prior["model"]["action"])):
+        if (expected.keys() != values.keys() or any(value.shape != values[name].shape or value.dtype != values[name].dtype
+                                                  for name, value in expected.items())):
+            raise ValueError("pi stage-1 shared projection or action expert keys, shapes or FP32 precision changed")
+        with torch.no_grad():
+            for name, value in expected.items():
+                value.copy_(values[name])
 
 
 def _frozen_checksums(native, encoder, config):
@@ -440,12 +604,22 @@ def validate_g_pi_artifact(payload, *, kind="g_pi_training", expected_encoder_id
     if (not isinstance(payload, dict) or payload.get("kind") != kind or payload.get("format_version") != g_pi_artifact_version(payload.get("config"))
             or not isinstance(payload.get("config"), dict) or payload.get("upstream_commit") != ZERO_WAM_COMMIT
             or payload.get("precision") != "float32" or payload.get("encoder_precision") not in {"float32", "bfloat16"}):
-        raise ValueError("expected a version-4 intent G or version-3 pi lightweight artifact (old versions cannot resume) with FP32 trainables and a shared frozen base reference")
+        raise ValueError("expected a version-4 intent G or endpoint pi lightweight artifact (old versions cannot resume) with FP32 trainables and a shared frozen base reference")
     config = validate_g_pi_config(payload["config"])
     from .g_pi_distributed import validate_distributed_artifact
 
     validate_distributed_artifact(payload, kind=kind)
     _check_stage(config, payload.get("stage"))
+    if config["interface_type"] == "pi_goal":
+        stage1_sha = payload.get("stage1_artifact_sha256")
+        if payload.get("pi_training") != pi_stage_contract(config, payload["stage"], stage1_sha):
+            raise ValueError("pi checkpoint stage, endpoint loss, noise or separation metadata differ from configuration")
+        needs_prior = payload["stage"] == "pi" and not pi_training_settings(config)["ablations"]["no_stage1"]
+        if needs_prior and (not isinstance(stage1_sha, str) or len(stage1_sha) != 64
+                            or any(char not in "0123456789abcdef" for char in stage1_sha)):
+            raise ValueError("pi stage 2 requires recorded stage-1 artifact provenance")
+        if not needs_prior and stage1_sha is not None:
+            raise ValueError("pi_prior or no_stage1 ablation cannot record stage-1 initialization")
     if config["interface_type"] == "g_translator" and payload.get("demo_route") != config.get("demo_route", "one_way"):
         raise ValueError("G demo_route differs from the recorded one_way/via_u_only architecture")
     registry = payload.get("registry")
@@ -564,12 +738,11 @@ def train_g_pi_interface(args):
     config = validate_g_pi_config(config)
     from .g_pi_distributed import distributed_settings, train_distributed_pi
 
+    _check_stage(config, args.stage)
     if distributed_settings(config)["enabled"]:
         return train_distributed_pi(args, config)
     stage = args.stage
     _check_stage(config, stage)
-    if getattr(args, "initialize", None):
-        raise ValueError("G and pi train independently; stage initialization or joint training is not supported")
     if type(args.steps) is not int or args.steps < 1:
         raise ValueError("steps must be positive")
     paths, sources = load_g_pi_index(args.index)
@@ -591,13 +764,15 @@ def train_g_pi_interface(args):
                   if entry.split == "train" and entry.paired_task is not None}
         if not paired or not paired <= indexed:
             raise ValueError("intent training requires paired train tasks belonging to the robot training index")
-    first = load_g_pi_sample(paths[0], route=config["interface_type"], generator=torch.Generator().manual_seed(args.seed))
+    sample_route = "pi_prior" if stage == "pi_prior" else config["interface_type"]
+    first = load_g_pi_sample(paths[0], route=sample_route, generator=torch.Generator().manual_seed(args.seed))
     registry = goal_registry(first)
     _check_sample(first, config, registry)
     if table is not None and (table.metadata["feature_space_id"] != first.metadata["feature_space_id"]
             or table.metadata["latent_normalization"] != first.metadata["latent_normalization"]):
         raise ValueError("intent demos and paired robot samples must share latent feature space and normalization")
     previous = read_g_pi_artifact(args.resume) if args.resume else None
+    prior = _initialization(args, config, previous)
     rng_names = ("sample", "action", "goal", "language") + (("intent",) if table is not None else ())
     if previous and set(previous.get("rng", {})) != set(rng_names):
         raise ValueError("resume requires matching sample, action, goal, language and optional intent RNG states")
@@ -611,8 +786,8 @@ def train_g_pi_interface(args):
             or previous["registry"] != registry or previous["tiny_native"] != args.tiny_native
             or previous["data_identity"] != identities or previous["seed"] != args.seed):
         raise ValueError("resume requires the same route, config, data, robot conventions and seed")
-    if previous:
-        _source_components([*previous["source_records"], *sources])
+    if previous or prior:
+        _source_components([*(previous or prior)["source_records"], *sources])
     visited = dict(previous["visited_arrays"]) if previous else {}
     if any(file_sha256(path) != digest for path, digest in visited.items()):
         raise ValueError("consumed training inputs changed before resume")
@@ -622,10 +797,13 @@ def train_g_pi_interface(args):
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
-    checkpoint = _base_location(previous["base_reference"], args.checkpoint) if previous else args.checkpoint
+    origin = previous or prior
+    checkpoint = _base_location(origin["base_reference"], args.checkpoint) if origin else args.checkpoint
     native, interface, encoder, identity, layers = build_g_pi_system(config, registry, stage=stage,
         checkpoint=checkpoint, tiny_native=args.tiny_native, device=args.device,
-        video_precision=previous["encoder_precision"] if previous else None)
+        video_precision=origin["encoder_precision"] if origin else None)
+    if prior:
+        _initialize_pi(native, interface, encoder, config, registry, prior, identity, layers)
     if previous:
         if previous["base_identity"] != identity or previous["feature_layers"] != layers:
             raise ValueError("base checkpoint or feature layers changed")
@@ -689,7 +867,7 @@ def train_g_pi_interface(args):
                         paired_samples.append((entry.paired_task, sample))
             else:
                 path = paths[step % len(paths)]
-                sample = load_g_pi_sample(path, route=config["interface_type"], generator=generators["sample"])
+                sample = load_g_pi_sample(path, route=sample_route, generator=generators["sample"])
                 paired_samples = [(path, sample)]
             for path, sample in paired_samples:
                 _check_sample(sample, config, registry)
@@ -755,7 +933,11 @@ def train_g_pi_interface(args):
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         "python_rng": random.getstate(), "numpy_rng": [n[0], n[1].tolist(), *n[2:]],
         "data_identity": identities, "visited_arrays": visited,
-        "source_records": previous["source_records"] if previous else sources}
+        "source_records": previous["source_records"] if previous else [*(prior["source_records"] if prior else []), *sources]}
+    if config["interface_type"] == "pi_goal":
+        source_sha = file_sha256(args.initialize) if prior else previous.get("stage1_artifact_sha256") if previous else None
+        payload["stage1_artifact_sha256"] = source_sha
+        payload["pi_training"] = pi_stage_contract(config, stage, source_sha)
     if stage == "g":
         payload["demo_route"] = config.get("demo_route", "one_way")
     temp = output / "goal_interface.pt.tmp"
@@ -781,6 +963,8 @@ def export_g_pi_policy(args, *, payload=None):
     payload = read_g_pi_artifact(args.artifact, payload=payload)
     if payload["updates"] < 1:
         raise ValueError("G/pi export requires a successfully trained independent route")
+    if payload["stage"] == "pi_prior":
+        raise ValueError("pi_prior checkpoints are only for resume or stage-2 initialization, not goal-policy deployment")
     thresholds, calibration = _export_stopping(args, payload)
     output = Path(args.output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):

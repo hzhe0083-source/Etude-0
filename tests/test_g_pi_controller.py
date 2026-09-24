@@ -27,8 +27,10 @@ class GPiControllerTest(unittest.TestCase):
         self.pi_calls.append((history.clone(), state.clone(), language.clone(), target))
         return torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2, 1) + len(self.pi_calls) * 10
 
-    def step(self, previous, time, *, current=None, new_demo=None, **extra):
-        return controller_step(previous, frame=torch.full((1, 2, 1, 2, 2), float(time)),
+    def step(self, previous, time, *, current=None, new_demo=None, new_frame=True, **extra):
+        frame = torch.full((1, 2, 1, 2, 2), float(time)) if new_frame else None
+        available = extra.pop("frame_available_time", float(time) if new_frame else None)
+        return controller_step(previous, frame=frame, frame_available_time=available,
                                time=float(time), state=torch.zeros(1, 4), language=torch.zeros(1, 3, 8),
                                current_goal=goal() if current is None else current,
                                g_predict=self.g_predict, pi_predict=self.pi_predict,
@@ -50,6 +52,7 @@ class GPiControllerTest(unittest.TestCase):
         self.assertEqual(first.cursor, 1)
         self.assertEqual(first.history_times, (0.,))
         self.assertEqual(result.state.history_times, (0., 1., 2., 3., 4.))
+        self.assertEqual(result.state.last_control_time, 4.)
         self.assertEqual(result.state.history[0].shape[2], 1)
 
     def test_event_interrupts_pending_actions_and_switches_goal(self):
@@ -102,6 +105,7 @@ class GPiControllerTest(unittest.TestCase):
         result = self.step(old, 100, current=goal(gripper=1.), new_demo=torch.zeros(1, 2, 5, 2, 2))
         self.assertEqual(result.state.task_start_time, 100.)
         self.assertEqual(result.state.history_times, (0.,))
+        self.assertEqual(result.state.last_control_time, 0.)
         self.assertEqual(len(result.state.history), 1)
         self.assertEqual(result.events, ())
         self.assertEqual(result.state.cursor, 1)
@@ -147,6 +151,104 @@ class GPiControllerTest(unittest.TestCase):
         self.assertFalse(goal_reached(target, current))
         target["z"] = current["z"].clone()
         self.assertTrue(goal_reached(target, current))
+
+    def test_event_between_latents_interrupts_without_duplicate_image(self):
+        result = self.start()
+        result = self.step(result.state, 11, new_frame=False)
+        result = self.step(result.state, 12, current=goal(gripper=1.), new_frame=False)
+        result = self.step(result.state, 13, current=goal(gripper=1.), new_frame=False)
+        self.assertTrue(result.interrupted)
+        self.assertTrue(result.refreshed)
+        self.assertEqual(result.events[0].kind, "open")
+        self.assertEqual(result.events[0].time, 3.)
+        self.assertEqual(result.action.item(), 20.)
+        self.assertEqual(result.state.history_times, (0.,))
+        self.assertEqual(result.state.last_control_time, 3.)
+        torch.testing.assert_close(self.g_calls[0][1], self.g_calls[1][1], rtol=0, atol=0)
+        self.assertEqual(self.pi_calls[-1][0].shape[2], 1)
+
+    def test_latents_arrive_every_four_control_steps(self):
+        result = self.start()
+        actions = [result.action.item()]
+        for index in range(1, 9):
+            result = self.step(result.state, 10 + index, new_frame=index % 4 == 0)
+            actions.append(result.action.item())
+        self.assertEqual(result.state.history_times, (0., 4., 8.))
+        self.assertEqual(result.state.last_control_time, 8.)
+        self.assertEqual([call[0].shape[2] for call in self.pi_calls], [1, 2, 3])
+        self.assertEqual(actions, [10., 11., 12., 13., 20., 21., 22., 23., 30.])
+
+    def test_available_history_can_lag_control_time(self):
+        result = self.start()
+        result = self.step(result.state, 11, new_frame=False)
+        result = self.step(result.state, 12, frame_available_time=11.5)
+        self.assertEqual(result.state.history_times, (0., 1.5))
+        self.assertEqual(result.state.last_control_time, 2.)
+        result = self.step(result.state, 13, new_frame=False, current=goal(1.))
+        self.assertTrue(result.interrupted)
+        self.assertEqual(self.g_calls[-1][1].shape[2], 2)
+        self.assertEqual(result.state.history_times, (0., 1.5))
+
+    def test_first_latent_cannot_be_omitted_or_shifted(self):
+        with self.assertRaisesRegex(ValueError, "initial latent"):
+            self.start(new_frame=False)
+        with self.assertRaisesRegex(ValueError, "initial latent"):
+            self.start(frame_available_time=9.)
+        with self.assertRaisesRegex(ValueError, "initial latent"):
+            self.start(frame_available_time=10.1)
+        result = self.start()
+        with self.assertRaisesRegex(ValueError, "initial latent"):
+            self.step(result.state, 20, new_frame=False, new_demo=torch.ones(1, 2, 2, 2, 2))
+
+    def test_rejects_future_duplicate_and_unspecified_frame_availability(self):
+        result = self.start()
+        for available in (9., 12.):
+            with self.subTest(available=available), self.assertRaisesRegex(ValueError, "future"):
+                self.step(result.state, 11, frame_available_time=available)
+        with self.assertRaisesRegex(ValueError, "strictly increase"):
+            self.step(result.state, 11, frame_available_time=10.)
+        for available in (None, float("nan"), True):
+            with self.subTest(available=available), self.assertRaisesRegex(ValueError, "explicit"):
+                self.step(result.state, 11, frame_available_time=available)
+        with self.assertRaisesRegex(ValueError, "omitted"):
+            self.step(result.state, 11, new_frame=False, frame_available_time=11.)
+
+    def test_control_clock_is_strict_even_without_new_latents(self):
+        result = self.start()
+        result = self.step(result.state, 11, new_frame=False)
+        with self.assertRaisesRegex(ValueError, "strictly increase"):
+            self.step(result.state, 11, new_frame=False)
+        with self.assertRaisesRegex(ValueError, "strictly increase"):
+            self.step(result.state, 10.5, new_frame=False)
+        self.targets = [goal()]
+        stopped = self.start(time=20)
+        stopped = self.step(stopped.state, 21, new_frame=False)
+        with self.assertRaisesRegex(ValueError, "strictly increase"):
+            self.step(stopped.state, 21, new_frame=False)
+
+    def test_new_demo_resets_between_latent_arrivals(self):
+        result = self.start()
+        result = self.step(result.state, 11, new_frame=False)
+        result = self.step(result.state, 12, new_frame=False, current=goal(gripper=1.))
+        previous = result.state
+        result = self.step(previous, 100, current=goal(gripper=1.), new_demo=torch.zeros(1, 2, 5, 2, 2))
+        self.assertEqual(result.state.task_start_time, 100.)
+        self.assertEqual(result.state.last_control_time, 0.)
+        self.assertEqual(result.state.history_times, (0.,))
+        self.assertEqual(result.events, ())
+        self.assertEqual(result.state.cursor, 1)
+        self.assertEqual(self.g_calls[-1][1].shape[2], 1)
+        self.assertEqual(previous.last_control_time, 2.)
+
+    def test_reached_without_new_latent_can_stop(self):
+        self.targets = [goal(1.), goal(1.)]
+        result = self.start()
+        result = self.step(result.state, 11, current=goal(1.), new_frame=False)
+        self.assertTrue(result.interrupted)
+        self.assertTrue(result.stopped)
+        self.assertIsNone(result.action)
+        self.assertEqual(result.state.history_times, (0.,))
+        self.assertEqual(result.state.last_control_time, 1.)
 
 
 if __name__ == "__main__":

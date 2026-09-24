@@ -11,6 +11,7 @@ from evo_wam.g_pi_context import (
     g_attention_mask, g_context_features, install_empty_text, load_target_cache, pi_context_features,
     save_target_cache, truncate_robot_history,
 )
+from evo_wam.goal_action import action_named_parameters, install_action_interface
 from evo_wam.zerowam import NativeDependencyError, load_native_class
 from test_native_icl import tiny_model
 
@@ -19,7 +20,7 @@ CONFIG = {"chunk_size": 2, "max_frame_chunk_size": 4, "icl_rope_h": 4, "window_s
 
 
 def context_model(device="cpu"):
-    native = tiny_model(device)
+    native = tiny_model(device).requires_grad_(False)
     install_empty_text(native, torch.randn(1, 4, 8), "fixture_empty_prompt")
     return native
 
@@ -59,7 +60,7 @@ class GPiContextTests(unittest.TestCase):
 
     def test_frozen_assertion_and_full_checksum(self):
         module = torch.nn.Linear(3, 2)
-        with self.assertRaisesRegex(ValueError, "every parameter frozen"):
+        with self.assertRaisesRegex(ValueError, "every non-action parameter frozen"):
             assert_frozen_base(module)
         module.requires_grad_(False)
         assert_frozen_base(module)
@@ -91,21 +92,34 @@ class GPiNativeContextTests(unittest.TestCase):
         except NativeDependencyError as exc:
             raise unittest.SkipTest(str(exc))
 
-    def test_snapshot_independent_frozen_and_identity(self):
+    def test_shared_base_rules_ownership_and_identity(self):
         native = context_model()
+        install_action_interface(native)
+        for _, parameter in action_named_parameters(native):
+            parameter.data = parameter.data.float()
+            parameter.requires_grad_(True)
+        native.train()
+        modes = [module.training for module in native.modules()]
+        trainable = [parameter.requires_grad for parameter in native.parameters()]
         base_id = {"kind": "fixture", "version": 1, "patch_size": (1, 1, 1)}
         encoder = FrozenGoalEncoder(native, layer=1, k_z=8, base_id=base_id)
         base_id["version"] = 2
         self.assertEqual(encoder.identity["base_id"],
                          {"kind": "fixture", "version": 1, "patch_size": [1, 1, 1]})
         encoder.train(True)
+        encoder.requires_grad_(False)
         self.assertFalse(any(module.training for module in encoder.modules()))
+        self.assertEqual(modes, [module.training for module in native.modules()])
+        self.assertEqual(trainable, [parameter.requires_grad for parameter in native.parameters()])
         assert_frozen_base(encoder.native)
-        for source, snapshot in zip(native.parameters(), encoder.native.parameters()):
-            self.assertNotEqual(source.data_ptr(), snapshot.data_ptr())
+        self.assertIs(encoder.native, native)
+        self.assertEqual(list(encoder.parameters()), [])
+        self.assertEqual(encoder.state_dict(), {})
         before = frozen_base_checksum(encoder.native)
-        with torch.no_grad():
-            next(native.parameters()).add_(2)
+        actions = [parameter for _, parameter in action_named_parameters(native)]
+        optimizer = torch.optim.SGD(actions, lr=0.1)
+        sum(parameter.square().sum() for parameter in actions).backward()
+        optimizer.step()
         self.assertEqual(before, frozen_base_checksum(encoder.native))
         encoder.validate_identity(encoder.identity)
         with self.assertRaisesRegex(ValueError, "E identity mismatch"):
@@ -114,7 +128,7 @@ class GPiNativeContextTests(unittest.TestCase):
             encoder(torch.randn(1, 4, 2, 1, 2))
 
     def test_pretrained_empty_text_required_and_hashed(self):
-        native = tiny_model()
+        native = tiny_model().requires_grad_(False)
         with self.assertRaisesRegex(ValueError, "empty text embedding"):
             FrozenGoalEncoder(native, layer=1)
         empty = torch.randn(1, 4, 8)
@@ -128,6 +142,21 @@ class GPiNativeContextTests(unittest.TestCase):
         self.assertNotEqual(first.identity, second.identity)
         with self.assertRaisesRegex(ValueError, "E identity mismatch"):
             first.validate_identity(second.identity)
+
+    def test_action_dtype_and_updates_leave_base_identity_unchanged(self):
+        native = context_model()
+        install_action_interface(native)
+        first = FrozenGoalEncoder(native, layer=1)
+        for _, parameter in action_named_parameters(native):
+            parameter.data = parameter.data.float()
+            parameter.requires_grad_(True)
+            with torch.no_grad():
+                parameter.add_(1)
+        second = FrozenGoalEncoder(native, layer=1)
+        self.assertEqual(first.identity, second.identity)
+        native.blocks[0].attn2.action_to_k.weight = native.blocks[0].attn2.to_k.weight
+        with self.assertRaisesRegex(ValueError, "independent action attention"):
+            assert_frozen_base(native)
 
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_native_directionality_and_real_demo_cache(self):
@@ -175,9 +204,14 @@ class GPiNativeContextTests(unittest.TestCase):
             torch.testing.assert_close(standalone[index], nested[index], rtol=0, atol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
-    def test_native_future_invariance_and_snapshot_output(self):
+    def test_native_future_invariance_and_shared_encoder_output(self):
         torch.manual_seed(28)
         native = context_model("cuda").requires_grad_(False)
+        install_action_interface(native)
+        actions = [parameter for _, parameter in action_named_parameters(native)]
+        for parameter in actions:
+            parameter.data = parameter.data.float()
+            parameter.requires_grad_(True)
         encoder = FrozenGoalEncoder(native, layer=1)
         video = torch.randn(1, 4, 4, 1, 2, device="cuda", dtype=torch.bfloat16)
         before_hash = frozen_base_checksum(native)
@@ -193,7 +227,16 @@ class GPiNativeContextTests(unittest.TestCase):
             for index, value in read(changed).items():
                 torch.testing.assert_close(value, baseline[index], rtol=0, atol=0)
         self.assertEqual(before_hash, frozen_base_checksum(native))
+        cache = build_demo_cache(native, demo, CONFIG)
+        cached = g_context_features(native, demo, video[:, :, :2], CONFIG, demo_cache=cache)
+        optimizer = torch.optim.SGD(actions, lr=0.1)
+        sum(parameter.square().sum() for parameter in actions).backward()
+        optimizer.step()
+        self.assertEqual(before_hash, frozen_base_checksum(native))
         torch.testing.assert_close(before_z, encoder(video[:, :, :1]), rtol=0, atol=0)
+        after = g_context_features(native, demo, video[:, :, :2], CONFIG, demo_cache=cache)
+        for index in range(2):
+            torch.testing.assert_close(cached[index], after[index], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

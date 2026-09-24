@@ -87,19 +87,23 @@ def load_goal_prediction(path, *, encoder_identity, registry):
 
 def load_g_pi_observation(path, payload):
     """Reject supervision fields; π never loads or returns a demonstration."""
+    from .g_pi_data import validate_latent_grid
+
     path = Path(path)
     metadata = json.loads(path.read_text())
+    if isinstance(metadata, dict) and metadata.get("format_version") == 1:
+        raise ValueError("g_pi_observation version 1 is unsupported; rebuild version 2 with latent availability times")
     route, registry = payload["config"]["interface_type"], payload["registry"]
     common = {"format_version", "kind", "arrays", "feature_space_id", "latent_normalization",
         "action_space", "current_time", "control_dt", "actions_per_frame", "state_space_id",
         "coordinate_frame", "pose_units", "end_effectors", "pose_representation", "tool_frames",
-        "gripper_space"}
+        "gripper_space", "frame_stride", "temporal_down_rate", "alignment", "subgoal_encoding"}
     extra = {"demonstration"} if route == "g_translator" else {"language", "goal"}
     if (route not in {"g_translator", "pi_goal"} or not isinstance(metadata, dict)
             or (common | extra) - metadata.keys() or metadata.keys() - common - extra - {"provenance"}
-            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 1
+            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 2
             or metadata["kind"] != "g_pi_observation"):
-        raise ValueError("expected route-specific version-1 g_pi_observation without supervision")
+        raise ValueError("expected route-specific version-2 g_pi_observation without supervision")
     _interface_metadata(metadata)
     if (type(metadata["actions_per_frame"]) is not int or metadata["actions_per_frame"] < 1
             or metadata["latent_normalization"] != LATENT_NORMALIZATION):
@@ -110,21 +114,24 @@ def load_g_pi_observation(path, payload):
     if _text(metadata, "feature_space_id") != payload["visual_feature_space"]:
         raise ValueError("observed visual encoder differs from the trained interface")
     with np.load(_local_path(path.parent, _text(metadata, "arrays"), ".npz"), allow_pickle=False) as archive:
-        if len(archive.files) != 3 or set(archive.files) != {"state", "history_latent", "history_times"}:
-            raise ValueError("observation NPZ needs exactly state, history_latent and history_times")
+        if len(archive.files) != 3 or set(archive.files) != {"state", "history_latent", "latent_available_times"}:
+            raise ValueError("observation NPZ needs exactly state, history_latent and latent_available_times")
         state, history, times = (torch.from_numpy(archive[key].copy())
-                                 for key in ("state", "history_latent", "history_times"))
+                                 for key in ("state", "history_latent", "latent_available_times"))
     _validate_state(state)
     if (history.ndim != 4 or min(history.shape) < 1 or not history.is_floating_point()
             or not torch.isfinite(history).all()):
         raise ValueError("history_latent must be finite floating [C,T,H,W]")
-    if (times.shape != (history.shape[1],) or not times.is_floating_point() or not torch.isfinite(times).all()
-            or (times[1:] <= times[:-1]).any() or times[0].item() != 0
-            or not math.isclose(times[-1].item(), metadata["current_time"], abs_tol=1e-6, rel_tol=0)):
-        raise ValueError("history_times must start at task t0=0 and end exactly at current_time")
-    expected = torch.arange(len(times), dtype=torch.float64) * metadata["control_dt"]
-    if not torch.allclose(times.double(), expected, atol=1e-6, rtol=0):
-        raise ValueError("v1 observed history requires one frame per robot control step")
+    current_time, dt = metadata["current_time"], metadata["control_dt"]
+    tolerance = min(1e-6, dt * 1e-4)
+    control_index = round(current_time / dt)
+    if current_time < 0 or not math.isclose(control_index * dt, current_time, abs_tol=tolerance, rel_tol=0):
+        raise ValueError("current_time must lie on the task-local control grid")
+    if (times.shape != (history.shape[1],) or not times.is_floating_point()
+            or not torch.isfinite(times).all() or (times > current_time + tolerance).any()):
+        raise ValueError("latent availability times must match history and never follow current_time")
+    controls = torch.arange(control_index + 1, dtype=torch.float64) * dt
+    validate_latent_grid(metadata, controls, times)
     if route == "g_translator":
         record = metadata["demonstration"]
         _identity(record)
@@ -150,7 +157,8 @@ def predict_g_pi_cli(args):
     output = Path(args.output)
     if output.suffix != ".npz" or output.exists() or output.with_suffix(".json").exists():
         raise ValueError("prediction requires fresh .npz and .json output paths")
-    native, interface, encoder, payload = load_g_pi_policy(args.policy, device=args.device)
+    native, interface, encoder, payload = load_g_pi_policy(args.policy, device=args.device,
+                                                         checkpoint=getattr(args, "checkpoint", None))
     observation = load_g_pi_observation(args.observation, payload)
     config, registry = payload["config"], payload["registry"]
     if config["interface_type"] == "g_translator":

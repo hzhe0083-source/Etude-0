@@ -124,6 +124,8 @@ def goal_registry(sample):
                 "language_identity": sample.language_identity}
     if "event_rules" in sample.metadata:
         registry["event_rules"] = sample.metadata["event_rules"]
+        for key in ("frame_stride", "temporal_down_rate", "alignment", "subgoal_encoding"):
+            registry[key] = sample.metadata[key]
     return registry
 
 
@@ -567,14 +569,14 @@ def export_goal_policy(args):
             "video_generation": payload["stage"] == "visual"}
 
 
-def load_goal_policy(path, *, device="cuda"):
+def load_goal_policy(path, *, device="cuda", checkpoint=None):
     from safetensors.torch import load_file
 
     folder = Path(path)
     payload = json.loads((folder / "policy.json").read_text())
     if payload.get("kind") == "g_pi_policy":
         from .g_pi_training import load_g_pi_policy
-        return load_g_pi_policy(path, device=device)
+        return load_g_pi_policy(path, device=device, checkpoint=checkpoint)
     if (payload.get("kind") != "se3_goal_policy" or payload.get("format_version") != 2
             or not isinstance(payload.get("config"), dict)
             or payload.get("architecture") != goal_architecture(payload["config"])

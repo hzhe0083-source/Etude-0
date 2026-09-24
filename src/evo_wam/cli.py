@@ -713,6 +713,7 @@ def main(argv=None):
     goal_predict = commands.add_parser("predict-goal-policy", help="predict normalized actions from observed-only SE(3) policy inputs")
     goal_predict.add_argument("--policy", required=True)
     goal_predict.add_argument("--observation", required=True)
+    goal_predict.add_argument("--checkpoint", help="local base checkpoint override for compact G/pi policies")
     goal_predict.add_argument("--device", default="cuda")
     goal_predict.add_argument("--seed", type=int, default=0)
     goal_predict.add_argument("--output", required=True)

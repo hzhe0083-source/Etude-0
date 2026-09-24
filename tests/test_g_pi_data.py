@@ -11,18 +11,20 @@ import torch
 
 from evo_wam.g_pi_data import (EventRules, GTranslatorSample, GripperEventDetector, PiGoalSample,
                               detect_gripper_events, g_pi_sample_files, load_g_pi_index,
-                              load_g_pi_sample, next_subgoal_time)
+                              load_g_pi_sample, next_subgoal_time, subgoal_control_indices, validate_latent_grid)
 from evo_wam.icl_data import LATENT_NORMALIZATION
 from test_goal_language import write_goal_language
 
 
-def write_g_pi_task(root, name="task", *, gripper=None, demonstration=True):
+def write_g_pi_task(root, name="task", *, gripper=None, demonstration=True, frame_stride=1):
     if gripper is None:
-        gripper = np.array([[0.], [0.], [0.], [1.], [1.], [1.], [1.], [1.]], dtype=np.float32)
+        gripper = np.array([[0.]] * 5 + [[1.]] * 12, dtype=np.float32)
     gripper = np.asarray(gripper, dtype=np.float32)
     frames, effectors = gripper.shape
+    count = 4 * frame_stride
+    latent_frames = (frames - 1) // count + 1
     metadata = {
-        "format_version": 1, "kind": "g_pi_task", "sample_id": name, "arrays": f"{name}.npz",
+        "format_version": 2, "kind": "g_pi_task", "sample_id": name, "arrays": f"{name}.npz",
         "robot_source": {"source_id": f"{name}-robot", "source_group": f"{name}-robot",
                          "domain": "robot", "trajectory_id": f"{name}-trajectory"},
         "action_space": {"representation": "zero-wam-normalized", "normalization_id": "fixture",
@@ -34,18 +36,24 @@ def write_g_pi_task(root, name="task", *, gripper=None, demonstration=True):
                           "open": [.08] * effectors, "units": "m"},
         "language": f"{name}-language.json", "feature_space_id": "fixture-wan-v1",
         "latent_normalization": LATENT_NORMALIZATION, "control_dt": .1,
-        "action_frames": 2, "actions_per_frame": 3, "task_start_time": 0., "success": True,
+        "action_frames": 2, "actions_per_frame": count, "task_start_time": 0., "success": True,
+        "frame_stride": frame_stride, "temporal_down_rate": 4,
+        "alignment": "zerowam_causal_first_then_four", "subgoal_encoding": "wan_vae_single_frame",
         "event_rules": asdict(EventRules()),
     }
     write_goal_language(root, f"{name}-language")
     poses = np.tile(np.eye(4, dtype=np.float32), (frames, effectors, 1, 1))
     poses[:, :, 0, 3] = np.arange(frames, dtype=np.float32)[:, None]
-    arrays = {"latent": np.arange(2 * frames * 4, dtype=np.float32).reshape(2, frames, 2, 2),
-              "frame_times": np.arange(frames, dtype=np.float64) * .1,
+    times = np.arange(frames, dtype=np.float64) * .1
+    goals = subgoal_control_indices(torch.from_numpy(gripper), torch.from_numpy(times)).numpy()
+    arrays = {"latent": np.arange(2 * latent_frames * 4, dtype=np.float32).reshape(2, latent_frames, 2, 2),
+              "control_times": times, "latent_available_times": times[::count],
               "states": np.arange(frames * 4, dtype=np.float32).reshape(frames, 4),
               "poses": poses, "gripper": gripper,
-              "actions": np.arange(2 * frames, dtype=np.float32).reshape(2, frames),
-              "actions_mask": np.ones((2, frames), dtype=np.bool_)}
+              "actions": 1 + np.arange(2 * frames, dtype=np.float32).reshape(2, frames),
+              "actions_mask": np.ones((2, frames), dtype=np.bool_), "subgoal_times": times[goals],
+              "subgoal_latents": np.stack([np.full((2, 1, 2, 2), 1000 + int(index), dtype=np.float32)
+                                             for index in goals])}
     if demonstration:
         metadata.update(demonstration={"source_id": f"{name}-demo", "source_group": f"{name}-demo",
                                        "domain": "human", "arrays": f"{name}-demo.npz"},
@@ -121,90 +129,245 @@ class GPiDataTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
-    def test_midchunk_event_masks_actions_and_slices_history(self):
+    def save(self, path, metadata, arrays):
+        path.write_text(json.dumps(metadata))
+        np.savez_compressed(path.parent / metadata["arrays"], **arrays)
+
+    def test_midchunk_event_masks_control_actions_and_slices_latent_history(self):
         path, _, arrays = write_g_pi_task(self.root)
-        sample = load_g_pi_sample(path, current_time=.2)
+        sample = load_g_pi_sample(path, current_time=.4)
         self.assertIs(type(sample), PiGoalSample)
-        self.assertEqual(sample.subgoal_time, .4)
-        self.assertAlmostEqual(sample.terminal_time, .7)
-        self.assertEqual(sample.history.shape, (1, 2, 3, 2, 2))
+        self.assertAlmostEqual(sample.subgoal_time, .6)
+        self.assertEqual(sample.terminal_time, 1.6)
+        self.assertEqual(sample.history.shape, (1, 2, 2, 2, 2))
+        self.assertEqual(sample.history_times.tolist(), [0., .4])
         self.assertEqual(sample.target_frame.shape, (1, 2, 1, 2, 2))
-        self.assertEqual(sample.actions.shape, (1, 2, 2, 3, 1))
-        self.assertEqual(sample.actions_mask.flatten().tolist(), [True, True] + [False] * 10)
-        torch.testing.assert_close(sample.target_frame[0, :, 0], torch.from_numpy(arrays["latent"][:, 4]))
-        torch.testing.assert_close(sample.goal_poses[0], torch.from_numpy(arrays["poses"][4]))
+        self.assertEqual(sample.actions.shape, (1, 2, 2, 4, 1))
+        self.assertEqual(sample.actions_mask.flatten().tolist(), [True, True] + [False] * 14)
+        self.assertEqual(sample.actions.flatten()[:2].tolist(), [5., 6.])
+        torch.testing.assert_close(sample.state[0], torch.from_numpy(arrays["states"][4]))
+        torch.testing.assert_close(sample.target_frame[0], torch.from_numpy(arrays["subgoal_latents"][0]))
+        torch.testing.assert_close(sample.goal_poses[0], torch.from_numpy(arrays["poses"][6]))
+        torch.testing.assert_close(sample.goal_gripper[0], torch.from_numpy(arrays["gripper"][6]))
         self.assertFalse(hasattr(sample, "demonstration"))
         self.assertNotIn("demonstration", inspect.signature(PiGoalSample).parameters)
         self.assertNotIn("demonstration", sample.metadata)
 
     def test_after_last_event_uses_terminal_including_remaining_motion(self):
         path, _, _ = write_g_pi_task(self.root)
-        for time in (.4, .5, .6):
+        for time in (.8, 1.2):
             sample = load_g_pi_sample(path, current_time=time)
-            self.assertAlmostEqual(sample.subgoal_time, .7)
+            self.assertEqual(sample.subgoal_time, 1.6)
             self.assertGreater(sample.subgoal_time, sample.metadata["current_time"])
-        self.assertEqual(load_g_pi_sample(path, current_time=.6).actions_mask.sum().item(), 1)
+        self.assertEqual(load_g_pi_sample(path, current_time=1.2).actions_mask.sum().item(), 4)
 
     def test_no_events_target_terminal_only(self):
-        path, _, _ = write_g_pi_task(self.root, gripper=np.zeros((8, 1)))
-        for time in (0., .2, .6):
+        path, _, _ = write_g_pi_task(self.root, gripper=np.zeros((17, 1)))
+        for time in (0., .4, 1.2):
             sample = load_g_pi_sample(path, current_time=time)
             self.assertEqual(sample.events, ())
-            self.assertAlmostEqual(sample.subgoal_time, .7)
+            self.assertEqual(sample.subgoal_time, 1.6)
 
-    def test_terminal_and_after_terminal_rejected(self):
+    def test_terminal_and_nonavailability_samples_rejected(self):
         path, _, _ = write_g_pi_task(self.root)
-        for time in (.7, .8, 1., -.1, .25):
+        for time in (1.6, 1.7, 2., -.1, .2, .25, .6):
             with self.subTest(time=time), self.assertRaises(ValueError):
                 load_g_pi_sample(path, current_time=time)
 
+    def test_event_at_sample_time_uses_strictly_later_subgoal(self):
+        path, _, _ = write_g_pi_task(self.root, gripper=[[0.]] * 3 + [[1.]] * 14)
+        sample = load_g_pi_sample(path, current_time=.4)
+        self.assertAlmostEqual(sample.events[0].time, .4)
+        self.assertEqual(sample.subgoal_time, 1.6)
+        initial = load_g_pi_sample(path, current_time=0.)
+        self.assertEqual(initial.subgoal_time, .4)
+        self.assertEqual(initial.actions_mask.sum().item(), 4)
+
+    def test_multiple_events_between_latents_and_simultaneous_effectors(self):
+        grip = np.array([[0.]] * 5 + [[1.]] * 4 + [[0.]] * 4 + [[1.]] * 4)
+        grip = np.concatenate([grip, 1 - grip], axis=1)
+        path, _, arrays = write_g_pi_task(self.root, gripper=grip)
+        self.assertEqual(len(arrays["subgoal_times"]), 4)
+        for time, expected in ((0., .6), (.4, .6), (.8, 1.), (1.2, 1.4)):
+            sample = load_g_pi_sample(path, current_time=time)
+            self.assertAlmostEqual(sample.subgoal_time, expected)
+            self.assertEqual(len(sample.events), 6)
+        self.assertEqual([e.effector for e in sample.events], [0, 1, 0, 1, 0, 1])
+
+    def test_event_at_terminal_shares_one_single_frame_target(self):
+        path, _, arrays = write_g_pi_task(self.root, gripper=[[0.]] * 15 + [[1.]] * 2)
+        sample = load_g_pi_sample(path, current_time=1.2)
+        self.assertEqual(arrays["subgoal_times"].tolist(), [1.6])
+        self.assertEqual(sample.events[0].time, sample.terminal_time)
+        self.assertEqual(sample.subgoal_time, 1.6)
+
     def test_g_reads_task_pair_and_pi_never_opens_demo(self):
         path, metadata, _ = write_g_pi_task(self.root)
-        sample = load_g_pi_sample(path, route="g_translator", current_time=.2)
+        sample = load_g_pi_sample(path, route="g_translator", current_time=.4)
         self.assertIs(type(sample), GTranslatorSample)
         self.assertEqual(sample.demonstration.shape, (1, 2, 3, 2, 2))
         self.assertIn(self.root / metadata["demonstration"]["arrays"], g_pi_sample_files(path, sample))
         (self.root / metadata["demonstration"]["arrays"]).unlink()
-        sample = load_g_pi_sample(path, current_time=.2)
+        sample = load_g_pi_sample(path, current_time=.4)
         self.assertEqual(len(g_pi_sample_files(path, sample)), 4)
         path, _, _ = write_g_pi_task(self.root, "unpaired", demonstration=False)
-        load_g_pi_sample(path, current_time=.2)
+        load_g_pi_sample(path, current_time=.4)
         with self.assertRaisesRegex(ValueError, "task-paired human"):
-            load_g_pi_sample(path, route="g_translator", current_time=.2)
+            load_g_pi_sample(path, route="g_translator", current_time=.4)
 
-    def test_future_frame_perturbations_never_enter_history(self):
+    def test_future_sequence_perturbations_never_enter_history_or_single_frame_target(self):
         path, metadata, arrays = write_g_pi_task(self.root)
-        baseline = load_g_pi_sample(path, current_time=.2)
-        arrays["latent"][:, 3:] += 1000
-        arrays["states"][3:] += 1000
-        np.savez_compressed(self.root / metadata["arrays"], **arrays)
-        changed = load_g_pi_sample(path, current_time=.2)
+        baseline = load_g_pi_sample(path, current_time=.4)
+        arrays["latent"][:, 2:] += 1000
+        arrays["states"][5:] += 1000
+        self.save(path, metadata, arrays)
+        changed = load_g_pi_sample(path, current_time=.4)
         self.assertTrue(torch.equal(baseline.history, changed.history))
         self.assertTrue(torch.equal(baseline.state, changed.state))
+        self.assertTrue(torch.equal(baseline.target_frame, changed.target_frame))
         self.assertEqual(baseline.history.untyped_storage().nbytes(),
                          baseline.history.numel() * baseline.history.element_size())
+        self.assertTrue(torch.equal(changed.target_frame, torch.full_like(changed.target_frame, 1006)))
 
-    def test_random_sampling_generator_reproducibility_and_bounds(self):
+    def test_random_sampling_generator_reproducibility_and_availability_bounds(self):
         path, _, _ = write_g_pi_task(self.root)
         one, two = torch.Generator().manual_seed(12), torch.Generator().manual_seed(12)
         times = [load_g_pi_sample(path, generator=one).metadata["current_time"] for _ in range(12)]
         self.assertEqual(times, [load_g_pi_sample(path, generator=two).metadata["current_time"] for _ in range(12)])
         self.assertGreater(len(set(times)), 1)
-        self.assertTrue(all(0 <= time < .7 for time in times))
+        self.assertTrue(all(any(abs(time - allowed) < 1e-6 for allowed in (0., .4, .8, 1.2)) for time in times))
 
-    def test_metadata_rejects_incompatible_frames_and_signals(self):
+    def test_stride_two_aligns_causal_latents_and_unpadded_future_actions(self):
+        path, metadata, arrays = write_g_pi_task(self.root, frame_stride=2)
+        sample = load_g_pi_sample(path, current_time=.8)
+        self.assertEqual(sample.history_times.tolist(), [0., .8])
+        self.assertEqual(sample.actions.shape, (1, 2, 2, 8, 1))
+        self.assertEqual(sample.actions[0, 0, 0, :, 0].tolist(), list(range(9, 17)))
+        self.assertEqual(sample.actions_mask.sum().item(), 8)
+        indices = validate_latent_grid(metadata, torch.from_numpy(arrays["control_times"]),
+                                       torch.from_numpy(arrays["latent_available_times"]))
+        self.assertEqual(indices.tolist(), [0, 8, 16])
+        with self.assertRaisesRegex(ValueError, "actions_per_frame"):
+            validate_latent_grid({**metadata, "actions_per_frame": 4},
+                                 torch.from_numpy(arrays["control_times"]),
+                                 torch.from_numpy(arrays["latent_available_times"]))
+
+    def test_short_task_with_only_initial_latent_and_terminal_off_latent_grid(self):
+        path, _, _ = write_g_pi_task(self.root, gripper=np.zeros((3, 1)))
+        sample = load_g_pi_sample(path, current_time=0.)
+        self.assertEqual(sample.history_times.tolist(), [0.])
+        self.assertEqual(sample.subgoal_time, .2)
+        self.assertEqual(sample.actions_mask.sum().item(), 2)
+        self.assertEqual(sample.actions.flatten()[:2].tolist(), [1., 2.])
+
+    def test_small_control_dt_preserves_exact_event_terminal_and_sample_indices(self):
+        grip = np.array([[0.], [0.], [1.], [1.], [1.]], dtype=np.float32)
+        path, metadata, arrays = write_g_pi_task(self.root, gripper=grip)
+        metadata["control_dt"] = 1e-7
+        arrays["control_times"] = np.arange(5, dtype=np.float64) * metadata["control_dt"]
+        arrays["latent_available_times"] = arrays["control_times"][::4]
+        arrays["subgoal_times"] = arrays["control_times"][[3, 4]]
+        self.save(path, metadata, arrays)
+        indices = subgoal_control_indices(torch.from_numpy(grip), torch.from_numpy(arrays["control_times"]))
+        self.assertEqual(indices.tolist(), [3, 4])
+        sample = load_g_pi_sample(path, current_time=0.)
+        self.assertEqual(sample.subgoal_time, arrays["control_times"][3])
+        self.assertEqual(sample.goal_poses[0, 0, 0, 3].item(), 3.)
+        self.assertTrue(torch.equal(sample.target_frame, torch.full_like(sample.target_frame, 1003)))
+        self.assertEqual(sample.actions_mask.sum().item(), 3)
+        with self.assertRaisesRegex(ValueError, "latent availability"):
+            load_g_pi_sample(path, current_time=1e-7)
+
+        path, metadata, arrays = write_g_pi_task(self.root, "small-dt", gripper=np.zeros((9, 1)))
+        metadata["control_dt"] = 1e-7
+        arrays["control_times"] = np.arange(9, dtype=np.float64) * metadata["control_dt"]
+        arrays["latent_available_times"] = arrays["control_times"][::4]
+        arrays["subgoal_times"] = arrays["control_times"][[-1]]
+        self.save(path, metadata, arrays)
+        sample = load_g_pi_sample(path, current_time=4e-7)
+        self.assertEqual(sample.metadata["current_time"], 4e-7)
+        self.assertEqual(sample.state[0, 0].item(), 16.)
+        self.assertEqual(sample.subgoal_time, 8e-7)
+        self.assertTrue(torch.equal(sample.target_frame, torch.full_like(sample.target_frame, 1008)))
+        invalid_times = torch.from_numpy(arrays["latent_available_times"].copy())
+        invalid_times[1] = 3e-7
+        with self.assertRaisesRegex(ValueError, "complete causal grid"):
+            validate_latent_grid(metadata, torch.from_numpy(arrays["control_times"]), invalid_times)
+
+    def test_metadata_rejects_incompatible_grid_conventions_and_signals(self):
         path, metadata, arrays = write_g_pi_task(self.root)
         for change in ({"success": False}, {"task_start_time": .1}, {"goal_source": "controller_target"},
                        {"pose_units": "cm"}, {"event_rules": {**metadata["event_rules"], "signal_source": "command"}},
-                       {"action_frames": False}, {"arrays": "../unsafe.npz"}):
-            path.write_text(json.dumps({**metadata, **change}))
+                       {"action_frames": False}, {"arrays": "../unsafe.npz"}, {"frame_stride": 0},
+                       {"temporal_down_rate": 2}, {"actions_per_frame": 3},
+                       {"alignment": "one_latent_per_control_step"}, {"subgoal_encoding": "sequence_slice"}):
+            self.save(path, {**metadata, **change}, arrays)
             with self.subTest(change=change), self.assertRaises(ValueError):
-                load_g_pi_sample(path, current_time=.2)
-        path.write_text(json.dumps(metadata))
-        for times in (arrays["frame_times"] + .1, arrays["frame_times"] * 2):
-            np.savez_compressed(self.root / metadata["arrays"], **{**arrays, "frame_times": times})
+                load_g_pi_sample(path, current_time=.4)
+        self.save(path, metadata, arrays)
+        for times in (arrays["control_times"] + .1, arrays["control_times"] * 2):
+            self.save(path, metadata, {**arrays, "control_times": times})
             with self.assertRaisesRegex(ValueError, "every control step"):
-                load_g_pi_sample(path, current_time=.2)
+                load_g_pi_sample(path, current_time=.4)
+
+    def test_rejects_latents_before_raw_coverage_is_available_and_missing_history(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        bad = arrays["latent_available_times"].copy()
+        bad[1] = .3
+        for change in ({"latent_available_times": bad},
+                       {"latent": arrays["latent"][:, 1:], "latent_available_times": arrays["latent_available_times"][1:]},
+                       {"latent": arrays["latent"][:, :-1], "latent_available_times": arrays["latent_available_times"][:-1]}):
+            self.save(path, metadata, {**arrays, **change})
+            with self.subTest(change=list(change)), self.assertRaisesRegex(ValueError, "complete causal grid"):
+                load_g_pi_sample(path, current_time=.4)
+
+    def test_rejects_missing_stale_or_sequence_subgoal_caches(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        for change in ({"subgoal_times": arrays["subgoal_times"][:1]},
+                       {"subgoal_times": arrays["subgoal_times"][1:]},
+                       {"subgoal_times": np.array([.5, 1.6])},
+                       {"subgoal_times": arrays["subgoal_times"] + 1e-8},
+                       {"subgoal_times": np.array([.6, .6, 1.6])},
+                       {"subgoal_latents": np.ones((2, 2, 2, 2, 2), dtype=np.float32)},
+                       {"subgoal_latents": np.full((2, 2, 1, 2, 2), np.nan, dtype=np.float32)}):
+            self.save(path, metadata, {**arrays, **change})
+            with self.subTest(change=list(change)), self.assertRaisesRegex(ValueError, "subgoal"):
+                load_g_pi_sample(path, current_time=.4)
+        changed = arrays["gripper"].copy()
+        changed[5] = 0.
+        self.save(path, metadata, {**arrays, "gripper": changed})
+        with self.assertRaisesRegex(ValueError, "recomputed"):
+            load_g_pi_sample(path, current_time=.4)
+
+    def test_version_one_rejected_with_migration_reason(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        self.save(path, {**metadata, "format_version": 1}, arrays)
+        with self.assertRaisesRegex(ValueError, "version 1 is unsupported.*separate control and latent grids"):
+            load_g_pi_sample(path)
+
+    def test_native_history_padding_is_not_shifted_into_future_labels(self):
+        import ast
+        source = Path(__file__).resolve().parents[1] / "third_party/Zero-WAM/wan_va/dataset/robotwin_action.py"
+        tree = ast.parse(source.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "preprocess_robotwin_actions")
+        namespace = {"np": np, "MODEL_ACTION_DIM": 30, "relative_robotwin_action": lambda action, state: action}
+        exec(compile(ast.Module([function], type_ignores=[]), str(source), "exec"), namespace)
+        raw = np.arange(17 * 16, dtype=np.float64).reshape(17, 16) / 300.
+        kwargs = dict(action=raw, state=raw, q01=-np.ones(30), q99=np.ones(30),
+                      inverse_used_action_channel_ids=list(range(16)) + [16] * 14)
+        unpadded, valid = namespace["preprocess_robotwin_actions"](**kwargs, history_size=0, required_size=17)
+        padded, _ = namespace["preprocess_robotwin_actions"](**kwargs, history_size=4, required_size=20)
+        np.testing.assert_array_equal(padded[:4], 0.)
+        np.testing.assert_array_equal(padded[4:8], unpadded[:4])
+        path, metadata, arrays = write_g_pi_task(self.root, gripper=np.zeros((17, 1)))
+        metadata["action_space"].update(dimension=30, valid_channels=valid[0].tolist())
+        arrays.update(actions=unpadded.T.astype(np.float32), actions_mask=valid.T)
+        self.save(path, metadata, arrays)
+        initial = load_g_pi_sample(path, current_time=0.)
+        np.testing.assert_array_equal(initial.actions[0, :, 0, :, 0].numpy(), padded[4:8].T.astype(np.float32))
+        following = load_g_pi_sample(path, current_time=.4)
+        np.testing.assert_array_equal(following.actions[0, :, 0, :, 0].numpy(), padded[8:12].T.astype(np.float32))
 
     def test_index_audits_source_splits_without_array_reads(self):
         first, _, _ = write_g_pi_task(self.root, "first")

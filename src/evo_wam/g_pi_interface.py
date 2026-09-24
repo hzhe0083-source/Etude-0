@@ -202,14 +202,14 @@ class GTranslator(nn.Module):
             raise ValueError("feature_layer must identify a native block")
         if goal_decoder.native_dim != native.inner_dim:
             raise ValueError("goal decoder width must match the frozen native model")
-        self.native, self.goal_decoder = native, goal_decoder
+        # The shared base is owned by the system, never by G's optimizer/state.
+        object.__setattr__(self, "native", native)
+        self.goal_decoder = goal_decoder
         self.config, self.feature_layer = dict(config), feature_layer
         self._demo_cache, self._demo_reference = None, None
-        self.native.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.native.eval()
         return self
 
     def clear_demo_cache(self):
@@ -243,27 +243,31 @@ class PiGoalPolicy(nn.Module):
                  action_shape, actions_mask: Tensor, seed: int = 0, video_native=None):
         super().__init__()
         from .g_pi_context import assert_frozen_base
-        video_native = native if video_native is None else video_native
-        assert_frozen_base(video_native)
+        if video_native is not None and video_native is not native:
+            raise ValueError("G, E and pi must share the same native object")
+        assert_frozen_base(native)
         if (not isinstance(action_shape, (list, tuple, torch.Size)) or len(action_shape) != 5
                 or any(type(size) is not int or size < 1 for size in action_shape)
                 or action_shape[0] != 1 or action_shape[1] != native.config.action_dim or action_shape[-1] != 1):
             raise ValueError("action_shape must be positive native [1,A,F,N,1]")
         if not getattr(native, "_goal_action_interface", False):
             raise ValueError("install the goal action interface before constructing the policy")
-        if (interface.native_dim != native.inner_dim or interface.native_dim != video_native.inner_dim
-                or interface.num_layers != len(native.blocks) or interface.num_layers != len(video_native.blocks)):
-            raise ValueError("policy, frozen video and action models must share widths and layer counts")
+        if interface.native_dim != native.inner_dim or interface.num_layers != len(native.blocks):
+            raise ValueError("policy and shared native must share widths and layer counts")
         from .zerowam import action_mask_for
         if not action_mask_for(actions_mask, torch.empty(action_shape)).any():
             raise ValueError("at least one action channel must be active")
         if type(seed) is not int or seed < 0:
             raise ValueError("sampling seed must be a nonnegative integer")
-        self.native, self.video_native, self.interface = native, video_native, interface
+        self.native, self.interface = native, interface
         self.config, self.action_shape = dict(config), tuple(action_shape)
         self.register_buffer("actions_mask", actions_mask.detach().clone())
         self.generator = torch.Generator(device="cpu").manual_seed(seed)
         self.video_native.eval()
+
+    @property
+    def video_native(self):
+        return self.native
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -278,10 +282,13 @@ class PiGoalPolicy(nn.Module):
         history = truncate_robot_history(robot_frames_t0_to_t, current_index)
         features = pi_context_features(self.video_native, history, self.config)
         if frame_times is None:
-            interval = self.config.get("latent_frame_dt", self.config.get(
-                "control_dt", getattr(self.interface, "control_dt", None)))
+            interval = self.config.get("latent_frame_dt", getattr(self.interface, "latent_frame_dt", None))
+            if interval is None:
+                control_dt = self.config.get("control_dt", getattr(self.interface, "control_dt", None))
+                if type(control_dt) in (int, float) and math.isfinite(control_dt) and control_dt > 0:
+                    interval = self.action_shape[3] * control_dt
             if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
-                raise ValueError("frame_times or a positive latent_frame_dt/control_dt from the training registry are required")
+                raise ValueError("frame_times or latent_frame_dt=N*control_dt from the training registry are required")
             frame_times = torch.arange(history.shape[2], dtype=torch.float64) * interval
         else:
             if not isinstance(frame_times, Tensor) or frame_times.ndim != 1:

@@ -192,9 +192,11 @@ class GPiNativeInterfaceTests(unittest.TestCase):
     def fixture(self, device="cpu"):
         from test_native_icl import tiny_model
         from evo_wam.g_pi_context import FrozenGoalEncoder, install_empty_text
+        from evo_wam.g_pi_training import _set_precision
         from evo_wam.goal_action import action_named_parameters, install_action_interface
         torch.manual_seed(243)
         native = install_action_interface(tiny_model(device).float()).requires_grad_(False).eval()
+        _set_precision(native, video_precision="bfloat16", route="pi_goal")
         install_empty_text(native, torch.randn(1, 2, 8, device=device), "unit-test empty-text fixture")
         encoder = FrozenGoalEncoder(native, layer=1, k_z=3, base_id="native-fixture")
         for _, parameter in action_named_parameters(native):
@@ -213,19 +215,38 @@ class GPiNativeInterfaceTests(unittest.TestCase):
 
     def test_wrappers_only_enable_expected_parameters_and_keep_video_eval(self):
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
+        self.assertIs(encoder.native, native)
+        self.assertEqual(list(encoder.parameters()), [])
+        self.assertEqual(dict(encoder.state_dict()), {})
+        native.train()
         translator = GTranslator(encoder.native, decoder, config)
         translator.train()
-        self.assertFalse(translator.native.training)
+        self.assertIs(translator.native, native)
+        self.assertTrue(native.training)
         self.assertTrue(translator.goal_decoder.training)
         self.assertTrue(all(name.startswith("goal_decoder.") for name, value in translator.named_parameters()
                             if value.requires_grad))
+        action_flags = [(parameter, parameter.requires_grad) for parameter in native.parameters()]
+        encoder.train()
+        self.assertTrue(native.training)
+        self.assertTrue(all(parameter.requires_grad == flag for parameter, flag in action_flags))
         policy = PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1),
-                              actions_mask=torch.ones(1, 3, 1, 2, 1, dtype=torch.bool), video_native=encoder.native)
+                              actions_mask=torch.ones(1, 3, 1, 2, 1, dtype=torch.bool))
         policy.train()
+        self.assertIs(policy.native, policy.video_native)
+        self.assertIs(policy.native, translator.native)
+        self.assertNotIn("video_native", policy._modules)
         self.assertFalse(policy.video_native.training)
         self.assertTrue(policy.interface.training)
-        with self.assertRaisesRegex(ValueError, "frozen"):
-            PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1), actions_mask=policy.actions_mask)
+        from copy import deepcopy
+        with self.assertRaisesRegex(ValueError, "same native"):
+            PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1),
+                         actions_mask=policy.actions_mask, video_native=deepcopy(native))
+        from evo_wam.goal_action import action_named_parameters
+        action_ids = {id(parameter) for _, parameter in action_named_parameters(native)}
+        self.assertTrue(all(parameter.dtype == (torch.float32 if id(parameter) in action_ids else torch.bfloat16)
+                            for parameter in native.parameters()))
+        self.assertTrue(all(parameter.dtype == torch.float32 for parameter in interface.parameters()))
         with self.assertRaises(TypeError):
             policy.predict(history, state, language, {}, demonstration=demo)
 
@@ -246,12 +267,18 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
              self.assertRaisesRegex(ValueError, "control_dt"):
             policy.predict(history, state, language, goal, current_index=1)
-        interface.control_dt = .2
+        interface.control_dt = .1
         with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
              patch("evo_wam.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)), \
              patch.object(interface, "conditions", wraps=interface.conditions) as condition:
             policy.predict(history, state, language, goal, current_index=1)
         torch.testing.assert_close(condition.call_args.args[4], torch.tensor([0., .2], dtype=torch.float64))
+        interface.latent_frame_dt = .3
+        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
+             patch("evo_wam.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)), \
+             patch.object(interface, "conditions", wraps=interface.conditions) as condition:
+            policy.predict(history, state, language, goal, current_index=1)
+        torch.testing.assert_close(condition.call_args.args[4], torch.tensor([0., .3], dtype=torch.float64))
 
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_native_g_step_changes_decoder_only_and_E_stays_exact(self):
@@ -259,6 +286,7 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture("cuda")
         translator = GTranslator(encoder.native, decoder, config)
         checksum = frozen_base_checksum(encoder.native)
+        native_before = {name: value.detach().clone() for name, value in native.state_dict().items()}
         original = {name: value.detach().clone() for name, value in translator.named_parameters()}
         with torch.autocast("cuda", dtype=torch.bfloat16):
             before_z = encoder(history[:, :, -1:])
@@ -272,6 +300,9 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         changed = {name for name, value in translator.named_parameters() if not torch.equal(value, original[name])}
         self.assertTrue(changed)
         self.assertTrue(all(name.startswith("goal_decoder.") for name in changed))
+        self.assertTrue(all(value.dtype == torch.float32 and value.grad.dtype == torch.float32
+                            for value in decoder.parameters()))
+        self.assertTrue(all(torch.equal(value, native_before[name]) for name, value in native.state_dict().items()))
         self.assertEqual(frozen_base_checksum(encoder.native), checksum)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             torch.testing.assert_close(encoder(history[:, :, -1:]), before_z, rtol=0, atol=0)
@@ -283,6 +314,7 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture("cuda")
         action_parameters = dict(action_named_parameters(native))
         original = {name: value.detach().clone() for name, value in native.named_parameters()}
+        decoder_before = {name: value.detach().clone() for name, value in decoder.named_parameters()}
         interface_before = {name: value.detach().clone() for name, value in interface.named_parameters()}
         checksum = frozen_base_checksum(encoder.native)
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -302,6 +334,11 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         changed = {name for name, value in native.named_parameters() if not torch.equal(value, original[name])}
         self.assertTrue(changed)
         self.assertTrue(changed <= action_parameters.keys())
+        self.assertTrue(all(value.dtype == torch.float32 and value.grad is not None
+                            and value.grad.dtype == torch.float32 for value in action_parameters.values()))
+        self.assertTrue(all(value.dtype == torch.float32 and value.grad is not None
+                            and value.grad.dtype == torch.float32 for value in interface.parameters()))
+        self.assertTrue(all(torch.equal(value, decoder_before[name]) for name, value in decoder.named_parameters()))
         self.assertTrue(any(not torch.equal(value, interface_before[name]) for name, value in interface.named_parameters()))
         self.assertEqual(frozen_base_checksum(encoder.native), checksum)
         with torch.autocast("cuda", dtype=torch.bfloat16):

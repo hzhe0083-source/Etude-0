@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -16,14 +15,14 @@ from .cli import file_sha256, write_json
 from .goal_action import action_named_parameters, goal_action_forward, install_action_interface
 from .icl_training import build_icl_model, validate_icl_config
 from .video_data import _local_path, _source_components, patch_grid_coordinates
-from .zerowam import DEFAULT_SOURCE, ZERO_WAM_COMMIT, load_native_class
+from .zerowam import DEFAULT_SOURCE, ZERO_WAM_COMMIT
 
 
 ROUTES = {"g_translator": "g", "pi_goal": "pi"}
 
 
 def g_pi_architecture(config):
-    return {"g_translator": "g_translator_v1", "pi_goal": "pi_goal_v1"}[config["interface_type"]]
+    return {"g_translator": "g_translator_shared_v2", "pi_goal": "pi_goal_shared_v2"}[config["interface_type"]]
 
 
 def _check_stage(config, stage):
@@ -78,6 +77,8 @@ def validate_g_pi_config(config):
     if config["interface_type"] == "g_translator" and any(noise.values()):
         raise ValueError("goal noise is only supported for hindsight pi training")
     EventRules.from_metadata(config.get("event_rules"))
+    if type(config.get("base_seed", 0)) is not int or not 0 <= config.get("base_seed", 0) < 2 ** 63:
+        raise ValueError("base_seed must be a nonnegative integer smaller than 2**63")
     for name in ("empty_text_emb_path", "empty_emb_path"):
         if name in config and (not isinstance(config[name], str) or not config[name].strip()):
             raise ValueError(f"{name} must be a nonempty local path")
@@ -102,7 +103,23 @@ def _interface(native, config, registry):
         interface = PiGoalInterface(**common, feature_dim=native.inner_dim,
                                    num_layers=len(native.blocks), **config["goal_interface"])
         interface.control_dt = registry["control_dt"]
-    return interface.to(native.action_embedder.weight)
+        interface.latent_frame_dt = registry["actions_per_frame"] * registry["control_dt"]
+    return interface.to(device=native.action_embedder.weight.device, dtype=torch.float32)
+
+
+def _set_precision(native, *, video_precision, route):
+    """Convert frozen storage without rounding the FP32 action master weights."""
+    if video_precision not in {"float32", "bfloat16"} or route not in ROUTES:
+        raise ValueError("G/pi require float32 or bfloat16 video and an explicit route")
+    action = {id(parameter) for _, parameter in action_named_parameters(native)} if route == "pi_goal" else set()
+    dtype = getattr(torch, video_precision)
+    for parameter in native.parameters():
+        parameter.data = parameter.data.to(dtype=torch.float32 if id(parameter) in action else dtype)
+    for module in native.modules():
+        for name, buffer in module.named_buffers(recurse=False):
+            if buffer.is_floating_point():
+                module._buffers[name] = buffer.to(dtype=dtype)
+    return native
 
 
 def _set_training(native, interface, encoder, config):
@@ -114,7 +131,8 @@ def _set_training(native, interface, encoder, config):
             parameter.requires_grad_(True)
 
 
-def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda"):
+def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=False, device="cuda",
+                      video_precision=None):
     from .g_pi_context import FrozenGoalEncoder, install_empty_text
 
     validate_g_pi_config(config)
@@ -122,10 +140,18 @@ def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=F
     source = config.get("empty_text_emb_path", config.get("empty_emb_path"))
     if source is not None and not Path(source).is_file():
         raise ValueError("configured empty text embedding must be an existing local file")
-    native, null, identity = build_icl_model(config, checkpoint=checkpoint, tiny_native=tiny_native,
-        device=device, adaptation=False, dtype=torch.float32, empty_text_path=source)
+    video_precision = video_precision or ("bfloat16" if str(device).startswith("cuda") else "float32")
+    # Build once on CPU. Fixed tiny-base randomness is independent of training
+    # RNG, and mixed storage is established before the sole device transfer.
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(config.get("base_seed", 0))
+        native, null, identity = build_icl_model(config, checkpoint=checkpoint, tiny_native=tiny_native,
+            device="cpu", adaptation=False, dtype=torch.float32, empty_text_path=source)
     identity = json.loads(json.dumps(identity))
+    if tiny_native:
+        identity["base_seed"] = config.get("base_seed", 0)
     install_action_interface(native)
+    _set_precision(native, video_precision=video_precision, route=config["interface_type"])
     if source is not None:
         path = Path(source).resolve()
         if tiny_native:
@@ -140,6 +166,7 @@ def build_g_pi_system(config, registry, *, stage, checkpoint=None, tiny_native=F
         text_identity = {"kind": "zerowam-empty-text", "path": str(path.resolve()), "sha256": file_sha256(path)}
     install_empty_text(native, null, text_identity)
     native.eval().requires_grad_(False)
+    native.to(device=device)
     encoder = FrozenGoalEncoder(native, layer=config["goal_encoder"]["layer"],
         k_z=config["goal_encoder"].get("k_z", 8), base_id=identity)
     interface = _interface(native, config, registry)
@@ -175,8 +202,8 @@ def g_pi_training_loss(native, interface, encoder, sample, config, generators, *
     if feature_layers != list(range(len(native.blocks))):
         raise ValueError("G/pi feature layers must follow every native block")
     weight = native.action_embedder.weight
-    state = sample.state.to(weight)
-    # E keeps FP32 weights and owns the same fixed native compute precision at deployment.
+    state = sample.state.to(device=weight.device, dtype=torch.float32)
+    # E shares the immutable video branch and owns its fixed compute precision.
     with torch.no_grad(), torch.autocast(device_type=weight.device.type, enabled=False):
         goal = {"z": encoder(sample.target_frame), "goal_poses": sample.goal_poses.to(weight.device),
                 "goal_gripper": sample.goal_gripper.to(weight.device)}
@@ -211,32 +238,29 @@ def _optimizer(native, interface, encoder, config):
                               "name": ROUTES[config["interface_type"]]}], weight_decay=0.)
 
 
+def _action_state(native, interface):
+    from .g_pi_interface import PiGoalInterface
+
+    return dict(action_named_parameters(native)) if isinstance(interface, PiGoalInterface) else {}
+
+
 def _system_state(native, interface, encoder):
-    return {name: {key: value.detach().cpu() for key, value in module.state_dict().items()}
-            for name, module in (("native", native), ("interface", interface), ("encoder", encoder))}
+    if encoder.state_dict():
+        raise ValueError("E must share the base without registering or serializing its weights")
+    modules = {"interface": interface.state_dict(), "action": _action_state(native, interface)}
+    return {name: {key: value.detach().cpu() for key, value in values.items()} for name, values in modules.items()}
 
 
 def _restore_system(native, interface, encoder, model):
-    if not isinstance(model, dict) or set(model) != {"native", "interface", "encoder"}:
-        raise ValueError("G/pi artifacts require complete native, interface and frozen encoder weights")
-    for name, module in (("native", native), ("interface", interface), ("encoder", encoder)):
-        expected = module.state_dict()
+    if encoder.state_dict() or not isinstance(model, dict) or set(model) != {"interface", "action"}:
+        raise ValueError("G/pi artifacts contain only trainable interface/action weights, never frozen native or E weights")
+    for name, expected in (("interface", interface.state_dict()), ("action", _action_state(native, interface))):
         if (model[name].keys() != expected.keys() or any(model[name][key].shape != value.shape
                 or model[name][key].dtype != value.dtype for key, value in expected.items())):
-            raise ValueError("G/pi complete model keys, shapes and precision must match")
-        module.load_state_dict(model[name], strict=True)
-
-
-def _video_checksum(native):
-    action = {name for name, _ in action_named_parameters(native)}
-    digest = hashlib.sha256()
-    for name, value in native.state_dict().items():
-        if name not in action:
-            tensor = value.detach().cpu().contiguous()
-            digest.update(name.encode())
-            digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
-            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
+            raise ValueError("G/pi trainable keys, shapes and FP32 precision must match")
+        with torch.no_grad():
+            for key, value in expected.items():
+                value.copy_(model[name][key])
 
 
 def _frozen_checksums(native, encoder, config):
@@ -246,16 +270,44 @@ def _frozen_checksums(native, encoder, config):
     action = {id(p) for _, p in action_named_parameters(native)} if config["interface_type"] == "pi_goal" else set()
     if any(p.requires_grad for p in native.parameters() if id(p) not in action):
         raise ValueError("video backbone parameters must all be frozen")
-    checksum = frozen_base_checksum(native) if config["interface_type"] == "g_translator" else _video_checksum(native)
-    return {"encoder": frozen_base_checksum(encoder.native), "native_video": checksum}
+    if encoder.native is not native:
+        raise ValueError("E and G/pi must share the same frozen video base")
+    checksum = frozen_base_checksum(native)
+    return {"encoder": checksum, "native_video": checksum}
+
+
+def _base_reference(config, checkpoint, tiny_native, identity, encoder):
+    return {"kind": "tiny-native" if tiny_native else "local-checkpoint",
+            "checkpoint": None if tiny_native else str(Path(checkpoint).resolve()),
+            "base_seed": config.get("base_seed", 0), "identity": identity,
+            "empty_text_identity": encoder.identity["empty_text_identity"],
+            "encoder_identity": encoder.identity,
+            "video_precision": str(encoder.native.patch_embedding_mlp.weight.dtype).removeprefix("torch.")}
+
+
+def _base_location(reference, checkpoint=None):
+    if reference["kind"] == "tiny-native":
+        if checkpoint is not None:
+            raise ValueError("tiny-native artifacts rebuild their fixed base_seed and cannot use another checkpoint")
+        return None
+    path = Path(checkpoint or reference["checkpoint"])
+    folder = path / "transformer" if (path / "transformer").is_dir() else path
+    expected = reference["identity"].get("sha256")
+    if not isinstance(expected, dict) or not expected:
+        raise ValueError("real base reference must record native checkpoint file hashes")
+    paths = [folder / name for name in expected]
+    actual_names = {p.name for p in folder.glob("*.safetensors")} | {"config.json"} | {
+        p.name for p in folder.glob("*.safetensors.index.json")}
+    if (actual_names != set(expected) or any(not p.is_file() or file_sha256(p) != expected[p.name] for p in paths)):
+        raise ValueError("referenced base checkpoint is missing or its file hashes changed")
+    return str(path)
 
 
 def validate_g_pi_artifact(payload, *, kind="g_pi_training", expected_encoder_identity=None):
-    if (not isinstance(payload, dict) or payload.get("kind") != kind or payload.get("format_version") != 1
+    if (not isinstance(payload, dict) or payload.get("kind") != kind or payload.get("format_version") != 2
             or not isinstance(payload.get("config"), dict) or payload.get("upstream_commit") != ZERO_WAM_COMMIT
-            or payload.get("precision") not in ({"float32"} if kind == "g_pi_training" else {"float32", "bfloat16"})
-            or payload.get("encoder_precision") != "float32"):
-        raise ValueError("expected a complete version-1 G/pi artifact with frozen FP32 encoder")
+            or payload.get("precision") != "float32" or payload.get("encoder_precision") not in {"float32", "bfloat16"}):
+        raise ValueError("expected a version-2 lightweight G/pi artifact with FP32 trainables and a shared frozen base reference")
     config = validate_g_pi_config(payload["config"])
     _check_stage(config, payload.get("stage"))
     identity = payload.get("encoder_identity")
@@ -275,6 +327,23 @@ def validate_g_pi_artifact(payload, *, kind="g_pi_training", expected_encoder_id
         raise ValueError("G/pi route, E identity, dimensions or event rules do not match the artifact")
     if expected_encoder_identity is not None and identity != expected_encoder_identity:
         raise ValueError("E identity mismatch")
+    reference = payload.get("base_reference")
+    if (not isinstance(reference, dict) or reference.get("kind") not in {"tiny-native", "local-checkpoint"}
+            or reference.get("kind") != ("tiny-native" if payload.get("tiny_native") else "local-checkpoint")
+            or reference.get("identity") != payload["base_identity"]
+            or reference.get("encoder_identity") != identity
+            or reference.get("empty_text_identity") != payload["empty_text_identity"]
+            or reference.get("video_precision") != payload["encoder_precision"]
+            or reference.get("base_seed") != config.get("base_seed", 0)
+            or (reference["kind"] == "local-checkpoint" and not isinstance(reference.get("checkpoint"), str))):
+        raise ValueError("base reference, shared E identity, precision or base_seed mismatch")
+    if kind == "g_pi_training":
+        model = payload.get("model")
+        if (not isinstance(model, dict) or set(model) != {"interface", "action"}
+                or not model["interface"] or (config["interface_type"] == "g_translator" and model["action"])
+                or any(not isinstance(v, torch.Tensor) or v.dtype != torch.float32
+                       for values in model.values() for v in values.values())):
+            raise ValueError("lightweight artifacts contain FP32 interface/action trainables only; frozen weights are forbidden")
     return payload
 
 
@@ -319,8 +388,10 @@ def train_g_pi_interface(args):
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
+    checkpoint = _base_location(previous["base_reference"], args.checkpoint) if previous else args.checkpoint
     native, interface, encoder, identity, layers = build_g_pi_system(config, registry, stage=stage,
-        checkpoint=args.checkpoint, tiny_native=args.tiny_native, device=args.device)
+        checkpoint=checkpoint, tiny_native=args.tiny_native, device=args.device,
+        video_precision=previous["encoder_precision"] if previous else None)
     if previous:
         if previous["base_identity"] != identity or previous["feature_layers"] != layers:
             raise ValueError("base checkpoint or feature layers changed")
@@ -388,12 +459,13 @@ def train_g_pi_interface(args):
         torch.cuda.synchronize()
     elapsed = time.monotonic() - started
     n = np.random.get_state()
-    payload = {"format_version": 1, "kind": "g_pi_training", "architecture": g_pi_architecture(config),
-        "precision": "float32", "encoder_precision": "float32", "upstream_commit": ZERO_WAM_COMMIT,
+    reference = _base_reference(config, checkpoint, args.tiny_native, identity, encoder)
+    payload = {"format_version": 2, "kind": "g_pi_training", "architecture": g_pi_architecture(config),
+        "precision": "float32", "encoder_precision": reference["video_precision"], "upstream_commit": ZERO_WAM_COMMIT,
         "config": config, "stage": stage, "interface_type": config["interface_type"],
         "model": _system_state(native, interface, encoder),
         "native_config": {k: v for k, v in dict(native.config).items() if not k.startswith("_")},
-        "base_identity": identity, "encoder_identity": encoder.identity,
+        "base_identity": identity, "base_reference": reference, "encoder_identity": encoder.identity,
         "empty_text_identity": encoder.identity["empty_text_identity"],
         "k_z": encoder.identity["k_z"], "d_z": encoder.identity["d_z"], "event_rules": config["event_rules"],
         "tiny_native": args.tiny_native, "feature_layers": layers, "registry": registry,
@@ -411,6 +483,8 @@ def train_g_pi_interface(args):
     report = {"artifact": str((output / "goal_interface.pt").resolve()), "stage": stage, "updates": updates,
         "interface_type": config["interface_type"], "elapsed_seconds": elapsed,
         "trainable_parameters": sum(p.numel() for p in parameters), "precision": "float32", "lora": False,
+        "encoder_precision": reference["video_precision"], "base_reference": reference,
+        "shared_video_base": encoder.native is native,
         "encoder_identity": encoder.identity, "frozen_checksums": frozen,
         "optimizer_groups": [{"name": g["name"], "lr": g["lr"],
                               "parameters": sum(p.numel() for p in g["params"])} for g in optimizer.param_groups],
@@ -429,11 +503,12 @@ def export_g_pi_policy(args, *, payload=None):
     output = Path(args.output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("export requires a fresh directory")
-    precision = getattr(args, "dtype", "float32")
-    if precision not in {"float32", "bfloat16"}:
+    requested = getattr(args, "dtype", "float32")
+    if requested not in {"float32", "bfloat16"}:
         raise ValueError("deployment dtype must be float32 or bfloat16")
-    state = {f"{module}.{key}": (value.to(dtype=getattr(torch, precision))
-             if module != "encoder" and value.is_floating_point() else value)
+    # The legacy dtype flag is accepted, but v2 never quantizes trainables or
+    # embeds a second copy of frozen video weights into an exported policy.
+    state = {f"{module}.{key}": value
              for module, values in payload["model"].items() for key, value in values.items()}
     split = split_torch_state_dict_into_shards(state, filename_pattern="model{suffix}.safetensors",
                                               max_shard_size=getattr(args, "max_shard_size", "2GB"))
@@ -446,17 +521,19 @@ def export_g_pi_policy(args, *, payload=None):
     excluded = {"model", "optimizer", "scheduler", "rng", "torch_rng", "cuda_rng", "python_rng", "numpy_rng",
                 "visited_arrays", "data_identity", "data_cursor"}
     policy = {key: value for key, value in payload.items() if key not in excluded}
-    policy.update(kind="g_pi_policy", precision=precision, shards=files, weight_map=weight_map,
+    policy.update(kind="g_pi_policy", precision="float32", requested_dtype=requested, shards=files, weight_map=weight_map,
                   source_artifact_sha256=file_sha256(args.artifact))
     write_json(output / "policy.json", policy)
     return {"policy": str(output.resolve()), "interface_type": payload["interface_type"],
-            "precision": precision, "encoder_precision": "float32", "test_time_updates": False,
+            "precision": "float32", "requested_dtype": requested,
+            "encoder_precision": payload["encoder_precision"], "requires_base_checkpoint": not payload["tiny_native"],
+            "test_time_updates": False,
             "video_generation": False}
 
 
-def load_g_pi_policy(path, *, device="cuda", expected_encoder_identity=None):
+def load_g_pi_policy(path, *, device="cuda", checkpoint=None, expected_encoder_identity=None):
     from safetensors.torch import load_file
-    from .g_pi_context import FrozenGoalEncoder, frozen_base_checksum, install_empty_text
+    from .g_pi_context import frozen_base_checksum
 
     folder = Path(path)
     payload = validate_g_pi_artifact(json.loads((folder / "policy.json").read_text()), kind="g_pi_policy",
@@ -475,30 +552,20 @@ def load_g_pi_policy(path, *, device="cuda", expected_encoder_identity=None):
     if state.keys() != payload["weight_map"].keys():
         raise ValueError("incomplete G/pi policy shards")
     model = {module: {key[len(module) + 1:]: value for key, value in state.items() if key.startswith(module + ".")}
-             for module in ("native", "interface", "encoder")}
+             for module in ("interface", "action")}
     if sum(map(len, model.values())) != len(state):
         raise ValueError("unknown G/pi policy module")
-    # Restore the original FP32 snapshot before constructing E: action expert
-    # updates must never become part of its base identity on a standalone load.
-    native = load_native_class()(**payload["native_config"]).to(device=device, dtype=torch.float32)
-    install_action_interface(native)
-    snapshot = {key[len("native."):]: value for key, value in model["encoder"].items() if key.startswith("native.")}
-    if "g_pi_empty_text" not in snapshot:
-        raise ValueError("the target encoder requires its original empty text embedding")
-    install_empty_text(native, snapshot["g_pi_empty_text"], payload["empty_text_identity"]["source"])
-    if snapshot.keys() != native.state_dict().keys():
-        raise ValueError("the target encoder snapshot is incomplete")
-    native.load_state_dict(snapshot, strict=True)
-    native.eval().requires_grad_(False)
-    encoder = FrozenGoalEncoder(native, layer=payload["config"]["goal_encoder"]["layer"],
-        k_z=payload["k_z"], base_id=payload["base_identity"])
+    checkpoint = _base_location(payload["base_reference"], checkpoint)
+    native, interface, encoder, identity, layers = build_g_pi_system(payload["config"], payload["registry"],
+        stage=payload["stage"], checkpoint=checkpoint, tiny_native=payload["tiny_native"], device=device,
+        video_precision=payload["encoder_precision"])
+    if identity != payload["base_identity"]:
+        raise ValueError("base checkpoint identity changed before loading the trainables")
     encoder.validate_identity(payload["encoder_identity"])
-    native.to(dtype=getattr(torch, payload["precision"]))
-    interface = _interface(native, payload["config"], payload["registry"])
     _restore_system(native, interface, encoder, model)
     if frozen_base_checksum(encoder.native) != payload["encoder_identity"]["base_sha256"]:
         raise ValueError("E weights differ from the recorded identity")
-    if payload["feature_layers"] != list(range(len(native.blocks))):
+    if payload["feature_layers"] != layers:
         raise ValueError("policy feature layers differ from native blocks")
     for module in (native, interface, encoder):
         module.eval().requires_grad_(False)

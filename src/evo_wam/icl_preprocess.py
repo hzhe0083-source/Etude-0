@@ -10,6 +10,51 @@ import torch
 from .vision import encode_rgb, load_vae, read_video, sha256
 
 
+def encode_g_pi_frames(vae, frames, control_times, gripper, *, frame_stride, control_dt,
+                       event_rules, size):
+    """Encode native causal history and each event/terminal image separately.
+
+    RGB contains every control-grid frame, including the incomplete video tail.
+    Returns visual NPZ fields and their alignment metadata for a v2 g_pi_task.
+    """
+    from .g_pi_data import EventRules, subgoal_control_indices, validate_latent_grid
+
+    if (not isinstance(frames, np.ndarray) or frames.dtype != np.uint8 or frames.ndim != 4
+            or frames.shape[-1] != 3 or min(frames.shape) < 1 or len(frames) < 2):
+        raise ValueError("G/pi RGB must be uint8 [T_c,H,W,3] including every control step")
+    times = torch.as_tensor(control_times).detach().cpu()
+    measured = torch.as_tensor(gripper).detach().cpu()
+    if times.shape != (len(frames),):
+        raise ValueError("control_times must identify every supplied RGB frame")
+    rules = EventRules.from_metadata(event_rules) if isinstance(event_rules, dict) else event_rules
+    if not isinstance(rules, EventRules):
+        raise ValueError("event_rules must contain the measured gripper detection rules")
+    if type(frame_stride) is not int or frame_stride < 1:
+        raise ValueError("frame_stride must be a positive integer")
+    metadata = {"frame_stride": frame_stride, "temporal_down_rate": 4, "control_dt": control_dt,
+                "actions_per_frame": 4 * frame_stride, "alignment": "zerowam_causal_first_then_four",
+                "subgoal_encoding": "wan_vae_single_frame"}
+    endpoints = torch.arange(0, len(frames), 4 * frame_stride)
+    available = times[endpoints]
+    validate_latent_grid(metadata, times, available)
+    subgoals = subgoal_control_indices(measured, times, rules)
+    # Discard incomplete groups only from the sequence, never from target RGB.
+    sampled = frames[:endpoints[-1].item() + 1:frame_stride]
+    latent = encode_rgb(vae, sampled, size)
+    targets = [encode_rgb(vae, frames[index:index + 1], size) for index in subgoals.tolist()]
+    if (latent.ndim != 5 or latent.shape[0] != 1 or latent.shape[2] != len(endpoints)
+            or min(latent.shape) < 1 or not latent.is_floating_point() or not torch.isfinite(latent).all()):
+        raise ValueError("Wan history must return finite [1,C,T_l,H,W] on the causal latent grid")
+    expected = (1, latent.shape[1], 1, *latent.shape[-2:])
+    if any(target.shape != expected or not target.is_floating_point() or not torch.isfinite(target).all()
+           for target in targets):
+        raise ValueError("each subgoal must be independently encoded as finite [1,C,1,H,W]")
+    arrays = {"latent": latent[0].float().numpy(), "latent_available_times": available.numpy(),
+              "subgoal_latents": torch.cat(targets, dim=0).float().numpy(),
+              "subgoal_times": times[subgoals].numpy()}
+    return arrays, metadata
+
+
 def preprocess_icl_video(manifest_path, output, *, device="cuda", vae=None):
     """Encode one continuous clip; semantic A/B pairing remains an audited input."""
     from .cli import write_json

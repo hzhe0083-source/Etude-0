@@ -1,4 +1,4 @@
-"""Frozen clean-video features and the independent visual-goal snapshot."""
+"""Frozen clean-video features and visual-goal rules over one shared base."""
 
 from copy import deepcopy
 from dataclasses import dataclass
@@ -13,8 +13,31 @@ from torch.nn import functional as F
 
 
 def assert_frozen_base(native):
-    if any(parameter.requires_grad for parameter in native.parameters()):
-        raise ValueError("G/pi video base must have every parameter frozen")
+    if any(parameter.requires_grad for _, parameter in frozen_base_named_parameters(native)):
+        raise ValueError("G/pi video base must have every non-action parameter frozen")
+
+
+def _action_ids(native):
+    if not getattr(native, "_goal_action_interface", False):
+        return set()
+    from .goal_action import action_named_parameters
+
+    # Installed action K/V must remain independent of the frozen video branch.
+    for block in native.blocks:
+        for attention in (block.attn1, block.attn2):
+            for name in ("to_q", "to_k", "to_v", "to_out", "norm_q", "norm_k"):
+                video_ids = {id(value) for value in getattr(attention, name).parameters()}
+                if any(id(value) in video_ids for value in getattr(attention, f"action_{name}").parameters()):
+                    raise ValueError("shared G/pi base requires independent action attention parameters")
+    return {id(parameter) for _, parameter in action_named_parameters(native)}
+
+
+def frozen_base_named_parameters(native):
+    """Reuse the installed action selector; aliases are filtered by identity."""
+    action_ids = _action_ids(native)
+    for name, parameter in native.named_parameters():
+        if id(parameter) not in action_ids:
+            yield name, parameter
 
 
 def _tensor_hash(value):
@@ -33,9 +56,9 @@ def _json_identity(value):
 
 
 def frozen_base_checksum(native):
-    """Hash all parameters and buffers, including unused frozen native heads."""
+    """Hash the frozen base once per tensor, excluding isolated action experts."""
     digest = hashlib.sha256()
-    for name, value in native.state_dict().items():
+    for name, value in list(frozen_base_named_parameters(native)) + list(native.named_buffers()):
         digest.update(name.encode())
         digest.update(_tensor_hash(value).encode())
     return digest.hexdigest()
@@ -150,7 +173,7 @@ def _validate_video(native, value, name):
 
 def _versions(native):
     return tuple((id(value), value._version, str(value.device), str(value.dtype))
-                 for value in list(native.parameters()) + list(native.buffers()))
+                 for _, value in list(frozen_base_named_parameters(native)) + list(native.named_buffers()))
 
 
 @dataclass(frozen=True)
@@ -313,7 +336,7 @@ def pi_context_features(native, history, config, *, current_index=None):
 
 
 class FrozenGoalEncoder(nn.Module):
-    """E: an independent, immutable-weight Wan snapshot encoding one frame."""
+    """E: fixed single-frame encoding rules over the shared frozen video base."""
 
     def __init__(self, native, *, layer, k_z=8, base_id=None):
         super().__init__()
@@ -327,21 +350,21 @@ class FrozenGoalEncoder(nn.Module):
             base_id = _json_identity(base_id)
         if not hasattr(native, "g_pi_empty_text") or not hasattr(native, "g_pi_empty_text_identity"):
             raise ValueError("E requires the pretrained empty text embedding and source identity")
-        self.native = deepcopy(native).requires_grad_(False).eval()
-        self.native.g_pi_empty_text_identity = _json_identity(self.native.g_pi_empty_text_identity)
-        # Task caches are transient and must not be copied into the snapshot.
-        self.native.clear_cache()
-        for module in self.native.modules():
-            if hasattr(module, "attn_caches"):
-                module.attn_caches.clear()
+        assert_frozen_base(native)
+        # The owning G/pi system registers native once; E has no parameter tree.
+        object.__setattr__(self, "native", native)
         self.k_z, self.d_z, self.layer = k_z, native.inner_dim, layer
         checksum = frozen_base_checksum(self.native)
+        empty_identity = _json_identity(native.g_pi_empty_text_identity)
+        empty_identity["sha256"] = _tensor_hash(native.g_pi_empty_text)
         self._identity = {
             "layer": layer, "timestep": 0, "pooling": "adaptive_avg_pool1d_spatial",
             "k_z": k_z, "d_z": self.d_z, "normalization": "l2_last_dim",
             "text_conditioning": "pretrained_empty_prompt",
-            "empty_text_identity": deepcopy(self.native.g_pi_empty_text_identity),
-            "precision": "cuda_bfloat16_autocast", "base_id": deepcopy(base_id) or checksum,
+            "empty_text_identity": empty_identity,
+            "precision": {"compute": "cuda_bfloat16_autocast",
+                          "video_weights": str(native.patch_embedding_mlp.weight.dtype)},
+            "base_id": deepcopy(base_id) or checksum,
             "base_sha256": checksum,
         }
         self.train(False)

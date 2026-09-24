@@ -64,6 +64,7 @@ class ControllerState:
     task_start_time: float | None = None
     history: tuple[Tensor, ...] = ()
     history_times: tuple[float, ...] = ()
+    last_control_time: float | None = None
     event_state: EventState | None = None
     goal: Mapping | None = None
     chunk: Tensor | None = None
@@ -81,9 +82,10 @@ class ControllerStep:
     stopped: bool
 
 
-def controller_step(previous: ControllerState, *, frame: Tensor, time: float,
+def controller_step(previous: ControllerState, *, frame: Tensor | None, time: float,
                     state: Tensor, language: Tensor, current_goal: Mapping,
                     g_predict: Callable, pi_predict: Callable,
+                    frame_available_time: float | None = None,
                     new_demo: Tensor | None = None,
                     event_rules: EventRules = EventRules(),
                     thresholds: GoalThresholds = GoalThresholds()) -> ControllerStep:
@@ -91,14 +93,22 @@ def controller_step(previous: ControllerState, *, frame: Tensor, time: float,
 
     G receives (demo, robot_history, state); pi receives
     (robot_history, state, language, goal). The caller executes the returned
-    action before supplying the next measured frame. G may cache its demo.
+    action before the next control step. A frame is supplied only when a new
+    causal VAE latent becomes available; its absolute availability time is
+    explicit. Events and state still update every control step. G may cache its
+    demo and reads the latest available history even between latent arrivals.
     """
-    if (not isinstance(frame, Tensor) or frame.ndim != 5 or frame.shape[0] != 1
+    if frame is not None and (not isinstance(frame, Tensor) or frame.ndim != 5 or frame.shape[0] != 1
             or frame.shape[2] != 1 or min(frame.shape) < 1 or not frame.is_floating_point()
             or not torch.isfinite(frame).all()):
-        raise ValueError("controller frame must be finite floating [1,C,1,H,W]")
+        raise ValueError("controller frame must be finite floating [1,C,1,H,W] or None")
     if type(time) not in (int, float) or not math.isfinite(time):
         raise ValueError("controller time must be finite seconds")
+    if frame is None:
+        if frame_available_time is not None:
+            raise ValueError("frame_available_time must be omitted when no new frame is available")
+    elif type(frame_available_time) not in (int, float) or not math.isfinite(frame_available_time):
+        raise ValueError("each new frame requires a finite explicit frame_available_time")
     _, poses, gripper = _goal(current_goal)
     if poses.shape[0] != 1:
         raise ValueError("controller supports one robot task at a time")
@@ -116,19 +126,28 @@ def controller_step(previous: ControllerState, *, frame: Tensor, time: float,
     if current.demonstration is None or current.task_start_time is None:
         raise ValueError("a new demonstration is required to start a task")
     elapsed = float(time) - current.task_start_time
-    if elapsed < 0 or (current.history_times and elapsed <= current.history_times[-1]):
+    if elapsed < 0 or (current.last_control_time is not None and elapsed <= current.last_control_time):
         raise ValueError("controller times must strictly increase within the current task")
-    if current.history and current.history[-1].shape != frame.shape:
-        raise ValueError("robot frame shape must stay constant within a task")
-    if current.demonstration.shape[1] != frame.shape[1]:
-        raise ValueError("demonstration and robot frame channels must match")
+    if not current.history and (frame is None or frame_available_time != current.task_start_time):
+        raise ValueError("a task requires its initial latent frame available exactly at t0")
+    history, history_times = current.history, current.history_times
+    if frame is not None:
+        available = float(frame_available_time) - current.task_start_time
+        if available < 0 or frame_available_time > time:
+            raise ValueError("frame_available_time must lie within the current task and cannot be in the future")
+        if current.history_times and available <= current.history_times[-1]:
+            raise ValueError("frame_available_time must strictly increase; repeated or reordered frames are invalid")
+        if current.history and current.history[-1].shape != frame.shape:
+            raise ValueError("robot frame shape must stay constant within a task")
+        if current.demonstration.shape[1] != frame.shape[1]:
+            raise ValueError("demonstration and robot frame channels must match")
+        history += (frame.detach().clone(),)
+        history_times += (available,)
     if current.stopped:
-        return ControllerStep(current, None, (), False, False, True)
+        return ControllerStep(replace(current, last_control_time=elapsed), None, (), False, False, True)
     if current.event_state is None:
         raise ValueError("controller event state is missing")
     event_state, events = gripper_event_step(current.event_state, gripper[0], elapsed, event_rules)
-    history = current.history + (frame.detach().clone(),)
-    history_times = current.history_times + (elapsed,)
     robot_history = torch.cat(history, dim=2)
     reached = current.goal is not None and goal_reached(current.goal, current_goal, thresholds)
     refreshed = current.goal is None or bool(events) or reached
@@ -141,7 +160,8 @@ def controller_step(previous: ControllerState, *, frame: Tensor, time: float,
         chunk, cursor = None, 0
         if goal_reached(goal, current_goal, thresholds):
             stopped = replace(current, history=history, history_times=history_times,
-                              event_state=event_state, goal=goal, chunk=None, cursor=0, stopped=True)
+                              last_control_time=elapsed, event_state=event_state,
+                              goal=goal, chunk=None, cursor=0, stopped=True)
             return ControllerStep(stopped, None, events, interrupted, True, True)
     if chunk is None or cursor >= chunk.shape[-1]:
         prediction = pi_predict(robot_history, state, language, goal)
@@ -152,6 +172,7 @@ def controller_step(previous: ControllerState, *, frame: Tensor, time: float,
         chunk = prediction.detach().clone().flatten(2)
         cursor = 0
     action = chunk[:, :, cursor].clone()
-    following = replace(current, history=history, history_times=history_times, event_state=event_state,
+    following = replace(current, history=history, history_times=history_times,
+                        last_control_time=elapsed, event_state=event_state,
                         goal=goal, chunk=chunk, cursor=cursor + 1, stopped=False)
     return ControllerStep(following, action, events, interrupted, refreshed, False)

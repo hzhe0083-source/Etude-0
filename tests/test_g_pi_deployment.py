@@ -19,12 +19,16 @@ class GDeploymentTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.path, self.metadata, self.arrays, _ = write_goal_observation(self.root)
-        self.metadata.update(format_version=1, kind="g_pi_observation", current_time=.1)
-        self.arrays["history_times"] = np.array([0., .1], dtype=np.float64)
+        self.metadata.update(format_version=2, kind="g_pi_observation", current_time=.5,
+                             actions_per_frame=4, frame_stride=1, temporal_down_rate=4,
+                             alignment="zerowam_causal_first_then_four", subgoal_encoding="wan_vae_single_frame")
+        self.arrays.pop("history_times")
+        self.arrays["latent_available_times"] = np.array([0., .4], dtype=np.float64)
         self.language_path = self.metadata.pop("language")
         _, language_identity = load_goal_language(self.root / self.language_path)
         keys = ("action_space", "state_space_id", "coordinate_frame", "pose_units", "end_effectors",
-                "control_dt", "actions_per_frame", "pose_representation", "tool_frames", "gripper_space")
+                "control_dt", "actions_per_frame", "pose_representation", "tool_frames", "gripper_space",
+                "frame_stride", "temporal_down_rate", "alignment", "subgoal_encoding")
         self.registry = {key: self.metadata[key] for key in keys}
         self.registry.update(language_identity=language_identity, goal_source="measured_endpoint",
                              event_rules={"signal_source": "measured"})
@@ -84,11 +88,46 @@ class GDeploymentTest(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "without supervision"):
                 load_g_pi_observation(self.path, self.payload)
         self.metadata = original
-        for times in ([.1, .2], [0., .2], [0., float("nan")]):
-            self.arrays["history_times"] = np.array(times)
+        for times, reason in (([.1, .4], "causal grid"), ([0., .6], "current_time"),
+                              ([0., float("nan")], "current_time"), ([0., .2], "causal grid")):
+            self.arrays["latent_available_times"] = np.array(times)
             self.save()
-            with self.subTest(times=times), self.assertRaisesRegex(ValueError, "current_time"):
+            with self.subTest(times=times), self.assertRaisesRegex(ValueError, reason):
                 load_g_pi_observation(self.path, self.payload)
+
+    def test_event_between_latents_uses_latest_available_history(self):
+        observation = load_g_pi_observation(self.path, self.payload)
+        self.assertEqual(observation.metadata["current_time"], .5)
+        torch.testing.assert_close(observation.history_times, torch.tensor([0., .4], dtype=torch.float64))
+        self.metadata["current_time"] = .35
+        self.save()
+        with self.assertRaisesRegex(ValueError, "control grid"):
+            load_g_pi_observation(self.path, self.payload)
+        self.metadata["current_time"] = .8
+        self.save()
+        with self.assertRaisesRegex(ValueError, "complete causal grid"):
+            load_g_pi_observation(self.path, self.payload)
+
+    def test_old_observation_version_is_rejected_explicitly(self):
+        self.metadata["format_version"] = 1
+        self.save()
+        with self.assertRaisesRegex(ValueError, "version 1.*version 2"):
+            load_g_pi_observation(self.path, self.payload)
+
+    def test_time_tolerance_never_reaches_another_control_step(self):
+        self.metadata.update(control_dt=1e-7, current_time=5e-7)
+        self.registry["control_dt"] = 1e-7
+        self.arrays["latent_available_times"] = np.array([0., 4e-7], dtype=np.float64)
+        self.save()
+        self.assertEqual(load_g_pi_observation(self.path, self.payload).history.shape[2], 2)
+        self.metadata["current_time"] = 4.5e-7
+        self.save()
+        with self.assertRaisesRegex(ValueError, "control grid"):
+            load_g_pi_observation(self.path, self.payload)
+        self.metadata["current_time"] = 3e-7
+        self.save()
+        with self.assertRaisesRegex(ValueError, "current_time"):
+            load_g_pi_observation(self.path, self.payload)
 
 
 if __name__ == "__main__":

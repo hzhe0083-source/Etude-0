@@ -22,8 +22,8 @@ class PiObservation:
     state: torch.Tensor
     history: torch.Tensor
     history_times: torch.Tensor
-    language: torch.Tensor
-    language_identity: dict
+    language: torch.Tensor | None
+    language_identity: dict | None
     goal: dict
 
 
@@ -91,24 +91,25 @@ def load_g_pi_observation(path, payload):
 
     path = Path(path)
     metadata = json.loads(path.read_text())
-    if isinstance(metadata, dict) and metadata.get("format_version") == 1:
-        raise ValueError("g_pi_observation version 1 is unsupported; rebuild version 2 with latent availability times")
+    if isinstance(metadata, dict) and metadata.get("format_version") in (1, 2):
+        raise ValueError(f"g_pi_observation version {metadata['format_version']} is unsupported; rebuild version 3 for the 2D goal grid")
     route, registry = payload["config"]["interface_type"], payload["registry"]
     common = {"format_version", "kind", "arrays", "feature_space_id", "latent_normalization",
         "action_space", "current_time", "control_dt", "actions_per_frame", "state_space_id",
         "coordinate_frame", "pose_units", "end_effectors", "pose_representation", "tool_frames",
         "gripper_space", "frame_stride", "temporal_down_rate", "alignment", "subgoal_encoding"}
-    extra = {"demonstration"} if route == "g_translator" else {"language", "goal"}
+    extra = {"demonstration"} if route == "g_translator" else {"goal"}
+    optional = {"provenance"} | ({"language"} if route == "pi_goal" else set())
     if (route not in {"g_translator", "pi_goal"} or not isinstance(metadata, dict)
-            or (common | extra) - metadata.keys() or metadata.keys() - common - extra - {"provenance"}
-            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 2
+            or (common | extra) - metadata.keys() or metadata.keys() - common - extra - optional
+            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 3
             or metadata["kind"] != "g_pi_observation"):
-        raise ValueError("expected route-specific version-2 g_pi_observation without supervision")
+        raise ValueError("expected route-specific version-3 g_pi_observation without supervision")
     _interface_metadata(metadata)
     if (type(metadata["actions_per_frame"]) is not int or metadata["actions_per_frame"] < 1
             or metadata["latent_normalization"] != LATENT_NORMALIZATION):
         raise ValueError("observation needs positive actions_per_frame and native latent_normalization")
-    for name in registry.keys() - {"goal_source", "language_identity", "event_rules"}:
+    for name in registry.keys() - {"goal_source", "language_identity", "event_rules", "subgoal_source"}:
         if metadata.get(name) != registry[name]:
             raise ValueError(f"observed {name} differs from the trained interface")
     if _text(metadata, "feature_space_id") != payload["visual_feature_space"]:
@@ -122,6 +123,10 @@ def load_g_pi_observation(path, payload):
     if (history.ndim != 4 or min(history.shape) < 1 or not history.is_floating_point()
             or not torch.isfinite(history).all()):
         raise ValueError("history_latent must be finite floating [C,T,H,W]")
+    layout = payload["encoder_identity"]["camera_layout"]
+    patch_width = payload["native_config"]["patch_size"][2]
+    if history.shape[-1] != sum(view["token_width"] for view in layout) * patch_width:
+        raise ValueError("observed canvas width must match the policy camera_layout in native patch tokens")
     current_time, dt = metadata["current_time"], metadata["control_dt"]
     tolerance = min(1e-6, dt * 1e-4)
     control_index = round(current_time / dt)
@@ -141,9 +146,11 @@ def load_g_pi_observation(path, payload):
         if demonstration.shape[0] != history.shape[0]:
             raise ValueError("demonstration and robot latent channels must match")
         return GObservation(metadata, state[None], history[None], times, demonstration[None])
-    language, identity = load_goal_language(_local_path(path.parent, _text(metadata, "language"), ".json"))
-    if identity != registry["language_identity"]:
-        raise ValueError("language encoder differs from the trained interface")
+    language, identity = None, None
+    if "language" in metadata:
+        language, identity = load_goal_language(_local_path(path.parent, _text(metadata, "language"), ".json"))
+        if identity != registry["language_identity"]:
+            raise ValueError("language encoder differs from the trained interface")
     goal = load_goal_prediction(_local_path(path.parent, _text(metadata, "goal"), ".json"),
                                encoder_identity=payload["encoder_identity"], registry=registry)
     return PiObservation(metadata, state[None], history[None], times, language, identity, goal)

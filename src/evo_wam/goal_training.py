@@ -124,6 +124,7 @@ def goal_registry(sample):
                 "language_identity": sample.language_identity}
     if "event_rules" in sample.metadata:
         registry["event_rules"] = sample.metadata["event_rules"]
+        registry["subgoal_source"] = sample.metadata.get("subgoal_source", "gripper")
         for key in ("frame_stride", "temporal_down_rate", "alignment", "subgoal_encoding"):
             registry[key] = sample.metadata[key]
     return registry
@@ -398,10 +399,11 @@ def _sample_files(path, sample):
 
 
 def train_goal_interface(args):
-    config, stage = load_goal_config(args.config), args.stage
-    if config["interface_type"] in G_PI_ROUTES:
+    config, stage = json.loads(Path(args.config).read_text()), args.stage
+    if isinstance(config, dict) and config.get("interface_type") in G_PI_ROUTES:
         from .g_pi_training import train_g_pi_interface
         return train_g_pi_interface(args)
+    config = validate_goal_config(config)
     if stage not in STAGES or args.resume and args.initialize:
         raise ValueError("choose a stage and either resume or initialize")
     _check_stage(config, stage)

@@ -40,40 +40,84 @@ class _GoalDecoderBlock(nn.Module):
 
 
 class GGoalDecoder(nn.Module):
-    """The complete trainable portion of G, reading one frozen native layer."""
+    """Demo-only intent queries followed by scene-conditioned goal queries."""
 
     def __init__(self, native_dim: int, d_z: int, state_dim: int, effectors: int,
-                 k_z: int = 8, dim: int = 768, num_heads: int = 8,
-                 num_layers: int = 2, translation_scale: float = 1., use_state: bool = True):
+                 k_z: int = 16, dim: int = 768, num_heads: int = 8,
+                 num_layers: int = 2, translation_scale: float = 1., use_state: bool = True,
+                 num_intent_tokens: int = 4, num_intent_layers: int | None = None,
+                 intent_mode: str = "connected"):
         super().__init__()
+        if num_intent_layers is None:
+            num_intent_layers = num_layers
         if any(type(value) is not int or value < 1 for value in
-               (native_dim, d_z, state_dim, effectors, k_z, dim, num_heads, num_layers)):
+               (native_dim, d_z, state_dim, effectors, k_z, dim, num_heads, num_layers,
+                num_intent_tokens, num_intent_layers)):
             raise ValueError("decoder dimensions, effectors, tokens, heads and layers must be positive integers")
         if dim % num_heads:
             raise ValueError("decoder dim must be divisible by num_heads")
         if type(use_state) is not bool:
             raise ValueError("use_state must be boolean")
+        if intent_mode not in ("connected", "independent", "regression_only"):
+            raise ValueError("intent_mode must be connected, independent or regression_only")
         self.native_dim, self.d_z, self.state_dim = native_dim, d_z, state_dim
         self.k_z, self.dim, self.effectors = k_z, dim, effectors
+        self.num_intent_tokens, self.intent_mode = num_intent_tokens, intent_mode
         self.translation_scale, self.use_state = _translation_scale(translation_scale), use_state
-        self.queries = nn.Parameter(torch.randn(k_z + 1, dim) / math.sqrt(dim))
+        self.queries = nn.Parameter(torch.randn(k_z + effectors, dim) / math.sqrt(dim))
         self.memory_projection = nn.Sequential(nn.Linear(native_dim, dim), nn.LayerNorm(dim))
         self.state_projection = nn.Linear(state_dim, dim) if use_state else None
         self.blocks = nn.ModuleList(_GoalDecoderBlock(dim, num_heads) for _ in range(num_layers))
         self.output_norm = nn.LayerNorm(dim)
         self.z_head = nn.Linear(dim, d_z)
-        self.pose_decoder = _PoseDecoder(dim, effectors, num_heads, self.translation_scale, 1)
+        self.pose_decoder = _PoseDecoder(dim, effectors, num_heads, self.translation_scale, effectors)
+        if intent_mode != "regression_only":
+            self.intent_queries = nn.Parameter(torch.randn(num_intent_tokens, dim) / math.sqrt(dim))
+            self.intent_projection = nn.Sequential(nn.Linear(native_dim, dim), nn.LayerNorm(dim))
+            self.intent_blocks = nn.ModuleList(_GoalDecoderBlock(dim, num_heads)
+                                               for _ in range(num_intent_layers))
+            self.intent_norm = nn.LayerNorm(dim)
+        if intent_mode == "connected":
+            self.intent_position = nn.Parameter(torch.randn(1, num_intent_tokens, dim) / math.sqrt(dim))
 
-    def forward(self, features: Tensor, state: Tensor) -> dict[str, Tensor]:
+    def _validate_features(self, features: Tensor, name: str):
         if (not isinstance(features, Tensor) or features.ndim != 3 or min(features.shape) < 1
                 or features.shape[-1] != self.native_dim or not features.is_floating_point()
                 or not torch.isfinite(features).all()):
-            raise ValueError("G features must be finite floating [B,S,native_dim]")
-        batch = features.shape[0]
+            raise ValueError(f"G {name} features must be finite floating [B,S,native_dim]")
+
+    def encode_intent(self, demo_features: Tensor) -> Tensor:
+        if self.intent_mode == "regression_only":
+            raise ValueError("regression_only has no intent queries")
+        self._validate_features(demo_features, "demonstration")
+        memory = self.intent_projection(demo_features.detach().to(self.intent_queries))
+        tokens = self.intent_queries[None].expand(demo_features.shape[0], -1, -1)
+        for block in self.intent_blocks:
+            tokens = block(tokens, memory)
+        return self.intent_norm(tokens)
+
+    def decode_goal(self, u: Tensor | None, robot_features: Tensor, state: Tensor, *,
+                    demo_features: Tensor | None = None) -> dict[str, Tensor]:
+        self._validate_features(robot_features, "robot")
+        batch = robot_features.shape[0]
         if (not isinstance(state, Tensor) or state.shape != (batch, self.state_dim)
                 or not state.is_floating_point() or not torch.isfinite(state).all()):
             raise ValueError("state must be finite floating [B,state_dim]")
-        memory = self.memory_projection(features.detach().to(self.queries))
+        robot_memory = self.memory_projection(robot_features.detach().to(self.queries))
+        if self.intent_mode == "connected":
+            if (not isinstance(u, Tensor) or u.shape != (batch, self.num_intent_tokens, self.dim)
+                    or not u.is_floating_point() or not torch.isfinite(u).all()):
+                raise ValueError("u must be finite floating [B,num_intent_tokens,dim]")
+            if demo_features is not None:
+                raise ValueError("connected decoder direct demo memory is disabled; pass intent only through u")
+            # Cross-attention alone is invariant to permuting its memory keys.
+            memory = torch.cat((u.to(robot_memory) + self.intent_position, robot_memory), dim=1)
+        else:
+            self._validate_features(demo_features, "demonstration")
+            if demo_features.shape[0] != batch:
+                raise ValueError("demonstration and robot features must share a batch")
+            memory = torch.cat((self.memory_projection(demo_features.detach().to(self.queries)),
+                                robot_memory), dim=1)
         if self.state_projection is not None:
             memory = torch.cat((memory, self.state_projection(state.detach().to(self.queries))[:, None]), dim=1)
         tokens = self.queries[None].expand(batch, -1, -1)
@@ -81,7 +125,14 @@ class GGoalDecoder(nn.Module):
             tokens = block(tokens, memory)
         tokens = self.output_norm(tokens)
         return {"z": normalize_z(self.z_head(tokens[:, :self.k_z])),
-                **self.pose_decoder(tokens[:, self.k_z:])}
+                **self.pose_decoder(tokens[:, self.k_z:], per_effector=True)}
+
+    def forward(self, demo_features: Tensor, robot_features: Tensor, state: Tensor) -> dict:
+        self._validate_features(demo_features, "demonstration")
+        u = None if self.intent_mode == "regression_only" else self.encode_intent(demo_features)
+        prediction = self.decode_goal(u, robot_features, state,
+            demo_features=None if self.intent_mode == "connected" else demo_features)
+        return {**prediction, "u": u}
 
 
 def g_goal_loss(prediction: dict, target: dict, translation_scale: float = 1.,
@@ -143,7 +194,7 @@ class PiGoalInterface(GoalInterface):
     """Recurrent LIT workspace with semantic [language, state, z, pose] memory."""
 
     def __init__(self, native_dim: int, feature_dim: int, state_dim: int, effectors: int,
-                 d_z: int, k_z: int = 8, **kwargs):
+                 d_z: int, k_z: int = 16, **kwargs):
         if any(type(value) is not int or value < 1 for value in (d_z, k_z)):
             raise ValueError("d_z and k_z must be positive integers")
         super().__init__(native_dim, feature_dim, state_dim, effectors, **kwargs)
@@ -151,6 +202,7 @@ class PiGoalInterface(GoalInterface):
         # No auxiliary pose prediction is used by the robot-only action route.
         del self.pose_decoder
         self.z_projection = nn.Linear(d_z, native_dim)
+        self.z_position = nn.Parameter(torch.randn(1, k_z, native_dim) / math.sqrt(native_dim))
 
     def goal_semantic(self, language_hidden: Tensor, state: Tensor, goal: dict) -> Tensor:
         semantic = self.semantic(language_hidden, state)
@@ -165,7 +217,8 @@ class PiGoalInterface(GoalInterface):
         poses = self.encode_goal(goal["goal_poses"].detach(), goal["goal_gripper"].detach())
         if poses.shape[0] != semantic.shape[0]:
             raise ValueError("goal and semantic features must share a batch")
-        return torch.cat((semantic, self.z_projection(z.detach().to(self.z_projection.weight)),
+        return torch.cat((semantic, self.z_projection(z.detach().to(self.z_projection.weight))
+                          + self.z_position,
                           self.condition_adapter(poses)), dim=1)
 
     def conditions(self, features: dict[int, Tensor], state: Tensor, language_hidden: Tensor,
@@ -202,6 +255,11 @@ class GTranslator(nn.Module):
             raise ValueError("feature_layer must identify a native block")
         if goal_decoder.native_dim != native.inner_dim:
             raise ValueError("goal decoder width must match the frozen native model")
+        demo_route = config.get("demo_route", "one_way")
+        if demo_route not in ("one_way", "via_u_only"):
+            raise ValueError("demo_route must be one_way or via_u_only")
+        if demo_route == "via_u_only" and goal_decoder.intent_mode != "connected":
+            raise ValueError("via_u_only requires a connected intent decoder")
         # The shared base is owned by the system, never by G's optimizer/state.
         object.__setattr__(self, "native", native)
         self.goal_decoder = goal_decoder
@@ -225,15 +283,72 @@ class GTranslator(nn.Module):
     @torch.no_grad()
     def predict(self, demo: Tensor, robot_frames_t0_to_t: Tensor, state: Tensor, *,
                 current_index: int | None = None, use_cache: bool = True) -> dict[str, Tensor]:
-        from .g_pi_context import g_context_features
+        from .g_pi_context import split_g_context_features
         from .goal_training import autocast_for
         if use_cache and (self._demo_reference is None or not torch.equal(demo, self._demo_reference)):
             self.cache_demo(demo)
         with autocast_for(self.native):
-            features = g_context_features(self.native, demo, robot_frames_t0_to_t, self.config,
-                                          demo_cache=self._demo_cache if use_cache else None,
-                                          current_index=current_index)
-            return self.goal_decoder(features[self.feature_layer], state)
+            demonstration, robot = split_g_context_features(
+                self.native, demo, robot_frames_t0_to_t, self.config,
+                demo_cache=self._demo_cache if use_cache else None, current_index=current_index)
+            result = self.goal_decoder(demonstration[self.feature_layer], robot[self.feature_layer], state)
+            return {name: value for name, value in result.items() if name != "u"}
+
+    @torch.no_grad()
+    def encode_intent(self, demo: Tensor, *, use_cache: bool = True) -> Tensor:
+        from .g_pi_context import demo_context_features
+        from .goal_training import autocast_for
+        if use_cache and (self._demo_reference is None or not torch.equal(demo, self._demo_reference)):
+            self.cache_demo(demo)
+        with autocast_for(self.native):
+            features = demo_context_features(self.native, demo, self.config,
+                                             demo_cache=self._demo_cache if use_cache else None)
+            return self.goal_decoder.encode_intent(features[self.feature_layer])
+
+    @torch.no_grad()
+    def predict_from_intent(self, demo: Tensor, robot_frames_t0_to_t: Tensor, state: Tensor,
+                            u: Tensor, *, demo_route: str | None = None,
+                            current_index: int | None = None, use_cache: bool = True) -> dict[str, Tensor]:
+        """Offline intervention: replace ordered u slots and optionally remove the native demo path."""
+        from .g_pi_context import split_g_context_features
+        from .goal_training import autocast_for
+        if self.goal_decoder.intent_mode != "connected":
+            raise ValueError("intent intervention requires connected goal decoder")
+        if use_cache and (self._demo_reference is None or not torch.equal(demo, self._demo_reference)):
+            self.cache_demo(demo)
+        config = dict(self.config)
+        if demo_route is not None:
+            config["demo_route"] = demo_route
+        with autocast_for(self.native):
+            _, robot = split_g_context_features(self.native, demo, robot_frames_t0_to_t, config,
+                demo_cache=self._demo_cache if use_cache else None, current_index=current_index)
+            return self.goal_decoder.decode_goal(u, robot[self.feature_layer], state)
+
+
+    @torch.no_grad()
+    def diagnose_intent(self, demo: Tensor, robot_frames_t0_to_t: Tensor, state: Tensor, *,
+                        replacement_u: Tensor | None = None, current_index: int | None = None,
+                        use_cache: bool = True) -> dict[str, dict[str, Tensor]]:
+        """Intervene on u at fixed robot memory, then remove the native demo path."""
+        from .g_pi_context import pi_context_features, split_g_context_features
+        from .goal_training import autocast_for
+        if self.goal_decoder.intent_mode != "connected":
+            raise ValueError("intent diagnostic requires connected goal decoder")
+        if use_cache and (self._demo_reference is None or not torch.equal(demo, self._demo_reference)):
+            self.cache_demo(demo)
+        with autocast_for(self.native):
+            demonstration, robot = split_g_context_features(self.native, demo, robot_frames_t0_to_t,
+                self.config, demo_cache=self._demo_cache if use_cache else None, current_index=current_index)
+            u = self.goal_decoder.encode_intent(demonstration[self.feature_layer])
+            robot_memory = robot[self.feature_layer]
+            changed = u.flip(1) if replacement_u is None else replacement_u
+            result = {"baseline": self.goal_decoder.decode_goal(u, robot_memory, state),
+                      "u_permuted" if replacement_u is None else "u_replaced":
+                          self.goal_decoder.decode_goal(changed, robot_memory, state)}
+            isolated = pi_context_features(self.native, robot_frames_t0_to_t, self.config,
+                                           current_index=current_index)
+            result["robot_without_demo"] = self.goal_decoder.decode_goal(u, isolated[self.feature_layer], state)
+            return result
 
 
 class PiGoalPolicy(nn.Module):
@@ -275,10 +390,13 @@ class PiGoalPolicy(nn.Module):
         return self
 
     @torch.no_grad()
-    def predict(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor, goal: dict, *,
+    def predict(self, robot_frames_t0_to_t: Tensor, state: Tensor, language: Tensor | None = None,
+                goal: dict | None = None, *,
                 current_index: int | None = None, frame_times: Tensor | None = None) -> Tensor:
         from .g_pi_context import pi_context_features, truncate_robot_history
         from .goal_training import autocast_for
+        if not isinstance(goal, dict):
+            raise ValueError("pi requires goal; when language is omitted, pass goal as a keyword")
         history = truncate_robot_history(robot_frames_t0_to_t, current_index)
         features = pi_context_features(self.video_native, history, self.config)
         if frame_times is None:
@@ -297,6 +415,10 @@ class PiGoalPolicy(nn.Module):
                 frame_times = frame_times[:current_index + 1]
         _, patch_h, patch_w = self.video_native.patch_size
         coordinates = patch_grid_coordinates((history.shape[3] // patch_h, history.shape[4] // patch_w))
+        if language is None:
+            if not hasattr(self.native, "g_pi_empty_text"):
+                raise ValueError("pi without language requires the pretrained empty prompt embedding")
+            language = self.native.g_pi_empty_text
         if (not isinstance(language, Tensor) or language.ndim != 3 or language.shape[0] != 1
                 or min(language.shape) < 1 or language.shape[-1] != self.native.config.text_dim
                 or not language.is_floating_point() or not torch.isfinite(language).all()):

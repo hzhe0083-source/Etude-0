@@ -9,7 +9,7 @@ import torch
 from evo_wam.g_pi_interface import (
     GGoalDecoder, GTranslator, PiGoalInterface, PiGoalPolicy, g_goal_loss, normalize_z, perturb_goal,
 )
-from evo_wam.goal_interface import _RecurrentGroup, validate_goal_poses
+from evo_wam.goal_interface import _PoseDecoder, _RecurrentGroup, validate_goal_poses
 
 
 class GPiInterfaceTests(unittest.TestCase):
@@ -43,14 +43,14 @@ class GPiInterfaceTests(unittest.TestCase):
             self.state, self.language, self.goal if goal is None else goal, self.times, self.xy)
 
     def test_decoder_queries_attention_order_and_pose_contract(self):
-        self.assertEqual(self.decoder.queries.shape, (4, 16))
+        self.assertEqual(self.decoder.queries.shape, (5, 16))
         calls, handles = [], []
         for index, block in enumerate(self.decoder.blocks):
             for name in ("self_attention", "cross_attention", "ffn"):
                 handles.append(getattr(block, name).register_forward_hook(
                     lambda _module, _args, _out, label=(index, name): calls.append(label)))
         try:
-            prediction = self.decoder(self.features[1], self.state)
+            prediction = self.decoder(self.features[0], self.features[1], self.state)
         finally:
             for handle in handles:
                 handle.remove()
@@ -67,7 +67,7 @@ class GPiInterfaceTests(unittest.TestCase):
         target = {name: value.clone().requires_grad_() for name, value in self.goal.items()}
         before = {name: value.detach().clone() for name, value in self.decoder.named_parameters()}
         optimizer = torch.optim.SGD(self.decoder.parameters(), lr=.05)
-        prediction = self.decoder(features, state)
+        prediction = self.decoder(features, features, state)
         losses = g_goal_loss(prediction, target, pose_weight=.3)
         torch.testing.assert_close(losses["total"], losses["z"] + .3 * losses["pose_total"])
         losses["total"].backward()
@@ -80,21 +80,157 @@ class GPiInterfaceTests(unittest.TestCase):
                             for value in self.decoder.parameters()))
 
     def test_g_state_is_optional_decoder_context(self):
-        before = self.decoder(self.features[1], self.state)
-        after = self.decoder(self.features[1], self.state + 10)
+        before = self.decoder(self.features[0], self.features[1], self.state)
+        after = self.decoder(self.features[0], self.features[1], self.state + 10)
         self.assertFalse(torch.allclose(before["z"], after["z"]))
         decoder = GGoalDecoder(12, 12, 4, 2, k_z=3, dim=16, num_heads=4, use_state=False)
         self.assertIsNone(decoder.state_projection)
-        first = decoder(self.features[1], self.state)
-        second = decoder(self.features[1], self.state + 10)
+        first = decoder(self.features[0], self.features[1], self.state)
+        second = decoder(self.features[0], self.features[1], self.state + 10)
         for name in first:
             torch.testing.assert_close(first[name], second[name], atol=0, rtol=0)
+
+    def test_pose_readout_uses_only_its_own_effector_token(self):
+        head = _PoseDecoder(16, 2, 4, 1., 2)
+        tokens = torch.randn(3, 2, 16)
+        first = head(tokens, per_effector=True)
+        tokens[:, 1] += 10
+        second = head(tokens, per_effector=True)
+        for name in first:
+            torch.testing.assert_close(first[name][:, 0], second[name][:, 0], atol=0, rtol=0)
+            self.assertFalse(torch.equal(first[name][:, 1], second[name][:, 1]))
+        with self.assertRaisesRegex(ValueError, "one token per effector"):
+            head(tokens[:, :1], per_effector=True)
+
+    def test_single_effector_decoder_matches_legacy_readout_exactly(self):
+        decoder = GGoalDecoder(12, 12, 4, 1, k_z=3, dim=16, num_heads=4, num_layers=2)
+        self.assertEqual(decoder.queries.shape, (4, 16))
+        self.assertEqual(decoder.pose_decoder.num_pose_tokens, 1)
+        current = decoder(self.features[0], self.features[1], self.state)
+        original = decoder.pose_decoder.forward
+        with patch.object(decoder.pose_decoder, "forward", side_effect=lambda tokens, **_: original(tokens)):
+            legacy = decoder(self.features[0], self.features[1], self.state)
+        for name in current:
+            torch.testing.assert_close(current[name], legacy[name], atol=0, rtol=0)
+
+    def test_decoder_can_fit_independent_dual_arm_targets(self):
+        torch.manual_seed(921)
+        decoder = GGoalDecoder(12, 12, 4, 2, k_z=3, dim=16, num_heads=4, num_layers=2)
+        features = torch.randn(4, 6, 12)
+        state = torch.eye(4)
+        target = {"z": normalize_z(torch.randn(4, 3, 12)),
+                  "goal_poses": torch.eye(4).repeat(4, 2, 1, 1),
+                  "goal_gripper": torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])}
+        target["goal_poses"][..., :3, 3] = torch.tensor([
+            [[.2, -.1, .1], [-.1, .2, .3]], [[-.2, .1, .2], [.3, -.1, .1]],
+            [[.1, .3, -.2], [-.3, -.2, .2]], [[-.1, -.3, .3], [.2, .1, -.1]]])
+        optimizer = torch.optim.Adam(decoder.parameters(), lr=.01)
+        for _ in range(400):
+            optimizer.zero_grad()
+            prediction = decoder(features, features, state)
+            g_goal_loss(prediction, target)["total"].backward()
+            optimizer.step()
+        prediction = decoder(features, features, state)
+        self.assertLess((prediction["goal_gripper"] - target["goal_gripper"]).abs().max().item(), .06)
+        self.assertLess((prediction["goal_poses"][..., :3, 3]
+                         - target["goal_poses"][..., :3, 3]).abs().max().item(), .025)
+
+    def test_intent_all_layers_only_read_demo_and_ignore_goal_queries_robot_state(self):
+        demo = self.features[0]
+        first = self.decoder(demo, self.features[1], self.state)
+        memories, handles = [], []
+        for block in self.decoder.intent_blocks:
+            handles.append(block.cross_attention.register_forward_pre_hook(
+                lambda _module, args: memories.append(args[1].detach().clone())))
+        with torch.no_grad():
+            self.decoder.queries.add_(torch.randn_like(self.decoder.queries) * 10)
+        try:
+            second = self.decoder(demo, self.features[1] + 10, self.state - 10)
+        finally:
+            for handle in handles:
+                handle.remove()
+        torch.testing.assert_close(first["u"], second["u"], rtol=0, atol=0)
+        self.assertFalse(torch.equal(first["z"], second["z"]))
+        projected = self.decoder.intent_projection(demo)
+        self.assertEqual(len(memories), 2)
+        for memory in memories:
+            torch.testing.assert_close(memory, projected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(first["u"], self.decoder.encode_intent(demo + 10)))
+        self.assertEqual(set(inspect.signature(self.decoder.encode_intent).parameters), {"demo_features"})
+        with self.assertRaises(TypeError):
+            self.decoder(demo, self.features[1], self.state, language=self.language)
+
+    def test_connected_goal_uses_u_and_retains_slot_order(self):
+        u = self.decoder.encode_intent(self.features[0])
+        first = self.decoder.decode_goal(u, self.features[1], self.state)
+        changed = self.decoder.decode_goal(u + torch.randn_like(u), self.features[1], self.state)
+        swapped = self.decoder.decode_goal(u.flip(1), self.features[1], self.state)
+        self.assertFalse(torch.allclose(first["z"], changed["z"]))
+        self.assertGreater((first["z"] - swapped["z"]).abs().max().item(), 1e-5)
+        with torch.no_grad():
+            self.decoder.intent_position.zero_()
+        original = self.decoder.decode_goal(u, self.features[1], self.state)
+        swapped = self.decoder.decode_goal(u.flip(1), self.features[1], self.state)
+        torch.testing.assert_close(original["z"], swapped["z"], atol=1e-6, rtol=1e-6)
+        with self.assertRaisesRegex(ValueError, "only through u"):
+            self.decoder.decode_goal(u, self.features[1], self.state, demo_features=self.features[0])
+
+    def test_regression_backpropagates_through_connected_intent_but_not_independent_head(self):
+        prediction = self.decoder(self.features[0], self.features[1], self.state)
+        g_goal_loss(prediction, self.goal)["total"].backward()
+        self.assertGreater(self.decoder.intent_queries.grad.abs().sum().item(), 0)
+        for name, parameter in self.decoder.intent_blocks.named_parameters():
+            self.assertIsNotNone(parameter.grad, name)
+            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+        for mode in ("independent", "regression_only"):
+            decoder = GGoalDecoder(12, 12, 4, 2, k_z=3, dim=16, num_heads=4, intent_mode=mode)
+            prediction = decoder(self.features[0], self.features[1], self.state)
+            g_goal_loss(prediction, self.goal)["total"].backward()
+            self.assertGreater(decoder.queries.grad.abs().sum().item(), 0)
+            if mode == "independent":
+                self.assertIsNone(decoder.intent_queries.grad)
+                with torch.no_grad():
+                    decoder.intent_queries.add_(100 * torch.randn_like(decoder.intent_queries))
+                second = decoder(self.features[0], self.features[1], self.state)
+                for name in self.goal:
+                    torch.testing.assert_close(prediction[name], second[name], rtol=0, atol=0)
+                self.assertFalse(torch.equal(prediction["u"], second["u"]))
+            else:
+                self.assertIsNone(prediction["u"])
+                self.assertFalse(hasattr(decoder, "intent_queries"))
+                with self.assertRaisesRegex(ValueError, "no intent queries"):
+                    decoder.encode_intent(self.features[0])
+
+    def test_contrastive_and_regression_share_live_intent_parameters(self):
+        from types import SimpleNamespace
+        from evo_wam.g_pi_intent import intent_contrastive_loss, ordered_intent_similarity
+        demo = torch.randn(4, 6, 12, requires_grad=True)
+        entries = [SimpleNamespace(demo_id=str(i), component=str(i), purpose_group=str(i // 2))
+                   for i in range(4)]
+        u = self.decoder.encode_intent(demo)
+        contrastive = intent_contrastive_loss(u, entries)
+        contrastive.backward()
+        self.assertGreater(self.decoder.intent_queries.grad.abs().sum().item(), 0)
+        self.assertGreater(self.decoder.intent_projection[0].weight.grad.abs().sum().item(), 0)
+        self.assertIsNone(self.decoder.queries.grad)
+        self.assertIsNone(demo.grad)
+        self.decoder.zero_grad(set_to_none=True)
+        g_goal_loss(self.decoder(demo[:2], self.features[1], self.state), self.goal)["total"].backward()
+        self.assertGreater(self.decoder.intent_queries.grad.abs().sum().item(), 0)
+        self.assertGreater(self.decoder.intent_projection[0].weight.grad.abs().sum().item(), 0)
+        role_program = torch.eye(3).unsqueeze(0)
+        ordered = torch.cat((role_program, role_program.flip(1), role_program.roll(1, dims=1)), dim=0)
+        similarity = ordered_intent_similarity(ordered)
+        torch.testing.assert_close(similarity.diag(), torch.ones(3))
+        self.assertLess(similarity[0, 1].item(), .5)
+        self.assertLess(similarity[0, 2].item(), .5)
 
     def test_pi_semantics_reuse_pose_encoder_and_keep_actions_separate(self):
         semantic = self.interface.goal_semantic(self.language, self.state, self.goal)
         self.assertEqual(semantic.shape, (2, 2 + 1 + 3 + 4, 12))
         torch.testing.assert_close(semantic[:, :2], self.language)
-        torch.testing.assert_close(semantic[:, 3:6], self.interface.z_projection(self.goal["z"]))
+        torch.testing.assert_close(semantic[:, 3:6], self.interface.z_projection(self.goal["z"])
+                                   + self.interface.z_position)
         pose = self.interface.encode_goal(self.goal["goal_poses"], self.goal["goal_gripper"])
         torch.testing.assert_close(semantic[:, 6:], self.interface.condition_adapter(pose))
         conditions = self.conditions()
@@ -105,6 +241,17 @@ class GPiInterfaceTests(unittest.TestCase):
         for value in conditions:
             torch.testing.assert_close(value[:, :2], self.language)
             torch.testing.assert_close(value[:, 2:3], self.interface.state_encoder(self.state))
+
+    def test_goal_position_embeddings_distinguish_permuted_tokens(self):
+        self.assertEqual(self.interface.z_position.shape, (1, 3, 12))
+        baseline = self.conditions()
+        flipped = {**self.goal, "z": self.goal["z"].flip(1)}
+        changed = self.conditions(flipped)
+        self.assertFalse(torch.allclose(baseline[-1], changed[-1]))
+        with torch.no_grad():
+            self.interface.z_position.zero_()
+        torch.testing.assert_close(self.conditions()[-1], self.conditions(flipped)[-1],
+                                   atol=1e-6, rtol=1e-6)
 
     def test_pi_each_goal_component_and_early_visual_layer_change_action_conditions(self):
         baseline = self.conditions()
@@ -132,7 +279,7 @@ class GPiInterfaceTests(unittest.TestCase):
         self.assertTrue(all(value.grad is None for value in features.values()))
         self.assertTrue(all(value.grad is None for value in goal.values()))
         changed = {name for name, value in self.interface.named_parameters() if not torch.equal(value, before[name])}
-        for prefix in ("goal_encoder.", "z_projection.", "state_encoder.", "condition_adapter.",
+        for prefix in ("goal_encoder.", "z_projection.", "z_position", "state_encoder.", "condition_adapter.",
                        "recurrent_groups.", "visual_queries"):
             self.assertTrue(any(name.startswith(prefix) for name in changed), prefix)
 
@@ -163,7 +310,7 @@ class GPiInterfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible"):
             GGoalDecoder(12, 12, 4, 2, dim=15, num_heads=4)
         with self.assertRaisesRegex(ValueError, "state"):
-            self.decoder(self.features[0], self.state[:, :1])
+            self.decoder(self.features[0], self.features[1], self.state[:, :1])
         with self.assertRaisesRegex(ValueError, "matching"):
             g_goal_loss(self.goal, {**self.goal, "z": self.goal["z"][:1]})
         with self.assertRaisesRegex(ValueError, "pose_weight"):
@@ -198,7 +345,8 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         native = install_action_interface(tiny_model(device).float()).requires_grad_(False).eval()
         _set_precision(native, video_precision="bfloat16", route="pi_goal")
         install_empty_text(native, torch.randn(1, 2, 8, device=device), "unit-test empty-text fixture")
-        encoder = FrozenGoalEncoder(native, layer=1, k_z=3, base_id="native-fixture")
+        encoder = FrozenGoalEncoder(native, layer=1, grid_size=(1, 3), base_id="native-fixture",
+                                    camera_layout=[{"name": "camera", "token_width": 2}])
         for _, parameter in action_named_parameters(native):
             parameter.requires_grad_(True)
         decoder = GGoalDecoder(36, 36, 4, 1, k_z=3, dim=16, num_heads=4, num_layers=2).to(device)
@@ -250,11 +398,22 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             policy.predict(history, state, language, {}, demonstration=demo)
 
+    def test_translator_validates_demo_route_and_connected_intent_requirement(self):
+        native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
+        with self.assertRaisesRegex(ValueError, "demo_route"):
+            GTranslator(native, decoder, dict(config, demo_route="unknown"))
+        GTranslator(native, decoder, dict(config, demo_route="via_u_only"))
+        for mode in ("independent", "regression_only"):
+            other = GGoalDecoder(36, 36, 4, 1, k_z=3, dim=16, num_heads=4, intent_mode=mode)
+            with self.assertRaisesRegex(ValueError, "requires a connected"):
+                GTranslator(native, other, dict(config, demo_route="via_u_only"))
+            GTranslator(native, other, config)
+
     def test_policy_physically_truncates_before_native_read(self):
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
         policy = PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1),
                               actions_mask=torch.ones(1, 3, 1, 2, 1, dtype=torch.bool), video_native=encoder.native)
-        goal = decoder(torch.randn(1, 4, 36), state)
+        goal = decoder(torch.randn(1, 4, 36), torch.randn(1, 4, 36), state)
         history[:, :, 2:] = float("nan")
         features = {index: torch.randn(1, 4, 36) for index in range(2)}
         with patch("evo_wam.g_pi_context.pi_context_features", return_value=features) as read, \
@@ -280,9 +439,60 @@ class GPiNativeInterfaceTests(unittest.TestCase):
             policy.predict(history, state, language, goal, current_index=1)
         torch.testing.assert_close(condition.call_args.args[4], torch.tensor([0., .3], dtype=torch.float64))
 
+    def test_policy_optional_language_uses_the_same_fixed_empty_prompt(self):
+        native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
+        policy = PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1),
+                              actions_mask=torch.ones(1, 3, 1, 2, 1, dtype=torch.bool))
+        goal = decoder(torch.randn(1, 4, 36), torch.randn(1, 4, 36), state)
+        features = {index: torch.randn(1, 4, 36) for index in range(2)}
+        inputs = []
+        projection = native.condition_embedder_action.text_embedder
+        hook = projection.register_forward_pre_hook(lambda _module, args: inputs.append(args[0].clone()))
+        try:
+            with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
+                 patch("evo_wam.g_pi_interface.goal_action_sample",
+                       return_value=torch.zeros(1, 3, 1, 2, 1)) as sample:
+                policy.predict(history, state, goal=goal, current_index=1)
+                absent = sample.call_args.args[1]
+                policy.predict(history, state, native.g_pi_empty_text, goal, current_index=1)
+                explicit = sample.call_args.args[1]
+                policy.predict(history, state, language, goal, current_index=1)
+        finally:
+            hook.remove()
+        self.assertEqual(len(inputs), 3)
+        torch.testing.assert_close(inputs[0], native.g_pi_empty_text.float(), atol=0, rtol=0)
+        torch.testing.assert_close(inputs[0], inputs[1], atol=0, rtol=0)
+        torch.testing.assert_close(inputs[2], language, atol=0, rtol=0)
+        for first, second in zip(absent, explicit):
+            torch.testing.assert_close(first, second, atol=0, rtol=0)
+        with self.assertRaisesRegex(ValueError, "requires goal"):
+            policy.predict(history, state)
+
+    def test_intent_diagnostic_holds_computed_robot_memory_fixed(self):
+        native, encoder, decoder, interface, config, demo, history, state, language = self.fixture()
+        translator = GTranslator(native, decoder, config)
+        demo_memory = torch.randn(1, 4, 36)
+        robot_memory = torch.randn(1, 6, 36)
+        isolated_memory = robot_memory + 5
+        with patch("evo_wam.g_pi_context.split_g_context_features",
+                   return_value=({1: demo_memory}, {1: robot_memory})), \
+             patch("evo_wam.g_pi_context.pi_context_features", return_value={1: isolated_memory}), \
+             patch.object(decoder, "decode_goal", wraps=decoder.decode_goal) as read:
+            results = translator.diagnose_intent(demo, history, state, use_cache=False)
+        self.assertIs(read.call_args_list[0].args[1], robot_memory)
+        self.assertIs(read.call_args_list[1].args[1], robot_memory)
+        self.assertIs(read.call_args_list[2].args[1], isolated_memory)
+        torch.testing.assert_close(read.call_args_list[0].args[0], read.call_args_list[2].args[0],
+                                   atol=0, rtol=0)
+        self.assertEqual(set(results), {"baseline", "u_permuted", "robot_without_demo"})
+        for result in results.values():
+            self.assertEqual(set(result), {"z", "goal_poses", "goal_gripper"})
+        self.assertFalse(torch.allclose(results["baseline"]["z"], results["u_permuted"]["z"]))
+        self.assertFalse(torch.allclose(results["baseline"]["z"], results["robot_without_demo"]["z"]))
+
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_native_g_step_changes_decoder_only_and_E_stays_exact(self):
-        from evo_wam.g_pi_context import frozen_base_checksum, g_context_features
+        from evo_wam.g_pi_context import frozen_base_checksum, split_g_context_features
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture("cuda")
         translator = GTranslator(encoder.native, decoder, config)
         checksum = frozen_base_checksum(encoder.native)
@@ -290,7 +500,9 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         original = {name: value.detach().clone() for name, value in translator.named_parameters()}
         with torch.autocast("cuda", dtype=torch.bfloat16):
             before_z = encoder(history[:, :, -1:])
-            prediction = decoder(g_context_features(encoder.native, demo, history[:, :, :2], config)[1], state)
+            demo_features, robot_features = split_g_context_features(
+                encoder.native, demo, history[:, :, :2], config)
+            prediction = decoder(demo_features[1], robot_features[1], state)
             target = {"z": before_z, "goal_poses": torch.eye(4, device="cuda").repeat(1, 1, 1, 1),
                       "goal_gripper": torch.ones(1, 1, device="cuda")}
             loss = g_goal_loss(prediction, target)["total"]
@@ -363,3 +575,8 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         after = translator.predict(demo, history, state, current_index=1)
         for name in goal:
             torch.testing.assert_close(after[name], cached[name], rtol=0, atol=0)
+        policy.generator.set_state(seed)
+        absent = policy.predict(history, state, goal=goal, current_index=1)
+        policy.generator.set_state(seed)
+        empty = policy.predict(history, state, native.g_pi_empty_text, goal, current_index=1)
+        torch.testing.assert_close(absent, empty, rtol=0, atol=0)

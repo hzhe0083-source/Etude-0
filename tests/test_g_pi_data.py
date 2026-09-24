@@ -24,7 +24,7 @@ def write_g_pi_task(root, name="task", *, gripper=None, demonstration=True, fram
     count = 4 * frame_stride
     latent_frames = (frames - 1) // count + 1
     metadata = {
-        "format_version": 2, "kind": "g_pi_task", "sample_id": name, "arrays": f"{name}.npz",
+        "format_version": 3, "kind": "g_pi_task", "sample_id": name, "arrays": f"{name}.npz",
         "robot_source": {"source_id": f"{name}-robot", "source_group": f"{name}-robot",
                          "domain": "robot", "trajectory_id": f"{name}-trajectory"},
         "action_space": {"representation": "zero-wam-normalized", "normalization_id": "fixture",
@@ -215,6 +215,31 @@ class GPiDataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "task-paired human"):
             load_g_pi_sample(path, route="g_translator", current_time=.4)
 
+    def test_g_never_loads_text_and_does_not_require_language_files(self):
+        path, metadata, _ = write_g_pi_task(self.root)
+        (self.root / metadata["language"]).unlink()
+        with patch("evo_wam.g_pi_data.load_goal_language", side_effect=AssertionError("G must not read text")):
+            sample = load_g_pi_sample(path, route="g_translator", current_time=.4)
+        self.assertIsNone(sample.language)
+        self.assertIsNone(sample.language_identity)
+        self.assertNotIn("language", sample.metadata)
+        self.assertEqual(len(g_pi_sample_files(path, sample)), 3)
+        metadata.pop("language")
+        path.write_text(json.dumps(metadata))
+        load_g_pi_sample(path, route="g_translator", current_time=.4)
+        with self.assertRaisesRegex(ValueError, "pi training requires"):
+            load_g_pi_sample(path, current_time=.4)
+
+    def test_offline_measurements_can_read_robot_goals_without_text_or_demo(self):
+        path, metadata, _ = write_g_pi_task(self.root, demonstration=False)
+        metadata.pop("language")
+        path.write_text(json.dumps(metadata))
+        with patch("evo_wam.g_pi_data.load_goal_language", side_effect=AssertionError("no text")):
+            sample = load_g_pi_sample(path, current_time=.4, read_language=False)
+        self.assertIsNone(sample.language)
+        self.assertEqual(len(g_pi_sample_files(path, sample)), 2)
+        self.assertNotIn("demonstration", sample.metadata)
+
     def test_future_sequence_perturbations_never_enter_history_or_single_frame_target(self):
         path, metadata, arrays = write_g_pi_task(self.root)
         baseline = load_g_pi_sample(path, current_time=.4)
@@ -338,6 +363,12 @@ class GPiDataTest(unittest.TestCase):
         self.save(path, metadata, {**arrays, "gripper": changed})
         with self.assertRaisesRegex(ValueError, "recomputed"):
             load_g_pi_sample(path, current_time=.4)
+
+    def test_version_two_rejected_with_subgoal_migration_reason(self):
+        path, metadata, arrays = write_g_pi_task(self.root)
+        self.save(path, {**metadata, "format_version": 2}, arrays)
+        with self.assertRaisesRegex(ValueError, "version 2 is unsupported.*auditable subgoal"):
+            load_g_pi_sample(path)
 
     def test_version_one_rejected_with_migration_reason(self):
         path, metadata, arrays = write_g_pi_task(self.root)

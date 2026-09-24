@@ -9,11 +9,15 @@ import torch
 from evo_wam.g_pi_context import (
     FrozenGoalEncoder, assert_frozen_base, build_demo_cache, frozen_base_checksum,
     g_attention_mask, g_context_features, install_empty_text, load_target_cache, pi_context_features,
-    save_target_cache, truncate_robot_history,
+    demo_context_features, split_g_context_features,
+    save_target_cache, truncate_robot_history, validate_camera_layout,
 )
 from evo_wam.goal_action import action_named_parameters, install_action_interface
 from evo_wam.zerowam import NativeDependencyError, load_native_class
 from test_native_icl import tiny_model
+
+
+CAMERAS = [{"name": "camera", "token_width": 2}]
 
 
 CONFIG = {"chunk_size": 2, "max_frame_chunk_size": 4, "icl_rope_h": 4, "window_size": 8}
@@ -69,7 +73,9 @@ class GPiContextTests(unittest.TestCase):
         self.assertNotEqual(before, frozen_base_checksum(module))
 
     def test_target_cache_identity_and_roundtrip(self):
-        identity = {"layer": 1, "timestep": 0, "pooling": "adaptive_avg_pool1d_spatial",
+        identity = {"layer": 1, "timestep": 0, "pooling": "adaptive_avg_pool2d_spatial",
+                    "grid_size": [2, 4], "token_order": "camera_then_row_major",
+                    "camera_layout": CAMERAS, "num_views": 1,
                     "k_z": 8, "d_z": 4, "normalization": "l2_last_dim",
                     "base_id": {"kind": "fixture", "patch_size": (1, 1, 1)},
                     "empty_text_identity": {"source": {"shape": (1, 4, 8)}}}
@@ -79,7 +85,8 @@ class GPiContextTests(unittest.TestCase):
             save_target_cache(path, z, identity)
             torch.testing.assert_close(load_target_cache(path, identity), z, atol=0, rtol=0)
             for field, value in (("layer", 0), ("base_id", "other"), ("k_z", 2),
-                                 ("normalization", "none"), ("timestep", 1)):
+                                 ("normalization", "none"), ("timestep", 1), ("grid_size", [4, 2]),
+                                 ("pooling", "adaptive_avg_pool1d_spatial")):
                 with self.assertRaisesRegex(ValueError, "E identity mismatch"):
                     load_target_cache(path, dict(identity, **{field: value}))
 
@@ -92,6 +99,87 @@ class GPiNativeContextTests(unittest.TestCase):
         except NativeDependencyError as exc:
             raise unittest.SkipTest(str(exc))
 
+    def test_two_dimensional_pooling_keeps_both_axes_in_row_order(self):
+        native = context_model()
+        encoder = FrozenGoalEncoder(native, camera_layout=[{"name": "camera", "token_width": 4}],
+                                    layer=1, grid_size=(2, 2))
+        spatial = torch.zeros(1, native.inner_dim, 4, 4)
+        spatial[:, 0] = 1
+        spatial[:, 1, :, :2], spatial[:, 1, :, 2:] = -1, 1
+        spatial[:, 2, :2, :], spatial[:, 2, 2:, :] = -2, 2
+        features = spatial.flatten(2).transpose(1, 2)
+        with patch("evo_wam.g_pi_context.pi_context_features", return_value={1: features}):
+            z = encoder(torch.zeros(1, 4, 1, 4, 4))
+        expected = torch.zeros(1, 4, native.inner_dim)
+        expected[0, :, :3] = torch.tensor([[1., -1., -2.], [1., 1., -2.],
+                                          [1., -1., 2.], [1., 1., 2.]])
+        torch.testing.assert_close(z, FrozenGoalEncoder.normalize(expected), atol=0, rtol=0)
+        self.assertFalse(torch.equal(z[:, 0], z[:, 1]))
+        self.assertFalse(torch.equal(z[:, 0], z[:, 2]))
+        self.assertEqual(encoder.identity["grid_size"], [2, 2])
+        self.assertEqual(encoder.identity["token_order"], "camera_then_row_major")
+        self.assertEqual(encoder.identity["pooling"], "adaptive_avg_pool2d_spatial")
+        self.assertEqual(FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1).k_z, 16)
+        for grid in ((0, 2), (2,), (True, 2), "4x4"):
+            with self.assertRaisesRegex(ValueError, "grid_size"):
+                FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1, grid_size=grid)
+        with self.assertRaises(TypeError):
+            FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1, k_z=8)
+
+    def test_same_token_count_with_different_grids_rejects_cache(self):
+        native = context_model()
+        encoder = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1, grid_size=(2, 4))
+        other = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1, grid_size=(4, 2))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "goal.npz"
+            z = FrozenGoalEncoder.normalize(torch.randn(1, 8, native.inner_dim))
+            save_target_cache(path, z, encoder.identity)
+            with self.assertRaisesRegex(ValueError, "E identity mismatch"):
+                load_target_cache(path, other.identity)
+            old = dict(encoder.identity, pooling="adaptive_avg_pool1d_spatial")
+            old.pop("grid_size")
+            old.pop("token_order")
+            save_target_cache(path, z, old)
+            with self.assertRaisesRegex(ValueError, "E identity mismatch"):
+                load_target_cache(path, encoder.identity)
+
+    def test_camera_pooling_never_averages_across_view_boundaries(self):
+        native = context_model()
+        layout = [{"name": "head", "token_width": 3}, {"name": "wrist", "token_width": 2}]
+        encoder = FrozenGoalEncoder(native, layer=1, camera_layout=layout, grid_size=(2, 2))
+        spatial = torch.zeros(1, native.inner_dim, 2, 5)
+        spatial[:, 0, :, :3] = 1
+        spatial[:, 1, :, 3:] = 1
+        with patch("evo_wam.g_pi_context.pi_context_features",
+                   return_value={1: spatial.flatten(2).transpose(1, 2)}):
+            z = encoder(torch.zeros(1, 4, 1, 2, 5))
+        expected = torch.zeros(1, 8, native.inner_dim)
+        expected[:, :4, 0], expected[:, 4:, 1] = 1, 1
+        torch.testing.assert_close(z, expected, atol=0, rtol=0)
+        self.assertEqual(encoder.k_z, 8)
+        self.assertEqual(encoder.identity["num_views"], 2)
+        self.assertEqual(encoder.identity["camera_layout"], layout)
+        layout[0]["token_width"] = 100
+        self.assertEqual(encoder.identity["camera_layout"][0]["token_width"], 3)
+        with self.assertRaisesRegex(ValueError, "exactly cover"):
+            encoder(torch.zeros(1, 4, 1, 2, 6))
+        config = dict(CONFIG, goal_encoder={"camera_layout": encoder.identity["camera_layout"]})
+        with self.assertRaisesRegex(ValueError, "exactly cover"):
+            pi_context_features(native, torch.zeros(1, 4, 2, 2, 6), config)
+        with self.assertRaisesRegex(ValueError, "exactly cover"):
+            g_context_features(native, torch.zeros(1, 4, 1, 2, 5),
+                               torch.zeros(1, 4, 2, 2, 6), config)
+        other = FrozenGoalEncoder(native, layer=1, grid_size=(2, 2),
+                                  camera_layout=list(reversed(encoder.identity["camera_layout"])))
+        with self.assertRaisesRegex(ValueError, "E identity mismatch"):
+            encoder.validate_identity(other.identity)
+        for layout in (None, [], [{"name": "head", "token_width": 0}],
+                       [{"name": "head", "token_width": True}],
+                       [{"name": "head", "token_width": 2}, {"name": "head", "token_width": 2}],
+                       [{"name": "head", "token_width": 2, "unused": True}]):
+            with self.assertRaisesRegex(ValueError, "camera_layout"):
+                validate_camera_layout(layout)
+
     def test_shared_base_rules_ownership_and_identity(self):
         native = context_model()
         install_action_interface(native)
@@ -102,7 +190,7 @@ class GPiNativeContextTests(unittest.TestCase):
         modes = [module.training for module in native.modules()]
         trainable = [parameter.requires_grad for parameter in native.parameters()]
         base_id = {"kind": "fixture", "version": 1, "patch_size": (1, 1, 1)}
-        encoder = FrozenGoalEncoder(native, layer=1, k_z=8, base_id=base_id)
+        encoder = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1, grid_size=(2, 4), base_id=base_id)
         base_id["version"] = 2
         self.assertEqual(encoder.identity["base_id"],
                          {"kind": "fixture", "version": 1, "patch_size": [1, 1, 1]})
@@ -130,15 +218,15 @@ class GPiNativeContextTests(unittest.TestCase):
     def test_pretrained_empty_text_required_and_hashed(self):
         native = tiny_model().requires_grad_(False)
         with self.assertRaisesRegex(ValueError, "empty text embedding"):
-            FrozenGoalEncoder(native, layer=1)
+            FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         empty = torch.randn(1, 4, 8)
         install_empty_text(native, empty, {"kind": "fixture_a", "shape": (1, 4, 8)})
-        first = FrozenGoalEncoder(native, layer=1)
+        first = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         self.assertEqual(first.identity["empty_text_identity"]["source"]["shape"], [1, 4, 8])
         self.assertIn("g_pi_empty_text", native.state_dict())
         self.assertFalse(native.g_pi_empty_text.requires_grad)
         install_empty_text(native, empty + 1, "fixture_b")
-        second = FrozenGoalEncoder(native, layer=1)
+        second = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         self.assertNotEqual(first.identity, second.identity)
         with self.assertRaisesRegex(ValueError, "E identity mismatch"):
             first.validate_identity(second.identity)
@@ -146,17 +234,48 @@ class GPiNativeContextTests(unittest.TestCase):
     def test_action_dtype_and_updates_leave_base_identity_unchanged(self):
         native = context_model()
         install_action_interface(native)
-        first = FrozenGoalEncoder(native, layer=1)
+        first = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         for _, parameter in action_named_parameters(native):
             parameter.data = parameter.data.float()
             parameter.requires_grad_(True)
             with torch.no_grad():
                 parameter.add_(1)
-        second = FrozenGoalEncoder(native, layer=1)
+        second = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         self.assertEqual(first.identity, second.identity)
         native.blocks[0].attn2.action_to_k.weight = native.blocks[0].attn2.to_k.weight
         with self.assertRaisesRegex(ValueError, "independent action attention"):
             assert_frozen_base(native)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
+    def test_split_default_preserves_native_demo_path_and_ablation_removes_it(self):
+        torch.manual_seed(315)
+        native = context_model("cuda").requires_grad_(False)
+        demonstration = torch.randn(1, 4, 2, 1, 2, device="cuda")
+        history = torch.randn(1, 4, 3, 1, 2, device="cuda")
+        legacy = g_context_features(native, demonstration, history, CONFIG)
+        demo, robot = split_g_context_features(native, demonstration, history, CONFIG)
+        changed_demo, changed_robot = split_g_context_features(native, demonstration + 7, history, CONFIG)
+        for layer in range(2):
+            torch.testing.assert_close(demo[layer], legacy[layer][:, :4], rtol=0, atol=0)
+            torch.testing.assert_close(robot[layer], legacy[layer][:, 4:], rtol=0, atol=0)
+            self.assertFalse(torch.equal(robot[layer], changed_robot[layer]))
+            self.assertFalse(torch.equal(demo[layer], changed_demo[layer]))
+        isolated = dict(CONFIG, demo_route="via_u_only")
+        demo, robot = split_g_context_features(native, demonstration, history, isolated)
+        other_demo, other_robot = split_g_context_features(native, demonstration + 7, history, isolated)
+        cached = build_demo_cache(native, demonstration, isolated)
+        with patch("evo_wam.g_pi_context._context", wraps=__import__(
+                "evo_wam.g_pi_context", fromlist=["_context"])._context) as context:
+            cached_demo = demo_context_features(native, demonstration, isolated, demo_cache=cached)
+            self.assertEqual(context.call_count, 0)
+        for layer in range(2):
+            torch.testing.assert_close(robot[layer], other_robot[layer], rtol=0, atol=0)
+            torch.testing.assert_close(demo[layer], cached_demo[layer], rtol=0, atol=0)
+            self.assertFalse(torch.equal(demo[layer], other_demo[layer]))
+        with self.assertRaisesRegex(ValueError, "demo cache"):
+            demo_context_features(native, demonstration + 1, isolated, demo_cache=cached)
+        with self.assertRaisesRegex(ValueError, "demo_route"):
+            split_g_context_features(native, demonstration, history, dict(CONFIG, demo_route="unknown"))
 
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_native_directionality_and_real_demo_cache(self):
@@ -190,7 +309,7 @@ class GPiNativeContextTests(unittest.TestCase):
     def test_native_fp32_weights_use_fixed_internal_autocast(self):
         native = tiny_model("cuda").float().requires_grad_(False)
         install_empty_text(native, torch.randn(1, 4, 8), "fixture_fp32_empty")
-        encoder = FrozenGoalEncoder(native, layer=1)
+        encoder = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         frame = torch.randn(1, 4, 1, 1, 2, device="cuda")
         standalone = encoder(frame)
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -212,12 +331,12 @@ class GPiNativeContextTests(unittest.TestCase):
         for parameter in actions:
             parameter.data = parameter.data.float()
             parameter.requires_grad_(True)
-        encoder = FrozenGoalEncoder(native, layer=1)
+        encoder = FrozenGoalEncoder(native, camera_layout=CAMERAS, layer=1)
         video = torch.randn(1, 4, 4, 1, 2, device="cuda", dtype=torch.bfloat16)
         before_hash = frozen_base_checksum(native)
         before_z = encoder(video[:, :, :1])
-        self.assertEqual(before_z.shape, (1, 8, 36))
-        torch.testing.assert_close(before_z.norm(dim=-1), torch.ones(1, 8, device="cuda"))
+        self.assertEqual(before_z.shape, (1, 16, 36))
+        torch.testing.assert_close(before_z.norm(dim=-1), torch.ones(1, 16, device="cuda"))
         demo = video[:, :, :2].clone()
         for read in (lambda value: g_context_features(native, demo, value, CONFIG, current_index=1),
                      lambda value: pi_context_features(native, value, CONFIG, current_index=1)):

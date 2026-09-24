@@ -83,10 +83,19 @@ class _PoseDecoder(nn.Module):
         with torch.no_grad():
             self.head.bias.copy_(self.head.bias.new_tensor([0., 0., 0., 1., 0., 0., 0., 1., 0., 0.]))
 
-    def forward(self, tokens: Tensor) -> dict[str, Tensor]:
+    def forward(self, tokens: Tensor, *, per_effector: bool = False) -> dict[str, Tensor]:
         tokens = tokens[:, :self.num_pose_tokens]
         queries = self.queries[None].expand(tokens.shape[0], -1, -1)
-        hidden = queries + self.readout(queries, tokens, tokens, need_weights=False)[0]
+        if per_effector:
+            if tokens.shape[1] != self.queries.shape[0]:
+                raise ValueError("per-effector pose decoding requires one token per effector")
+            batch, effectors, dim = queries.shape
+            query = queries.reshape(batch * effectors, 1, dim)
+            memory = tokens.reshape(batch * effectors, 1, dim)
+            attended = self.readout(query, memory, memory, need_weights=False)[0]
+            hidden = queries + attended.reshape(batch, effectors, dim)
+        else:
+            hidden = queries + self.readout(queries, tokens, tokens, need_weights=False)[0]
         raw = self.head(hidden)
         raw = raw if raw.dtype == torch.float64 else raw.float()
         poses = raw.new_zeros(*raw.shape[:-1], 4, 4)

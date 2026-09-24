@@ -2,7 +2,7 @@
   "schema_version": 3,
   "kind": "se3_goal_experiment",
   "synthetic_dimensions_only": true,
-  "interface_type": "pi_goal",
+  "interface_type": "g_translator",
   "human_context": "cross_video",
   "domain_schedule": [
     "robot"
@@ -33,10 +33,11 @@
     "state_dim": 4,
     "dim": 768,
     "num_heads": 8,
-    "num_tokens": 100,
-    "num_layer_groups": 1,
-    "num_pose_tokens": 8,
-    "translation_scale": 1.0
+    "num_layers": 2,
+    "translation_scale": 1.0,
+    "use_state": true,
+    "intent_mode": "connected",
+    "num_intent_tokens": 4
   },
   "action_sampling_steps": 4,
   "pose_weight": 1.0,
@@ -70,6 +71,13 @@
     "rotation_std": 0.0,
     "gripper_std": 0.0
   },
-  "conditioning_mode": "language_state_goal",
-  "p_drop": 0.0
+  "conditioning_mode": "demo_robot_state_internal_empty",
+  "demo_route": "one_way",
+  "intent_training": {
+    "data_version": "v2",
+    "groups_per_batch": 2,
+    "samples_per_group": 2,
+    "contrastive_weight": 1.0,
+    "temperature": 0.1
+  }
 }

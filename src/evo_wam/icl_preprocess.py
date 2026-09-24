@@ -11,11 +11,11 @@ from .vision import encode_rgb, load_vae, read_video, sha256
 
 
 def encode_g_pi_frames(vae, frames, control_times, gripper, *, frame_stride, control_dt,
-                       event_rules, size):
+                       event_rules, size, subgoal_metadata=None, offline_arrays=None):
     """Encode native causal history and each event/terminal image separately.
 
     RGB contains every control-grid frame, including the incomplete video tail.
-    Returns visual NPZ fields and their alignment metadata for a v2 g_pi_task.
+    Returns visual NPZ fields and their alignment metadata for a v3 g_pi_task.
     """
     from .g_pi_data import EventRules, subgoal_control_indices, validate_latent_grid
 
@@ -37,7 +37,16 @@ def encode_g_pi_frames(vae, frames, control_times, gripper, *, frame_stride, con
     endpoints = torch.arange(0, len(frames), 4 * frame_stride)
     available = times[endpoints]
     validate_latent_grid(metadata, times, available)
-    subgoals = subgoal_control_indices(measured, times, rules)
+    if subgoal_metadata is None:
+        subgoals = subgoal_control_indices(measured, times, rules)
+    else:
+        from dataclasses import asdict
+        from .g_pi_subgoals import resolve_subgoal_indices
+
+        evidence = {name: torch.as_tensor(value) for name, value in (offline_arrays or {}).items()}
+        evidence.update(control_times=times, gripper=measured)
+        subgoals, audit = resolve_subgoal_indices({**subgoal_metadata, "event_rules": asdict(rules)}, evidence)
+        metadata.update(subgoal_source=subgoal_metadata.get("subgoal_source", "gripper"), subgoal_annotation=audit)
     # Discard incomplete groups only from the sequence, never from target RGB.
     sampled = frames[:endpoints[-1].item() + 1:frame_stride]
     latent = encode_rgb(vae, sampled, size)

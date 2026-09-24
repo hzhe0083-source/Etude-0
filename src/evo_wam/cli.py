@@ -695,6 +695,7 @@ def main(argv=None):
     goal_train = commands.add_parser("train-goal-interface", help="train G/π, observed-context, or legacy goal/visual routes")
     goal_train.add_argument("--config", required=True)
     goal_train.add_argument("--index", required=True)
+    goal_train.add_argument("--intent-groups", help="offline whole-demonstration purpose table for G contrastive training")
     goal_train.add_argument("--stage", required=True, choices=("goal", "visual", "joint", "g", "pi"))
     goal_train.add_argument("--checkpoint")
     goal_train.add_argument("--tiny-native", action="store_true")
@@ -710,6 +711,9 @@ def main(argv=None):
     goal_export.add_argument("--output", required=True)
     goal_export.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     goal_export.add_argument("--max-shard-size", default="2GB")
+    goal_stopping = goal_export.add_mutually_exclusive_group()
+    goal_stopping.add_argument("--stop-thresholds", help="explicit G/pi stopping distances in a JSON file")
+    goal_stopping.add_argument("--calibration", help="validation calibration artifact for G/pi stopping")
     goal_predict = commands.add_parser("predict-goal-policy", help="predict normalized actions from observed-only SE(3) policy inputs")
     goal_predict.add_argument("--policy", required=True)
     goal_predict.add_argument("--observation", required=True)
@@ -717,6 +721,27 @@ def main(argv=None):
     goal_predict.add_argument("--device", default="cuda")
     goal_predict.add_argument("--seed", type=int, default=0)
     goal_predict.add_argument("--output", required=True)
+    goal_calibrate = commands.add_parser("calibrate-g-pi-stop", help="calibrate G/pi stopping distances on validation recordings")
+    goal_calibrate.add_argument("--manifest", required=True)
+    goal_calibrate.add_argument("--output", required=True)
+    goal_calibrate.add_argument("--artifact", help="G/pi training artifact for encoding uncached validation goals")
+    goal_calibrate.add_argument("--checkpoint", help="local base checkpoint override")
+    goal_calibrate.add_argument("--device", default="cuda")
+    goal_candidates = commands.add_parser("generate-g-pi-candidates", help="build weak subgoal labels from measured gripper and visual robot poses")
+    goal_candidates.add_argument("--manifest", required=True)
+    goal_candidates.add_argument("--output", required=True)
+    intent_probe = commands.add_parser("probe-g-pi-intent", help="fit a held-out purpose probe on frozen demonstration-only features")
+    intent_probe.add_argument("--manifest", required=True)
+    intent_probe.add_argument("--output", required=True)
+    intent_probe.add_argument("--artifact", help="G training artifact for the frozen native base")
+    intent_probe.add_argument("--checkpoint", help="local base checkpoint override")
+    intent_probe.add_argument("--device", default="cuda")
+    goal_evaluate = commands.add_parser("evaluate-g-pi", help="measure goal interventions and offline action replay without executing commands")
+    goal_evaluate.add_argument("--manifest", required=True)
+    goal_evaluate.add_argument("--output", required=True)
+    goal_evaluate.add_argument("--device", default="cuda")
+    goal_evaluate.add_argument("--g-checkpoint", help="local G base checkpoint override")
+    goal_evaluate.add_argument("--pi-checkpoint", help="local pi base checkpoint override")
     icl_visual = commands.add_parser("preprocess-icl-video", help="cache one raw video for native ICL semantic pairing")
     icl_visual.add_argument("--manifest", required=True)
     icl_visual.add_argument("--output", required=True)
@@ -831,6 +856,18 @@ def main(argv=None):
         elif args.command == "predict-goal-policy":
             from .goal_training import predict_goal_cli
             result = predict_goal_cli(args)
+        elif args.command == "calibrate-g-pi-stop":
+            from .g_pi_calibration import calibrate_g_pi_thresholds
+            result = calibrate_g_pi_thresholds(args)
+        elif args.command == "generate-g-pi-candidates":
+            from .g_pi_subgoals import generate_candidate_annotation
+            result = generate_candidate_annotation(args.manifest, args.output)
+        elif args.command == "probe-g-pi-intent":
+            from .g_pi_probe import probe_g_pi_intent
+            result = probe_g_pi_intent(args)
+        elif args.command == "evaluate-g-pi":
+            from .g_pi_evaluation import evaluate_g_pi_cli
+            result = evaluate_g_pi_cli(args)
         elif args.command == "preprocess-icl-video":
             from .icl_preprocess import preprocess_icl_video
             result = preprocess_icl_video(args.manifest, args.output, device=args.device)

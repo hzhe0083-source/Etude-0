@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "kind": "se3_goal_experiment",
   "synthetic_dimensions_only": true,
   "interface_type": "g_translator",
@@ -35,14 +35,29 @@
     "num_heads": 8,
     "num_layers": 2,
     "translation_scale": 1.0,
-    "use_state": true
+    "use_state": true,
+    "intent_mode": "connected",
+    "num_intent_tokens": 4
   },
   "action_sampling_steps": 4,
   "pose_weight": 1.0,
   "video_weight": 0.0,
   "goal_encoder": {
     "layer": 1,
-    "k_z": 8
+    "grid_size": [
+      4,
+      4
+    ],
+    "camera_layout": [
+      {
+        "name": "front",
+        "token_width": 1
+      },
+      {
+        "name": "wrist",
+        "token_width": 1
+      }
+    ]
   },
   "event_rules": {
     "signal_source": "measured",
@@ -55,5 +70,14 @@
     "translation_std": 0.0,
     "rotation_std": 0.0,
     "gripper_std": 0.0
+  },
+  "conditioning_mode": "demo_robot_state_internal_empty",
+  "demo_route": "one_way",
+  "intent_training": {
+    "data_version": "v1",
+    "groups_per_batch": 2,
+    "samples_per_group": 2,
+    "contrastive_weight": 1.0,
+    "temperature": 0.1
   }
 }

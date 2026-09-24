@@ -19,7 +19,7 @@ class GDeploymentTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.path, self.metadata, self.arrays, _ = write_goal_observation(self.root)
-        self.metadata.update(format_version=2, kind="g_pi_observation", current_time=.5,
+        self.metadata.update(format_version=3, kind="g_pi_observation", current_time=.5,
                              actions_per_frame=4, frame_stride=1, temporal_down_rate=4,
                              alignment="zerowam_causal_first_then_four", subgoal_encoding="wan_vae_single_frame")
         self.arrays.pop("history_times")
@@ -30,13 +30,15 @@ class GDeploymentTest(unittest.TestCase):
                 "control_dt", "actions_per_frame", "pose_representation", "tool_frames", "gripper_space",
                 "frame_stride", "temporal_down_rate", "alignment", "subgoal_encoding")
         self.registry = {key: self.metadata[key] for key in keys}
-        self.registry.update(language_identity=language_identity, goal_source="measured_endpoint",
+        self.registry.update(language_identity=language_identity, goal_source="measured_endpoint", subgoal_source="gripper",
                              event_rules={"signal_source": "measured"})
-        self.identity = {"k_z": 8, "d_z": 4, "layer": 1, "base_sha256": "fixture"}
+        self.identity = {"k_z": 16, "grid_size": [4, 4], "num_views": 1,
+                         "camera_layout": [{"name": "head", "token_width": 2}], "d_z": 4, "layer": 1, "base_sha256": "fixture"}
         self.payload = {"config": {"interface_type": "g_translator"}, "registry": self.registry,
+                        "native_config": {"patch_size": [1, 1, 1]},
                         "visual_feature_space": self.metadata["feature_space_id"],
                         "encoder_identity": self.identity}
-        self.goal = {"z": torch.nn.functional.normalize(torch.ones(1, 8, 4), dim=-1),
+        self.goal = {"z": torch.nn.functional.normalize(torch.ones(1, 16, 4), dim=-1),
                      "goal_poses": torch.eye(4)[None, None], "goal_gripper": torch.ones(1, 1)}
         self.save()
 
@@ -80,9 +82,26 @@ class GDeploymentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "route-specific"):
             load_g_pi_observation(self.path, self.payload)
 
+    def test_pi_observation_without_language_does_not_open_a_language_file(self):
+        self.metadata.pop("demonstration")
+        self.metadata["goal"] = save_goal_prediction(self.root / "goal.npz", self.goal,
+                                                    self.identity, self.registry).name
+        self.payload["config"]["interface_type"] = "pi_goal"
+        (self.root / self.language_path).unlink()
+        self.save()
+        observation = load_g_pi_observation(self.path, self.payload)
+        self.assertIsInstance(observation, PiObservation)
+        self.assertIsNone(observation.language)
+        self.assertIsNone(observation.language_identity)
+        self.metadata["language"] = self.language_path
+        self.save()
+        with self.assertRaises((FileNotFoundError, ValueError)):
+            load_g_pi_observation(self.path, self.payload)
+
     def test_rejects_future_previous_task_and_supervision(self):
         original = copy.deepcopy(self.metadata)
-        for key in ("goal_poses", "actions", "terminal_time", "subgoal_time"):
+        for key in ("goal_poses", "actions", "terminal_time", "subgoal_time", "subgoal_source",
+                    "subgoal_annotation", "object_states", "relation", "stage"):
             self.metadata = {**original, key: "not-an-input"}
             self.save()
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "without supervision"):
@@ -108,11 +127,21 @@ class GDeploymentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete causal grid"):
             load_g_pi_observation(self.path, self.payload)
 
-    def test_old_observation_version_is_rejected_explicitly(self):
-        self.metadata["format_version"] = 1
-        self.save()
-        with self.assertRaisesRegex(ValueError, "version 1.*version 2"):
+    def test_observation_canvas_matches_policy_camera_layout(self):
+        self.payload["encoder_identity"] = {**self.identity,
+            "camera_layout": [{"name": "head", "token_width": 2}, {"name": "wrist", "token_width": 1}]}
+        with self.assertRaisesRegex(ValueError, "camera_layout"):
             load_g_pi_observation(self.path, self.payload)
+        self.payload["encoder_identity"]["camera_layout"] = [{"name": "head", "token_width": 1},
+                                                             {"name": "wrist", "token_width": 1}]
+        self.assertEqual(load_g_pi_observation(self.path, self.payload).history.shape[-1], 2)
+
+    def test_old_observation_version_is_rejected_explicitly(self):
+        for version in (1, 2):
+            self.metadata["format_version"] = version
+            self.save()
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, f"version {version}.*version 3"):
+                load_g_pi_observation(self.path, self.payload)
 
     def test_time_tolerance_never_reaches_another_control_step(self):
         self.metadata.update(control_dt=1e-7, current_time=5e-7)

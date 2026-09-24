@@ -129,8 +129,8 @@ class PiGoalSample:
     target_frame: Tensor           # [1,C,1,H,W], independently passed to frozen E
     goal_poses: Tensor
     goal_gripper: Tensor
-    language: Tensor
-    language_identity: Mapping
+    language: Tensor | None
+    language_identity: Mapping | None
     actions: Tensor                # [1,A,F,N,1], padded only beyond terminal
     actions_mask: Tensor
     subgoal_time: float
@@ -154,22 +154,29 @@ def _metadata(path: Path) -> dict:
     metadata = json.loads(path.read_text(encoding="utf-8"))
     required = {"format_version", "kind", "sample_id", "arrays", "robot_source", "action_space",
                 "state_space_id", "coordinate_frame", "pose_units", "goal_source", "end_effectors",
-                "control_dt", "pose_representation", "tool_frames", "gripper_space", "language",
+                "control_dt", "pose_representation", "tool_frames", "gripper_space",
                 "feature_space_id", "latent_normalization", "action_frames", "actions_per_frame",
                 "task_start_time", "success", "event_rules", "frame_stride", "temporal_down_rate",
                 "alignment", "subgoal_encoding"}
     if isinstance(metadata, dict) and metadata.get("format_version") == 1:
-        raise ValueError("g_pi_task version 1 is unsupported; rebuild as version 2 with separate control and latent grids")
+        raise ValueError("g_pi_task version 1 is unsupported; rebuild as version 3 with separate control and latent grids and auditable subgoal sources")
+    if isinstance(metadata, dict) and metadata.get("format_version") == 2:
+        raise ValueError("g_pi_task version 2 is unsupported; rebuild as version 3 with auditable subgoal sources")
     if (not isinstance(metadata, dict) or required - set(metadata)
-            or set(metadata) - required - {"demonstration", "compatibility", "provenance"}
-            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 2
+            or set(metadata) - required - {"language", "demonstration", "compatibility", "provenance", "subgoal_source", "subgoal_annotation"}
+            or type(metadata.get("format_version")) is not int or metadata["format_version"] != 3
             or metadata.get("kind") != "g_pi_task"):
-        raise ValueError("expected an explicit version-2 g_pi_task schema")
+        raise ValueError("expected an explicit version-3 g_pi_task schema")
     _interface_metadata({**metadata, "current_time": 0.})
-    for name in ("sample_id", "arrays", "language", "feature_space_id"):
+    for name in ("sample_id", "arrays", "feature_space_id"):
         _text(metadata, name)
-    for name, suffix in (("arrays", ".npz"), ("language", ".json")):
-        _local_path(path.parent, metadata[name], suffix)
+    _local_path(path.parent, metadata["arrays"], ".npz")
+    if "language" in metadata:
+        _local_path(path.parent, _text(metadata, "language"), ".json")
+    from .g_pi_subgoals import SOURCES
+    if (not isinstance(metadata.get("subgoal_source", "gripper"), str)
+            or metadata.get("subgoal_source", "gripper") not in SOURCES):
+        raise ValueError("subgoal_source must be gripper, sim_relation, pedal or candidate_match")
     _identity(metadata["robot_source"])
     if set(metadata["robot_source"]) != _IDENTITY_FIELDS or metadata["robot_source"]["domain"] != "robot":
         raise ValueError("robot_source needs exactly robot source_id, source_group, domain and trajectory_id")
@@ -251,7 +258,8 @@ def subgoal_control_indices(gripper: Tensor, times: Tensor,
 
 def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
                      current_time: float | None = None,
-                     generator: torch.Generator | None = None) -> PiGoalSample:
+                     generator: torch.Generator | None = None,
+                     read_language: bool = True) -> PiGoalSample:
     """Sample a newly available causal latent; pi never opens the human archive.
 
     Unpadded action column k is the command executed on (control_times[k],
@@ -262,15 +270,23 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
 
     if route not in {"g_translator", "pi_goal"}:
         raise ValueError("G/pi route must be g_translator or pi_goal")
+    if type(read_language) is not bool:
+        raise ValueError("read_language must be boolean; disable only for offline goal measurements")
     path = Path(manifest_path)
     metadata = _metadata(path)
+    if route == "pi_goal" and read_language and "language" not in metadata:
+        raise ValueError("pi training requires the language cache; G and offline goal measurements do not")
     expected = {"latent", "latent_available_times", "control_times", "states", "poses", "gripper",
                 "actions", "actions_mask", "subgoal_times", "subgoal_latents"}
+    from .g_pi_subgoals import OFFLINE_ARRAYS, resolve_subgoal_indices
+
     with np.load(_local_path(path.parent, metadata["arrays"], ".npz"), allow_pickle=False) as archive:
-        if len(archive.files) != len(expected) or set(archive.files) != expected:
-            raise ValueError("G/pi version-2 task NPZ needs exactly latent, latent_available_times, control_times, "
-                             "states, poses, gripper, actions, actions_mask, subgoal_times and subgoal_latents")
-        arrays = {name: torch.from_numpy(archive[name].copy()) for name in expected}
+        if (len(archive.files) != len(set(archive.files)) or expected - set(archive.files)
+                or set(archive.files) - expected - OFFLINE_ARRAYS):
+            raise ValueError("G/pi version-3 task NPZ requires latent, latent_available_times, control_times, "
+                             "states, poses, gripper, actions, actions_mask, subgoal_times and subgoal_latents; "
+                             "only declared offline object/pedal evidence fields are optional")
+        arrays = {name: torch.from_numpy(archive[name].copy()) for name in archive.files}
     latent, latent_times, times, states, poses, gripper, actions, mask, subgoal_times, subgoal_latents = (
         arrays[name] for name in ("latent", "latent_available_times", "control_times", "states", "poses",
                                   "gripper", "actions", "actions_mask", "subgoal_times", "subgoal_latents"))
@@ -300,11 +316,11 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     rules = EventRules.from_metadata(metadata["event_rules"])
     events = detect_gripper_events(gripper, times, rules)
     terminal = times[-1].item()
-    goal_indices = subgoal_control_indices(gripper, times, rules)
+    goal_indices, audit = resolve_subgoal_indices(metadata, arrays)
     expected_subgoals = times[goal_indices]
     _times(subgoal_times, expected_subgoals.numel(), "subgoal_times")
     if not torch.equal(subgoal_times.double(), expected_subgoals.double()):
-        raise ValueError("subgoal_times must exactly match all recomputed measured event times plus terminal, "
+        raise ValueError("subgoal_times must exactly match recomputed subgoal source times plus terminal, "
                          "with simultaneous events deduplicated")
     if (subgoal_latents.shape != (subgoal_times.numel(), latent.shape[0], 1, *latent.shape[2:])
             or not subgoal_latents.is_floating_point() or not torch.isfinite(subgoal_latents).all()):
@@ -325,7 +341,7 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
             raise ValueError("current_time must identify a latent availability on the control grid")
         index = latent_indices[match.nonzero()[0]].item()
         current_time = times[index].item()
-    subgoal = next_subgoal_time(current_time, terminal, events)
+    subgoal = expected_subgoals[expected_subgoals > current_time][0].item()
     target_index = (expected_subgoals.double() == subgoal).nonzero()[0].item()
     goal_index = goal_indices[target_index].item()
     count = metadata["action_frames"] * actions_per_frame
@@ -339,13 +355,18 @@ def load_g_pi_sample(manifest_path: str | Path, *, route: str = "pi_goal",
     block = _masked_values(block, block_mask, "actions")
     if not block_mask.any():
         raise ValueError("sample requires valid action supervision before subgoal_time")
-    language, language_identity = load_goal_language(_local_path(path.parent, metadata["language"], ".json"))
+    language, language_identity = None, None
+    if route == "pi_goal" and read_language:
+        language, language_identity = load_goal_language(_local_path(path.parent, metadata["language"], ".json"))
     sample_metadata = {**metadata, "current_time": current_time, "subgoal_time": subgoal,
                        "terminal_time": terminal, "events": [asdict(event) for event in events],
-                       "action_alignment": "control_step_start_unpadded"}
+                       "action_alignment": "control_step_start_unpadded",
+                       "subgoal_source": metadata.get("subgoal_source", "gripper"), "subgoal_annotation": audit}
     if route == "pi_goal":
         sample_metadata.pop("demonstration", None)
         sample_metadata.pop("compatibility", None)
+    if language is None:
+        sample_metadata.pop("language", None)
     shape = (1, actions.shape[0], metadata["action_frames"], actions_per_frame, 1)
     history_frames = index // actions_per_frame + 1
     values = dict(metadata=sample_metadata, state=states[index:index + 1].clone(),
@@ -425,10 +446,11 @@ def g_pi_sample_files(manifest_path: str | Path, sample: PiGoalSample) -> list[P
     from .goal_language import _language_metadata
 
     path = Path(manifest_path)
-    language = _local_path(path.parent, sample.metadata["language"], ".json")
-    language_metadata = _language_metadata(language)
-    paths = [path, _local_path(path.parent, sample.metadata["arrays"], ".npz"), language,
-             _local_path(language.parent, language_metadata["arrays"], ".npz")]
+    paths = [path, _local_path(path.parent, sample.metadata["arrays"], ".npz")]
+    if sample.language is not None:
+        language = _local_path(path.parent, sample.metadata["language"], ".json")
+        language_metadata = _language_metadata(language)
+        paths.extend((language, _local_path(language.parent, language_metadata["arrays"], ".npz")))
     if isinstance(sample, GTranslatorSample):
         paths.append(_local_path(path.parent, sample.metadata["demonstration"]["arrays"], ".npz"))
     return paths

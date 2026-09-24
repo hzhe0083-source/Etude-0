@@ -129,6 +129,29 @@ def _positive_int(name, value):
         raise ValueError(f"{name} must be a positive integer")
 
 
+def validate_camera_layout(layout):
+    """Ordered view names and widths in native spatial patch tokens."""
+    if not isinstance(layout, (list, tuple)) or not layout:
+        raise ValueError("camera_layout must be a nonempty ordered list of named token widths")
+    result, names = [], set()
+    for view in layout:
+        if (not isinstance(view, dict) or set(view) != {"name", "token_width"}
+                or not isinstance(view["name"], str) or not view["name"].strip()
+                or view["name"] in names):
+            raise ValueError("camera_layout requires unique nonempty names and token_width only")
+        _positive_int("camera_layout token_width", view["token_width"])
+        result.append({"name": view["name"], "token_width": view["token_width"]})
+        names.add(view["name"])
+    return result
+
+
+def _validate_camera_canvas(native, video, layout):
+    layout = validate_camera_layout(layout)
+    width = video.shape[4] // native.patch_size[2]
+    if video.shape[4] % native.patch_size[2] or sum(view["token_width"] for view in layout) != width:
+        raise ValueError("camera_layout token widths must exactly cover the native spatial patch width")
+
+
 def g_attention_mask(demo_tokens, robot_frames, spatial_tokens, chunk_size, *, device="cpu"):
     """Dense reference for [demo, robot], useful without native CUDA kernels."""
     if type(demo_tokens) is not int or demo_tokens < 0:
@@ -206,6 +229,8 @@ def _context_impl(native, demonstration, history, config, *, demo_cache=None, ca
     for name, value in (("demonstration", demonstration), ("history", history)):
         if value is not None:
             _validate_video(native, value, name)
+    if history is not None and "goal_encoder" in config:
+        _validate_camera_canvas(native, history, config["goal_encoder"].get("camera_layout"))
     if demonstration is None and history is None:
         raise ValueError("context requires demonstration or robot history")
     if history is not None and config["icl_rope_h"] < history.shape[3] // native.patch_size[1]:
@@ -329,6 +354,40 @@ def g_context_features(native, demonstration, history, config, *, demo_cache=Non
     return _context(native, demonstration, history, config, demo_cache=demo_cache)[0]
 
 
+def demo_context_features(native, demonstration, config, *, demo_cache=None):
+    """Read a complete demonstration with no robot, state or task text inputs."""
+    if demonstration is None:
+        raise ValueError("demo-only context requires a complete task demonstration")
+    if demo_cache is None:
+        return _context(native, demonstration, None, config)[0]
+    assert_frozen_base(native)
+    _validate_config(native, config)
+    _validate_video(native, demonstration, "demonstration")
+    if (not isinstance(demo_cache, DemoCache) or demo_cache.native_id != id(native)
+            or demo_cache.versions != _versions(native)
+            or demo_cache.height_shift != config["icl_rope_h"]
+            or demo_cache.demo_hash != _tensor_hash(demonstration)):
+        raise ValueError("demo cache does not match the frozen base, demonstration, or RoPE namespace")
+    return demo_cache.features
+
+
+def split_g_context_features(native, demonstration, history, config, *, demo_cache=None,
+                             current_index=None):
+    """Split frozen demo/robot memories; optionally isolate the entire u path."""
+    route = config.get("demo_route", "one_way")
+    if route not in ("one_way", "via_u_only"):
+        raise ValueError("demo_route must be one_way or via_u_only")
+    history = truncate_robot_history(history, current_index)
+    if route == "via_u_only":
+        demo = demo_context_features(native, demonstration, config, demo_cache=demo_cache)
+        return demo, pi_context_features(native, history, config)
+    features = g_context_features(native, demonstration, history, config, demo_cache=demo_cache)
+    _, ph, pw = native.patch_size
+    count = demonstration.shape[2] * (demonstration.shape[3] // ph) * (demonstration.shape[4] // pw)
+    return ({layer: value[:, :count] for layer, value in features.items()},
+            {layer: value[:, count:] for layer, value in features.items()})
+
+
 def pi_context_features(native, history, config, *, current_index=None):
     """Read only observed robot frames using chunk-causal attention."""
     history = truncate_robot_history(history, current_index)
@@ -338,9 +397,11 @@ def pi_context_features(native, history, config, *, current_index=None):
 class FrozenGoalEncoder(nn.Module):
     """E: fixed single-frame encoding rules over the shared frozen video base."""
 
-    def __init__(self, native, *, layer, k_z=8, base_id=None):
+    def __init__(self, native, *, layer, camera_layout, grid_size=(4, 4), base_id=None):
         super().__init__()
-        _positive_int("k_z", k_z)
+        if (not isinstance(grid_size, (tuple, list)) or len(grid_size) != 2
+                or any(type(value) is not int or value < 1 for value in grid_size)):
+            raise ValueError("E grid_size must contain two positive integers [height,width]")
         if type(layer) is not int or not 0 <= layer < len(native.blocks):
             raise ValueError("E layer must select an existing native block")
         if base_id is not None:
@@ -353,13 +414,18 @@ class FrozenGoalEncoder(nn.Module):
         assert_frozen_base(native)
         # The owning G/pi system registers native once; E has no parameter tree.
         object.__setattr__(self, "native", native)
-        self.k_z, self.d_z, self.layer = k_z, native.inner_dim, layer
+        self.grid_size = tuple(grid_size)
+        self.camera_layout = validate_camera_layout(camera_layout)
+        self.k_z = len(self.camera_layout) * grid_size[0] * grid_size[1]
+        self.d_z, self.layer = native.inner_dim, layer
         checksum = frozen_base_checksum(self.native)
         empty_identity = _json_identity(native.g_pi_empty_text_identity)
         empty_identity["sha256"] = _tensor_hash(native.g_pi_empty_text)
         self._identity = {
-            "layer": layer, "timestep": 0, "pooling": "adaptive_avg_pool1d_spatial",
-            "k_z": k_z, "d_z": self.d_z, "normalization": "l2_last_dim",
+            "layer": layer, "timestep": 0, "pooling": "adaptive_avg_pool2d_spatial",
+            "grid_size": list(self.grid_size), "token_order": "camera_then_row_major",
+            "camera_layout": deepcopy(self.camera_layout), "num_views": len(self.camera_layout),
+            "k_z": self.k_z, "d_z": self.d_z, "normalization": "l2_last_dim",
             "text_conditioning": "pretrained_empty_prompt",
             "empty_text_identity": empty_identity,
             "precision": {"compute": "cuda_bfloat16_autocast",
@@ -375,7 +441,7 @@ class FrozenGoalEncoder(nn.Module):
 
     def validate_identity(self, identity):
         if _json_identity(identity) != self._identity:
-            raise ValueError("E identity mismatch: layer, timestep, pooling, normalization, empty prompt, or base weights differ")
+            raise ValueError("E identity mismatch: layer, timestep, grid, pooling, normalization, empty prompt, or base weights differ")
 
     def train(self, mode=True):
         return super().train(False)
@@ -388,9 +454,19 @@ class FrozenGoalEncoder(nn.Module):
     def forward(self, frame):
         if not isinstance(frame, torch.Tensor) or frame.ndim != 5 or frame.shape[2] != 1:
             raise ValueError("E requires exactly one separately encoded target frame [1,C,1,H,W]")
+        _validate_camera_canvas(self.native, frame, self.camera_layout)
         config = {"chunk_size": 1, "max_frame_chunk_size": 1,
                   "icl_rope_h": max(1, frame.shape[3] // self.native.patch_size[1]),
                   "window_size": self.native.attn_window}
         features = pi_context_features(self.native, frame, config)[self.layer]
-        pooled = F.adaptive_avg_pool1d(features.transpose(1, 2).float(), self.k_z).transpose(1, 2)
+        height, width = (frame.shape[3] // self.native.patch_size[1],
+                         frame.shape[4] // self.native.patch_size[2])
+        spatial = features.transpose(1, 2).float().reshape(1, self.d_z, height, width)
+        pooled, start = [], 0
+        for view in self.camera_layout:
+            end = start + view["token_width"]
+            pooled.append(F.adaptive_avg_pool2d(spatial[..., start:end], self.grid_size)
+                          .flatten(2).transpose(1, 2))
+            start = end
+        pooled = torch.cat(pooled, dim=1)
         return self.normalize(pooled)

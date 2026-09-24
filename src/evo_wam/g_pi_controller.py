@@ -15,7 +15,7 @@ from .goal_interface import validate_goal_poses, validate_gripper
 
 @dataclass(frozen=True)
 class GoalThresholds:
-    z: float = .05
+    z: float
     position_m: float = .01
     rotation_deg: float = 5.
     gripper: float = .05
@@ -40,8 +40,8 @@ def _goal(value: Mapping) -> tuple[Tensor, Tensor, Tensor]:
     return z, poses, gripper
 
 
-def goal_reached(goal: Mapping, current: Mapping, thresholds: GoalThresholds = GoalThresholds()) -> bool:
-    """Require every effector and all four distances to meet their thresholds."""
+def goal_distances(goal: Mapping, current: Mapping) -> dict[str, float]:
+    """Measure the worst token/effector, shared by control and calibration."""
     z, poses, gripper = _goal(goal)
     current_z, current_poses, current_gripper = _goal(current)
     if z.shape != current_z.shape or poses.shape != current_poses.shape:
@@ -54,8 +54,16 @@ def goal_reached(goal: Mapping, current: Mapping, thresholds: GoalThresholds = G
         trace = (pose[..., :3, :3] * measured[..., :3, :3]).sum(dim=(-2, -1))
         angle = torch.rad2deg(torch.acos(((trace - 1) / 2).clamp(-1, 1))).max()
         grip = (gripper.double() - current_gripper.to(gripper.device).double()).abs().max()
-        return bool(z_distance <= thresholds.z and translation <= thresholds.position_m
-                    and angle <= thresholds.rotation_deg and grip <= thresholds.gripper)
+        return {"z": float(z_distance), "position_m": float(translation),
+                "rotation_deg": float(angle), "gripper": float(grip)}
+
+
+def goal_reached(goal: Mapping, current: Mapping, thresholds: GoalThresholds) -> bool:
+    """Require every effector and all four distances to meet explicit thresholds."""
+    if not isinstance(thresholds, GoalThresholds):
+        raise ValueError("goal thresholds must be explicit GoalThresholds or loaded from calibration")
+    return all(value <= getattr(thresholds, name)
+               for name, value in goal_distances(goal, current).items())
 
 
 @dataclass(frozen=True)
@@ -70,6 +78,11 @@ class ControllerState:
     chunk: Tensor | None = None
     cursor: int = 0
     stopped: bool = False
+    completed_subgoals: int = 0
+    refresh_control_time: float | None = None
+    refresh_latent_time: float | None = None
+    refresh_history_count: int = 0
+    awaiting_stop_confirmation: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,21 +96,27 @@ class ControllerStep:
 
 
 def controller_step(previous: ControllerState, *, frame: Tensor | None, time: float,
-                    state: Tensor, language: Tensor, current_goal: Mapping,
+                    state: Tensor, language: Tensor | None = None, current_goal: Mapping,
                     g_predict: Callable, pi_predict: Callable,
+                    thresholds: GoalThresholds,
                     frame_available_time: float | None = None,
                     new_demo: Tensor | None = None,
-                    event_rules: EventRules = EventRules(),
-                    thresholds: GoalThresholds = GoalThresholds()) -> ControllerStep:
+                    event_rules: EventRules = EventRules()) -> ControllerStep:
     """Advance one measured control step without mutating previous or issuing IO.
 
     G receives (demo, robot_history, state); pi receives
     (robot_history, state, language, goal). The caller executes the returned
-    action before the next control step. A frame is supplied only when a new
-    causal VAE latent becomes available; its absolute availability time is
-    explicit. Events and state still update every control step. G may cache its
-    demo and reads the latest available history even between latent arrivals.
+    action before the next control step. Omitted language is passed through as
+    None for pi to apply its internal pretrained empty conditioning. A frame is
+    supplied only when a new causal VAE latent becomes available; its absolute
+    availability time is explicit. Events and state still update every control
+    step. G may cache its demo and reads the latest available history even
+    between latent arrivals.
+    A refreshed goal that is already close pauses action dispatch until a new
+    latent is available for G to confirm stopping. Progress counts are logging only.
     """
+    if not isinstance(thresholds, GoalThresholds):
+        raise ValueError("controller requires explicit goal thresholds or calibrated thresholds")
     if frame is not None and (not isinstance(frame, Tensor) or frame.ndim != 5 or frame.shape[0] != 1
             or frame.shape[2] != 1 or min(frame.shape) < 1 or not frame.is_floating_point()
             or not torch.isfinite(frame).all()):
@@ -144,25 +163,55 @@ def controller_step(previous: ControllerState, *, frame: Tensor | None, time: fl
         history += (frame.detach().clone(),)
         history_times += (available,)
     if current.stopped:
-        return ControllerStep(replace(current, last_control_time=elapsed), None, (), False, False, True)
+        return ControllerStep(replace(current, history=history, history_times=history_times,
+                                      last_control_time=elapsed), None, (), False, False, True)
     if current.event_state is None:
         raise ValueError("controller event state is missing")
     event_state, events = gripper_event_step(current.event_state, gripper[0], elapsed, event_rules)
     robot_history = torch.cat(history, dim=2)
     reached = current.goal is not None and goal_reached(current.goal, current_goal, thresholds)
-    refreshed = current.goal is None or bool(events) or reached
-    interrupted = bool((events or reached) and current.chunk is not None
+    new_evidence = (current.refresh_latent_time is not None and current.refresh_control_time is not None
+                    and history_times[-1] > current.refresh_latent_time
+                    and history_times[-1] > current.refresh_control_time
+                    and len(history) > current.refresh_history_count)
+    awaiting_stop = current.awaiting_stop_confirmation
+    confirm_stop = awaiting_stop and new_evidence
+    if awaiting_stop and not reached:
+        awaiting_stop = False
+    completed = bool(reached and not current.awaiting_stop_confirmation)
+    refreshed = current.goal is None or bool(events) or completed or confirm_stop
+    interrupted = bool((events or completed) and current.chunk is not None
                        and current.cursor < current.chunk.shape[-1])
     goal, chunk, cursor = current.goal, current.chunk, current.cursor
+    completed_subgoals = current.completed_subgoals + int(completed)
+    refresh_control_time = current.refresh_control_time
+    refresh_latent_time = current.refresh_latent_time
+    refresh_history_count = current.refresh_history_count
     if refreshed:
         goal = g_predict(current.demonstration, robot_history, state)
         _goal(goal)
         chunk, cursor = None, 0
-        if goal_reached(goal, current_goal, thresholds):
+        close = goal_reached(goal, current_goal, thresholds)
+        if confirm_stop and close:
             stopped = replace(current, history=history, history_times=history_times,
                               last_control_time=elapsed, event_state=event_state,
-                              goal=goal, chunk=None, cursor=0, stopped=True)
+                              goal=goal, chunk=None, cursor=0, stopped=True,
+                              completed_subgoals=completed_subgoals,
+                              awaiting_stop_confirmation=False)
             return ControllerStep(stopped, None, events, interrupted, True, True)
+        refresh_control_time = elapsed
+        refresh_latent_time, refresh_history_count = history_times[-1], len(history)
+        awaiting_stop = close
+    following = replace(current, history=history, history_times=history_times,
+                        last_control_time=elapsed, event_state=event_state,
+                        goal=goal, completed_subgoals=completed_subgoals,
+                        refresh_control_time=refresh_control_time,
+                        refresh_latent_time=refresh_latent_time,
+                        refresh_history_count=refresh_history_count,
+                        awaiting_stop_confirmation=awaiting_stop)
+    if awaiting_stop:
+        return ControllerStep(replace(following, chunk=None, cursor=0), None,
+                              events, interrupted, refreshed, False)
     if chunk is None or cursor >= chunk.shape[-1]:
         prediction = pi_predict(robot_history, state, language, goal)
         if (not isinstance(prediction, Tensor) or prediction.ndim != 5 or prediction.shape[0] != 1
@@ -172,7 +221,5 @@ def controller_step(previous: ControllerState, *, frame: Tensor | None, time: fl
         chunk = prediction.detach().clone().flatten(2)
         cursor = 0
     action = chunk[:, :, cursor].clone()
-    following = replace(current, history=history, history_times=history_times,
-                        last_control_time=elapsed, event_state=event_state,
-                        goal=goal, chunk=chunk, cursor=cursor + 1, stopped=False)
+    following = replace(following, chunk=chunk, cursor=cursor + 1, stopped=False)
     return ControllerStep(following, action, events, interrupted, refreshed, False)

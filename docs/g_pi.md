@@ -46,7 +46,7 @@ E_eta 是与语义子目标 `goal_encoder` **参数完全分开的 MLP**，输�
 示例配置的尺度为 z=.03、平移=.005 m、旋转=.03 rad、夹爪=.02，上限 .02 m/10°，候选间距 .1 m。**这些只是 synthetic_dimensions_only 配置的手工示例，不是 G 的实测误差，也不适用于未经核查的真实数据。** 干净 q 永远不加噪、不进入阶段二网络。
 
 ```bash
-.venv/bin/python -m evo_wam.cli calibrate-g-pi-noise \
+.venv/bin/python -m etude.cli calibrate-g-pi-noise \
   --manifest /data/g-validation-residuals.json --output /tmp/pi-noise.json
 ```
 
@@ -55,10 +55,10 @@ E_eta 是与语义子目标 `goal_encoder` **参数完全分开的 MLP**，输�
 ## D：两阶段命令、工件与换 g 诊断
 
 ```bash
-.venv/bin/python -m evo_wam.cli train-goal-interface \
+.venv/bin/python -m etude.cli train-goal-interface \
   --config configs/se3/pi_prior.json --index /data/pi-index.json \
   --stage pi_prior --tiny-native --steps 2 --device cuda --output /tmp/evo-pi-prior
-.venv/bin/python -m evo_wam.cli train-goal-interface \
+.venv/bin/python -m etude.cli train-goal-interface \
   --config configs/se3/pi_goal.json --index /data/pi-index.json \
   --stage pi --initialize /tmp/evo-pi-prior/goal_interface.pt \
   --tiny-native --steps 2 --device cuda --output /tmp/evo-pi
@@ -150,7 +150,7 @@ sim 模式还需 `object_roles` 有序列表和 `geometry: axis_aligned_robot_ba
 候选工具不使用力、触觉、摩擦或质量。它检测：测量夹爪开合、闭合后在非零宽度持续停住、末端平移速度低谷。低谷需看到后续上升才在当前步确认，或持续低速达到稳定窗口才确认。opened/closed 的本体候选不能验证真实视觉关系，因此整个匹配结果保持弱标签。严格匹配可能保守丢弃正常录像，需在真实 SO-101 数据上审计保留率。
 
 ```bash
-.venv/bin/python -m evo_wam.cli generate-g-pi-candidates \
+.venv/bin/python -m etude.cli generate-g-pi-candidates \
   --manifest /data/candidate-spec.json --output /data/candidate-labels.json
 ```
 
@@ -189,10 +189,10 @@ z 停止阈值没有默认值。程序调用需显式 GoalThresholds(z=...)；po
 标定计算同意图、对应子目标的跨录像离散度、相邻目标距离和可选到达误差。各维正样本最大值构成下界，再在可分离范围内取 margin_fraction（默认一半）。每个相邻对只需至少一维超出阈值，符合控制器的 AND 条件；并非要求四个维度都能区分。最终重验所有正样本被接受、所有相邻目标被拒绝；无解则 ValueError，不自动放宽。跨场景离散是保守的验证分布容差，不等于纯传感噪声，也不是统计置信保证。
 
 ```bash
-.venv/bin/python -m evo_wam.cli calibrate-g-pi-stop \
+.venv/bin/python -m etude.cli calibrate-g-pi-stop \
   --manifest /data/validation.json --artifact /tmp/evo-pi/goal_interface.pt \
   --device cuda --output /data/stop-calibration.json
-.venv/bin/python -m evo_wam.cli export-goal-policy \
+.venv/bin/python -m etude.cli export-goal-policy \
   --artifact /tmp/evo-pi/goal_interface.pt --calibration /data/stop-calibration.json \
   --output /tmp/evo-pi-policy
 # 或用 --stop-thresholds /data/thresholds.json；文件需恰含
@@ -204,17 +204,17 @@ z 停止阈值没有默认值。程序调用需显式 GoalThresholds(z=...)；po
 ## 训练、部署及范围
 
 ```bash
-.venv/bin/python -m evo_wam.cli train-goal-interface \
+.venv/bin/python -m etude.cli train-goal-interface \
   --config configs/se3/g_translator.json --index /data/g-index.json \
   --intent-groups /data/purpose-v1.json \
   --stage g --tiny-native --steps 2 --device cuda --output /tmp/evo-g
-.venv/bin/python -m evo_wam.cli train-goal-interface \
+.venv/bin/python -m etude.cli train-goal-interface \
   --config configs/se3/pi_goal.json --index /data/pi-index.json \
   --stage pi --initialize /tmp/evo-pi-prior/goal_interface.pt \
   --tiny-native --steps 2 --device cuda --output /tmp/evo-pi
 # 续训保留同配置/index/seed并添加 --resume 对应 goal_interface.pt。
 # 本轮仅验证 tiny；真实训练还需审计配置并提供本地 --checkpoint。
-.venv/bin/python -m evo_wam.cli predict-goal-policy \
+.venv/bin/python -m etude.cli predict-goal-policy \
   --policy /tmp/evo-pi-policy --observation /data/pi-observation.json \
   --device cuda --seed 0 --output /data/actions.npz
 ```

@@ -49,7 +49,7 @@ A `native_icl_index` JSON has `format_version: 1`, `kind: "native_icl_index"`, a
 `preprocess-icl-video` caches one screened, continuous local clip with the frozen Wan VAE:
 
 ```bash
-evo-wam preprocess-icl-video \
+etude preprocess-icl-video \
   --manifest /server/data/raw-human-a.json \
   --output /server/data/human-a --device cuda
 ```
@@ -108,7 +108,7 @@ The variant NPZ contains only `latent` and `frame_times`, matches A's `[C,F,H,W]
 Use a reviewed copy of the configuration with the real-data marker and data/checkpoint constraints set for the experiment:
 
 ```bash
-evo-wam train-native-icl \
+etude train-native-icl \
   --config /server/configs/H1_cross_video.json \
   --index /server/data/native-icl-index.json \
   --checkpoint /server/zero-wam \
@@ -120,7 +120,7 @@ evo-wam train-native-icl \
 For H1, export merges the learned LoRA adapters into the original model's linear layers and writes native checkpoint files:
 
 ```bash
-evo-wam export-native-icl \
+etude export-native-icl \
   --artifact /server/runs/H1/native_icl.pt \
   --checkpoint /server/zero-wam \
   --device cpu --output /server/models/H1
@@ -130,7 +130,7 @@ Use the H1 merged model through the original Zero-WAM demonstration/robot infere
 
 With H2/H3 enabled, training and resume explicitly preserve the compressor, its adapter, and LoRA parameters together with optimizer/RNG state. `export-native-icl` instead writes a dedicated bundle with root `bottleneck.json`, `demo_bottleneck.pt`, and nested merged backbone weights. Loading the bundle root as a stock Zero-WAM checkpoint is intentionally unsupported: dropping the interface would change the trained model.
 
-`evo_wam.icl_deployment.load_bottleneck_deployment(path)` restores the native model and null text embedding. `evo_wam.demo_context.cache_demo_context` prepares a demonstration through the restored compressor. Initialize the demo in an empty native cache before adding robot observations, as the original server reset does; replacing a context without resetting is rejected so previous tasks or observations cannot contaminate its encoding. For the original Zero-WAM server, call `evo_wam.icl_deployment.attach_bottleneck_server(server, bundle)` before the first reset or inference. Construct that server with its transformer path resolving to the bundle's `backbone` directory (for example, using a model-resource symlink); retain the original VAE, tokenizer, and text encoder resources. The helper verifies the loaded transformer's origin, attaches the interface without loading a second backbone, and retains the original video/action sampler. The server must use ICL, cache name `pos`, and the trained `icl_rope_h`.
+`etude.icl_deployment.load_bottleneck_deployment(path)` restores the native model and null text embedding. `etude.demo_context.cache_demo_context` prepares a demonstration through the restored compressor. Initialize the demo in an empty native cache before adding robot observations, as the original server reset does; replacing a context without resetting is rejected so previous tasks or observations cannot contaminate its encoding. For the original Zero-WAM server, call `etude.icl_deployment.attach_bottleneck_server(server, bundle)` before the first reset or inference. Construct that server with its transformer path resolving to the bundle's `backbone` directory (for example, using a model-resource symlink); retain the original VAE, tokenizer, and text encoder resources. The helper verifies the loaded transformer's origin, attaches the interface without loading a second backbone, and retains the original video/action sampler. The server must use ICL, cache name `pos`, and the trained `icl_rope_h`.
 
 The attached server's demonstration input is an audited `preprocess-icl-video` cache (`clip.npz` with adjacent `clip.json`), with matching feature-space identity and explicit frame timestamps. It does not fall back to the old raw-video or `.pth` loader. All deployment parameters are frozen; no test-time training occurs. The appearance variant is needed for consistency training, not deployment.
 

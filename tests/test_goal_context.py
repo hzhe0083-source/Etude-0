@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.goal_context import observed_context_features
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.goal_context import observed_context_features
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_native_icl import tiny_model
 
 

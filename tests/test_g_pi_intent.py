@@ -8,10 +8,10 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_intent import (IntentDemo, intent_contrastive_loss, intent_table_files,
+from etude.g_pi_intent import (IntentDemo, intent_contrastive_loss, intent_table_files,
                                 load_intent_demo, load_intent_table, ordered_intent_similarity,
                                 sample_intent_batch)
-from evo_wam.icl_data import LATENT_NORMALIZATION
+from etude.icl_data import LATENT_NORMALIZATION
 from test_g_pi_data import write_g_pi_task
 
 
@@ -173,7 +173,7 @@ class IntentDataTest(unittest.TestCase):
             path.write_text(json.dumps(document))
             table = load_intent_table(path)
             # Fix first group while leaving source shuffles driven by the RNG.
-            with patch("evo_wam.g_pi_intent.torch.randint", return_value=torch.tensor(0)):
+            with patch("etude.g_pi_intent.torch.randint", return_value=torch.tensor(0)):
                 batch = sample_intent_batch(table, torch.Generator().manual_seed(4))
             self.assertEqual({entry.purpose_group for entry in batch}, {"purpose-0", "purpose-1"})
             self.assertTrue(any(a.scene_id == b.scene_id and a.purpose_group != b.purpose_group

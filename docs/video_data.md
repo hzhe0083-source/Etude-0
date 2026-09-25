@@ -1,6 +1,6 @@
 # Unpaired video pretraining data
 
-`evo_wam.video_data` accepts one continuous, single-view feature window. Human
+`etude.video_data` accepts one continuous, single-view feature window. Human
 video does not need a matching robot execution, actions, task-role labels or a
 second camera. Robot replay can use the same schema and feature encoder. The
 loader never manufactures a human/robot pair from task names or filenames.

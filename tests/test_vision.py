@@ -16,8 +16,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from evo_wam.video_data import patch_grid_coordinates
-from evo_wam.vision import encode_rgb, load_vae, preprocess, preprocess_video, read_video, robot_features, sha256
+from etude.video_data import patch_grid_coordinates
+from etude.vision import encode_rgb, load_vae, preprocess, preprocess_video, read_video, robot_features, sha256
 
 
 class Capture:
@@ -160,7 +160,7 @@ class VideoPretrainManifestTest(unittest.TestCase):
                            {"source_group": ""}, {"clip_start_seconds": 1}, {"split": "validation/test"}):
                 path = root / "raw.json"
                 path.write_text(json.dumps({**spec, **change}))
-                with self.subTest(change=change), patch("evo_wam.vision.read_video") as reader:
+                with self.subTest(change=change), patch("etude.vision.read_video") as reader:
                     with self.assertRaises(ValueError):
                         preprocess_video(path, root / "output", device="cpu", vae=object())
                     reader.assert_not_called()
@@ -306,7 +306,7 @@ class NativeWanVaeTest(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("cv2"), "native OpenCV extra is unavailable")
     def test_single_unpaired_video_emits_patch_windows_at_actual_source_seconds(self):
         import cv2
-        from evo_wam.video_data import load_video_index, load_video_window
+        from etude.video_data import load_video_index, load_video_window
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -368,7 +368,7 @@ class NativeWanVaeTest(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("cv2"), "native OpenCV extra is unavailable")
     def test_real_raw_preprocessing_loads_v2_observation_with_explicit_test_provenance(self):
         import cv2
-        from evo_wam.data import load_observation
+        from etude.data import load_observation
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -484,7 +484,7 @@ class NativeWanVaeTest(unittest.TestCase):
 
             # Exercise the real local B artifact loader after one synthetic
             # future-feature update; this is not a trained robotics result.
-            from evo_wam.video_effects import EffectFeaturePredictor, VideoEffectEncoder
+            from etude.video_effects import EffectFeaturePredictor, VideoEffectEncoder
             with torch.random.fork_rng():
                 torch.manual_seed(19)
                 effect_encoder = VideoEffectEncoder(2, latent_dim=4, num_tokens=2, hidden_dim=8, noise_std=.2)
@@ -538,7 +538,7 @@ class NativeWanVaeTest(unittest.TestCase):
                 self.assertFalse((root / "rejected-artifact").exists())
             torch.save({**payload, "feature_kind_updates": {"patches": 0, "tracked_entities": 1}}, artifact)
             encoded_path.write_text(json.dumps({**encoded_spec, "demo_encoder_sha256": sha256(artifact)}))
-            with patch("evo_wam.vision.encode_rgb", side_effect=AssertionError("untrained patch route must fail before video encoding")):
+            with patch("etude.vision.encode_rgb", side_effect=AssertionError("untrained patch route must fail before video encoding")):
                 with self.assertRaisesRegex(ValueError, "no successful patches updates"):
                     preprocess(encoded_path, root / "untrained-patch-route", device="cpu", vae=self.vae)
 

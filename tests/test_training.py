@@ -7,11 +7,11 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from evo_wam.contracts import EffectRequirement, PhysicalOutcome, TaskRequirement
-from evo_wam.models import (CausalEffectPredictor, EffectReader, RequirementCodec,
+from etude.contracts import EffectRequirement, PhysicalOutcome, TaskRequirement
+from etude.models import (CausalEffectPredictor, EffectReader, RequirementCodec,
                             TemporalInteractionHead)
-from evo_wam.training import EvoTrainer, LossWeights, TrainingBatch
-from evo_wam.zerowam import GeneratedFuture, NativeOutput
+from etude.training import EvoTrainer, LossWeights, TrainingBatch
+from etude.zerowam import GeneratedFuture, NativeOutput
 
 
 def sequence(value):
@@ -260,7 +260,7 @@ class TrainingTests(unittest.TestCase):
             stream[key] = stream[key].repeat(1, 1, 2, 1, 1)
         batch.native_inputs["chunk_size"] = 1
         batch.entity_patch_weights = torch.ones(1, 2, 4) / 4
-        from evo_wam.zerowam import TaskConditions
+        from etude.zerowam import TaskConditions
         conditions = TaskConditions(torch.ones(1, 2, 4), torch.ones(1, 2, 4), batch.null_text)
         with self.assertRaises(ValueError):
             model._native(batch, conditions, include_action=False, include_interaction=True,
@@ -328,7 +328,7 @@ class TrainingTests(unittest.TestCase):
         self.assertIs(first["mcp_latent_dicts"][0], second["mcp_latent_dicts"][0])
 
     def test_native_training_receives_same_observed_history_for_pairs_and_null_examples(self):
-        from evo_wam.zerowam import NativeHistoryChunk
+        from etude.zerowam import NativeHistoryChunk
         model, batch = trainer(weights=LossWeights(execution=0)), make_batch()
         history = (NativeHistoryChunk("video", torch.ones(1, 4, 1, 1, 2), 0, 0),
                    NativeHistoryChunk("action", torch.zeros(1, 4, 1, 2, 1), 1, 0))

@@ -9,12 +9,12 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_context import frozen_base_checksum
-from evo_wam.g_pi_intent import load_intent_table
-from evo_wam.g_pi_probe import (_data_identity, extract_probe_features, fit_intent_probe,
+from etude.g_pi_context import frozen_base_checksum
+from etude.g_pi_intent import load_intent_table
+from etude.g_pi_probe import (_data_identity, extract_probe_features, fit_intent_probe,
     load_probe_features, ordered_probe_features, probe_g_pi_intent, save_probe_features,
     validate_probe_split)
-from evo_wam.icl_data import LATENT_NORMALIZATION
+from etude.icl_data import LATENT_NORMALIZATION
 
 
 def write_probe_table(folder):
@@ -183,9 +183,9 @@ class IntentProbeTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_tiny_native_demo_only_frozen_extraction_and_artifact_entry(self):
         from test_g_pi_training import config_for
-        from evo_wam.g_pi_training import (build_g_pi_system, _base_reference, _system_state,
+        from etude.g_pi_training import (build_g_pi_system, _base_reference, _system_state,
             g_pi_artifact_version, g_pi_architecture, conditioning_mode)
-        from evo_wam.zerowam import ZERO_WAM_COMMIT
+        from etude.zerowam import ZERO_WAM_COMMIT
 
         config = config_for("g_translator")
         empty_path = self.root / "empty.pt"

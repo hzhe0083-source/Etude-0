@@ -14,10 +14,10 @@ import numpy as np
 import torch
 from torch import nn
 
-from evo_wam import cli
-from evo_wam.data import load_experiment, load_sample, load_observation
-from evo_wam.training import EvoTrainer, LossWeights
-from evo_wam.zerowam import TaskConditions, ZERO_WAM_COMMIT
+from etude import cli
+from etude.data import load_experiment, load_sample, load_observation
+from etude.training import EvoTrainer, LossWeights
+from etude.zerowam import TaskConditions, ZERO_WAM_COMMIT
 
 
 class CheckpointFixture(nn.Module):

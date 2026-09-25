@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from evo_wam.goal_interface import GoalInterface, _rotation_from_6d, goal_pose_loss, validate_goal_poses, validate_se3
+from etude.goal_interface import GoalInterface, _rotation_from_6d, goal_pose_loss, validate_goal_poses, validate_se3
 
 
 class GoalInterfaceTests(unittest.TestCase):

@@ -16,12 +16,12 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 
-from evo_wam.cli import make_fixture
-from evo_wam.contracts import TaskRequirement
-from evo_wam.data import (ObservedActionHistory, load_experiment, load_observation,
+from etude.cli import make_fixture
+from etude.contracts import TaskRequirement
+from etude.data import (ObservedActionHistory, load_experiment, load_observation,
                           load_sample)
-from evo_wam.inference import NativePolicy, RequirementRejected
-from evo_wam.models import GoalTokens, RequirementCodec
+from etude.inference import NativePolicy, RequirementRejected
+from etude.models import GoalTokens, RequirementCodec
 
 
 class SamplerSpy(nn.Module):

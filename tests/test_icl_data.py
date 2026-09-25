@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.icl_data import LATENT_NORMALIZATION, load_icl_index, load_icl_sample
+from etude.icl_data import LATENT_NORMALIZATION, load_icl_index, load_icl_sample
 
 
 def write_sample(root, name="pair", *, robot=False):

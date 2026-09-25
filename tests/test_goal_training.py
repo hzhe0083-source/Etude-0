@@ -14,14 +14,14 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.goal_action import action_named_parameters, goal_action_forward, goal_action_sample
-from evo_wam.goal_data import load_goal_observation, load_goal_sample
-from evo_wam.goal_interface import goal_pose_loss, validate_goal_poses
-from evo_wam.icl_training import native_icl_objective
-from evo_wam.goal_training import (autocast_for, build_goal_system, export_goal_policy, goal_registry,
+from etude.goal_action import action_named_parameters, goal_action_forward, goal_action_sample
+from etude.goal_data import load_goal_observation, load_goal_sample
+from etude.goal_interface import goal_pose_loss, validate_goal_poses
+from etude.icl_training import native_icl_objective
+from etude.goal_training import (autocast_for, build_goal_system, export_goal_policy, goal_registry,
     goal_training_loss, load_goal_config, load_goal_policy, masked_action_loss, predict_goal_actions,
     train_goal_interface, visual_goal_tokens, _restore_system, _system_state)
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_goal_data import write_goal_observation, write_goal_sample
 from test_icl_data import save_sample
 
@@ -166,7 +166,7 @@ class GoalTrainingTest(unittest.TestCase):
         optimizer = torch.optim.AdamW([p for m in (native, interface) for p in m.parameters() if p.requires_grad], lr=.001)
         with patch.object(native, "forward", side_effect=AssertionError("Stage 1 cannot run video WAM")), \
              patch.object(native.patch_embedding_mlp, "forward", side_effect=AssertionError("Stage 1 cannot embed images")), \
-             patch("evo_wam.goal_data.load_icl_sample", side_effect=AssertionError("Stage 1 cannot load images")):
+             patch("etude.goal_data.load_icl_sample", side_effect=AssertionError("Stage 1 cannot load images")):
             sample = load_goal_sample(self.sample_path, visual=False)
             losses = goal_training_loss(native, interface, unused, sample, self.config, self.generators(),
                                        stage="goal", feature_layers=layers)
@@ -267,7 +267,7 @@ class GoalTrainingTest(unittest.TestCase):
         self.assertTrue(any('action_' in n for n in changed))
         self.assertTrue(any('action_' not in n for n in changed))
         policy_dir = self.root / "policy"
-        exported = subprocess.run([sys.executable, "-m", "evo_wam", "export-goal-policy",
+        exported = subprocess.run([sys.executable, "-m", "etude", "export-goal-policy",
             "--artifact", full_visual["artifact"], "--output", str(policy_dir), "--max-shard-size", "50KB"],
             env={**os.environ, "PYTHONHASHSEED": "54321"}, capture_output=True, text=True, timeout=60)
         self.assertEqual(exported.returncode, 0, exported.stderr)
@@ -300,7 +300,7 @@ class GoalTrainingTest(unittest.TestCase):
         self.assertTrue(((prediction['goal_gripper'] >= 0) & (prediction['goal_gripper'] <= 1)).all())
         self.assert_same(frozen, _system_state(native, interface, True))
         prediction_path = self.root / "prediction.npz"
-        predicted = subprocess.run([sys.executable, "-m", "evo_wam", "predict-goal-policy",
+        predicted = subprocess.run([sys.executable, "-m", "etude", "predict-goal-policy",
             "--policy", str(policy_dir), "--observation", str(observation_path), "--output", str(prediction_path),
             "--device", "cuda", "--seed", "17"], env={**os.environ, "PYTHONHASHSEED": "12345"},
             capture_output=True, text=True, timeout=90)

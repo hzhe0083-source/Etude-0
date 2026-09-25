@@ -1,6 +1,6 @@
 # RoboTwin execution bridge
 
-`evo_wam.robotwin` connects normalized model commands to an already initialized
+`etude.robotwin` connects normalized model commands to an already initialized
 RoboTwin episode. Full weights, RoboTwin, assets and visual entity tracks are
 server-side inputs. No weights are downloaded by this module. Local tests use a
 fake environment and verify API/control semantics, **not simulator performance**.
@@ -73,7 +73,7 @@ must be identified separately.
 ## Server entry point
 
 ```bash
-python -m evo_wam.robotwin \
+python -m etude.robotwin \
   --factory server_episode:build \
   --config /server/configs/oracle_episode.json \
   --output /server/results/oracle_episode.json
@@ -90,7 +90,7 @@ deployment-specific objects:
    is used for entity features, explicitly label the result as oracle perception.
 2. A requirement provider tied to the current observation, with its source ID.
 3. `NativePolicy.from_artifact(config["artifact"], checkpoint=config["checkpoint"],
-   device="cuda").oracle_candidate`, loading the Evo-WAM artifact and base weights
+   device="cuda").oracle_candidate`, loading the Etude artifact and base weights
    from configured local server paths. The bridge neither locates nor downloads
    them; weights may remain path placeholders until server training completes.
 4. `Provenance(kind="simulated", ...)` identifying the actual policy, checkpoint,
@@ -104,7 +104,7 @@ owns action conversion, prefix execution, history recording and dual reporting.
 The model part of the factory is only:
 
 ```python
-from evo_wam.inference import NativePolicy
+from etude.inference import NativePolicy
 
 native_policy = NativePolicy.from_artifact(
     config["artifact"], checkpoint=config["checkpoint"], device="cuda"

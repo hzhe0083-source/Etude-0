@@ -4,9 +4,9 @@ import unittest
 
 import torch
 
-from evo_wam.contracts import (EffectRequirement, PhysicalOutcome, BINDING_UNUSED,
+from etude.contracts import (EffectRequirement, PhysicalOutcome, BINDING_UNUSED,
                                BINDING_UNMATCHED, BINDING_UNCERTAIN)
-from evo_wam.models import (
+from etude.models import (
     CausalEffectPredictor, EffectReader, PhysicalPrediction, RequirementCodec,
     TemporalInteractionHead, decoded_requirement_loss, effect_cost,
     physical_prediction_loss,

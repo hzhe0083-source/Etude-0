@@ -8,9 +8,9 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_data import EventRules, load_g_pi_sample
-from evo_wam.icl_preprocess import encode_g_pi_frames
-from evo_wam.vision import encode_rgb
+from etude.g_pi_data import EventRules, load_g_pi_sample
+from etude.icl_preprocess import encode_g_pi_frames
+from etude.vision import encode_rgb
 from test_g_pi_data import write_g_pi_task
 
 
@@ -21,7 +21,7 @@ class GPreprocessContractTest(unittest.TestCase):
         for times, stride in ((torch.arange(10).double() * .1, 1),
                               (torch.arange(11).double() * .2, 1),
                               (torch.arange(11).double() * .1, 0)):
-            with self.subTest(stride=stride), patch("evo_wam.icl_preprocess.encode_rgb") as encode:
+            with self.subTest(stride=stride), patch("etude.icl_preprocess.encode_rgb") as encode:
                 with self.assertRaises(ValueError):
                     encode_g_pi_frames(None, frames, times, gripper, frame_stride=stride,
                                        control_dt=.1, event_rules=EventRules(), size=[32, 48])
@@ -45,7 +45,7 @@ class NativeGPreprocessTest(unittest.TestCase):
         frames = self.fixture.frames(self, 19)
         times = np.arange(19, dtype=np.float64) * .1
         gripper = np.array([[0.]] * 10 + [[1.]] * 9, dtype=np.float32)
-        with patch("evo_wam.icl_preprocess.encode_rgb", wraps=encode_rgb) as encode:
+        with patch("etude.icl_preprocess.encode_rgb", wraps=encode_rgb) as encode:
             arrays, metadata = encode_g_pi_frames(self.vae, frames, times, gripper,
                 frame_stride=2, control_dt=.1, event_rules=EventRules(), size=[32, 48])
         self.assertEqual([len(call.args[1]) for call in encode.call_args_list], [9, 1, 1])

@@ -5,7 +5,7 @@ import sys
 import torch
 from torch import nn
 
-from evo_wam.zerowam import (NativeDependencyError, NativeHistoryChunk, TaskConditions, VideoLoRA, ZeroWAMAdapter,
+from etude.zerowam import (NativeDependencyError, NativeHistoryChunk, TaskConditions, VideoLoRA, ZeroWAMAdapter,
                              load_native_class,
                              optional_flash_source, _LEGACY_FLASH_IMPORT, _OptionalFlashFinder,
                              route_allowed, tiny_native_smoke, unpack_velocity,

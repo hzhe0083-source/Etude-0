@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from evo_wam.data import (
+from etude.data import (
     TaskCondition, assign_splits, connected_components, executed_prefix_valid,
     load_experiment, load_observation, load_sample, paired_dropout_disabled, prepare_training_input,
     shared_denoising_inputs, validate_demo_encoding, validate_splits,

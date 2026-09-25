@@ -108,7 +108,7 @@ Inference instead accepts `se3_goal_observation` version 2. It contains the same
 Cache each explicitly supplied instruction with the local pretrained model's `text_encoder/` and `tokenizer/` components:
 
 ```bash
-evo-wam cache-goal-language \
+etude cache-goal-language \
   --text "Operate the drawer as demonstrated." \
   --checkpoint /models/zero-wam --device cuda \
   --output /data/evo/language/drawer
@@ -123,12 +123,12 @@ The manifest records the original instruction and its hash, cleaned instruction,
 [`configs/se3/goal_interface.json`](../configs/se3/goal_interface.json) declares `schema_version: 2` and `interface_type: "latent"`. It still has `synthetic_dimensions_only: true`: `state_dim: 4`, chunk length, sampler steps, and training budget are placeholders. Audit these against collected robot data before formal training. `domain_schedule: ["robot"]` describes supervised targets and does not prohibit human references.
 
 ```bash
-evo-wam train-goal-interface \
+etude train-goal-interface \
   --config /data/evo/se3-config.json --index /data/evo/goal-index.json \
   --stage goal --checkpoint /models/zero-wam --device cuda \
   --steps 1000 --seed 0 --output outputs/se3-stage1
 
-evo-wam train-goal-interface \
+etude train-goal-interface \
   --config /data/evo/se3-config.json --index /data/evo/visual-goal-index.json \
   --stage visual --checkpoint /models/zero-wam --device cuda \
   --initialize outputs/se3-stage1/goal_interface.pt \
@@ -144,11 +144,11 @@ A new run/export needs a fresh output directory. `--tiny-native` replaces `--che
 ## Complete deployment export and frozen inference
 
 ```bash
-evo-wam export-goal-policy \
+etude export-goal-policy \
   --artifact outputs/se3-stage2/goal_interface.pt \
   --output outputs/se3-policy --dtype float32 --max-shard-size 2GB
 
-evo-wam predict-goal-policy \
+etude predict-goal-policy \
   --policy outputs/se3-policy \
   --observation /data/evo/current-observation.json --device cuda --seed 0 \
   --output outputs/se3-prediction.npz
@@ -156,7 +156,7 @@ evo-wam predict-goal-policy \
 
 Export requires successful updates in both stages. It writes complete native/interface **safetensors shards** plus `policy.json`, with construction configuration, dtype, weight map, and shard checksums. `--dtype` selects `float32` (default) or `bfloat16`; this is a deployment choice, not a change to training master precision. Loading reconstructs the separate action K/V modules, strictly restores the full state, validates shard integrity, and freezes all parameters. **No external base checkpoint is needed to load this policy.** Cached language and visual inputs still need their corresponding preprocessing components when new raw inputs are prepared.
 
-Training recovery and deployment export are distinct formats. A deployment bundle has no optimizer/RNG recovery state and cannot replace the full FP32 training artifact. The dedicated `load_goal_policy` and `predict_goal_actions` functions in [`goal_training.py`](../src/evo_wam/goal_training.py) execute the same per-layer conditions as training. An original unmodified Zero-WAM server is not a substitute for this loader.
+Training recovery and deployment export are distinct formats. A deployment bundle has no optimizer/RNG recovery state and cannot replace the full FP32 training artifact. The dedicated `load_goal_policy` and `predict_goal_actions` functions in [`goal_training.py`](../src/etude/goal_training.py) execute the same per-layer conditions as training. An original unmodified Zero-WAM server is not a substitute for this loader.
 
 Prediction outputs `actions` and `generated_future`; the main latent route additionally outputs diagnostic `goal_poses` and `goal_gripper`. The direct-feature baseline has no goal decoder output. All weights stay frozen; changing a demonstration is test-time ICL, not task-specific fine-tuning. Actions are normalized model outputs, not robot commands. The CLI sends zero commands and supplies no closed-loop controller.
 

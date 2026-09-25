@@ -152,10 +152,10 @@ FlashAttention未安装；固定上游的未用legacy导入仍通过明确加载
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -q
-.venv/bin/evo-wam make-fixture --output outputs/fixture-v2
-.venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage interface --steps 1 --output outputs/interface-v2
-.venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage reader --initialize outputs/interface-v2/adapter.pt --steps 1 --output outputs/reader-v2
-.venv/bin/evo-wam train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage joint --initialize outputs/reader-v2/adapter.pt --steps 1 --output outputs/joint-v2
+.venv/bin/etude make-fixture --output outputs/fixture-v2
+.venv/bin/etude train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage interface --steps 1 --output outputs/interface-v2
+.venv/bin/etude train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage reader --initialize outputs/interface-v2/adapter.pt --steps 1 --output outputs/reader-v2
+.venv/bin/etude train --config configs/V1.json --index outputs/fixture-v2/index.json --tiny-native --seed 1 --stage joint --initialize outputs/reader-v2/adapter.pt --steps 1 --output outputs/joint-v2
 ```
 
 seed 1 的该数值 fixture 进入条件分支；seed 0 的首步进入无条件分支，两条路径本轮均实际运行。暖启动计数是当前阶段的成功优化更新数；联合阶段无条件原生更新也计数，reader阶段无条件批次不更新、不推进计数。

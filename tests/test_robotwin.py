@@ -13,9 +13,9 @@ try:
 except ImportError:
     Rotation = None
 
-from evo_wam.evaluation import Candidate, Provenance
-from evo_wam.inference import RequirementRejected
-from evo_wam.robotwin import (
+from etude.evaluation import Candidate, Provenance
+from etude.inference import RequirementRejected
+from etude.robotwin import (
     RoboTwinBridge, RobotwinActionTransform, USED_CHANNELS,
     run_oracle_requirement,
 )

@@ -6,14 +6,14 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.g_pi_context import (
+from etude.g_pi_context import (
     FrozenGoalEncoder, assert_frozen_base, build_demo_cache, frozen_base_checksum,
     g_attention_mask, g_context_features, install_empty_text, load_target_cache, pi_context_features,
     demo_context_features, split_g_context_features,
     save_target_cache, truncate_robot_history, validate_camera_layout,
 )
-from evo_wam.goal_action import action_named_parameters, install_action_interface
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.goal_action import action_named_parameters, install_action_interface
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_native_icl import tiny_model
 
 
@@ -52,7 +52,7 @@ class GPiContextTests(unittest.TestCase):
             seen.append(history)
             return {0: history}, ()
 
-        with patch("evo_wam.g_pi_context._context", side_effect=record):
+        with patch("etude.g_pi_context._context", side_effect=record):
             g_context_features(None, torch.zeros_like(frames), frames, CONFIG, current_index=2)
             pi_context_features(None, frames, CONFIG, current_index=2)
         self.assertTrue(all(value.shape[2] == 3 and torch.isfinite(value).all() for value in seen))
@@ -108,7 +108,7 @@ class GPiNativeContextTests(unittest.TestCase):
         spatial[:, 1, :, :2], spatial[:, 1, :, 2:] = -1, 1
         spatial[:, 2, :2, :], spatial[:, 2, 2:, :] = -2, 2
         features = spatial.flatten(2).transpose(1, 2)
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value={1: features}):
+        with patch("etude.g_pi_context.pi_context_features", return_value={1: features}):
             z = encoder(torch.zeros(1, 4, 1, 4, 4))
         expected = torch.zeros(1, 4, native.inner_dim)
         expected[0, :, :3] = torch.tensor([[1., -1., -2.], [1., 1., -2.],
@@ -150,7 +150,7 @@ class GPiNativeContextTests(unittest.TestCase):
         spatial = torch.zeros(1, native.inner_dim, 2, 5)
         spatial[:, 0, :, :3] = 1
         spatial[:, 1, :, 3:] = 1
-        with patch("evo_wam.g_pi_context.pi_context_features",
+        with patch("etude.g_pi_context.pi_context_features",
                    return_value={1: spatial.flatten(2).transpose(1, 2)}):
             z = encoder(torch.zeros(1, 4, 1, 2, 5))
         expected = torch.zeros(1, 8, native.inner_dim)
@@ -264,8 +264,8 @@ class GPiNativeContextTests(unittest.TestCase):
         demo, robot = split_g_context_features(native, demonstration, history, isolated)
         other_demo, other_robot = split_g_context_features(native, demonstration + 7, history, isolated)
         cached = build_demo_cache(native, demonstration, isolated)
-        with patch("evo_wam.g_pi_context._context", wraps=__import__(
-                "evo_wam.g_pi_context", fromlist=["_context"])._context) as context:
+        with patch("etude.g_pi_context._context", wraps=__import__(
+                "etude.g_pi_context", fromlist=["_context"])._context) as context:
             cached_demo = demo_context_features(native, demonstration, isolated, demo_cache=cached)
             self.assertEqual(context.call_count, 0)
         for layer in range(2):

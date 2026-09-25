@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.g_pi_distributed import distributed_settings, process_group
-from evo_wam.g_pi_training import (export_g_pi_policy, load_g_pi_policy, read_g_pi_artifact,
+from etude.g_pi_distributed import distributed_settings, process_group
+from etude.g_pi_training import (export_g_pi_policy, load_g_pi_policy, read_g_pi_artifact,
                                   train_g_pi_interface, _system_state, validate_g_pi_config)
 from test_g_pi_training import config_for, contract_payload, explicit_thresholds
 
@@ -42,21 +42,21 @@ class DistributedPiContractTest(unittest.TestCase):
             read_g_pi_artifact(None, payload=payload)
 
     def test_rank_consensus_and_consumed_input_mismatch_are_rejected(self):
-        from evo_wam.g_pi_distributed import rank_consensus, merge_input_hashes
+        from etude.g_pi_distributed import rank_consensus, merge_input_hashes
 
         def records(values):
             def gather(output, value):
                 output[:] = values
             return gather
 
-        with patch("evo_wam.g_pi_distributed.dist.get_world_size", return_value=2):
-            with patch("evo_wam.g_pi_distributed.dist.all_gather_object", side_effect=records([{"base": "a"}, {"base": "b"}])):
+        with patch("etude.g_pi_distributed.dist.get_world_size", return_value=2):
+            with patch("etude.g_pi_distributed.dist.all_gather_object", side_effect=records([{"base": "a"}, {"base": "b"}])):
                 with self.assertRaisesRegex(ValueError, "ranks disagree"):
                     rank_consensus({"base": "a"})
-            with patch("evo_wam.g_pi_distributed.dist.all_gather_object", side_effect=records([{"task": "a"}, {"task": "b"}])):
+            with patch("etude.g_pi_distributed.dist.all_gather_object", side_effect=records([{"task": "a"}, {"task": "b"}])):
                 with self.assertRaisesRegex(ValueError, "inputs differ"):
                     merge_input_hashes({}, {"task": "a"})
-            with patch("evo_wam.g_pi_distributed.dist.all_gather_object", side_effect=records([{"task-a": "a"}, {"task-b": "b"}])):
+            with patch("etude.g_pi_distributed.dist.all_gather_object", side_effect=records([{"task-a": "a"}, {"task-b": "b"}])):
                 self.assertEqual(merge_input_hashes({"old": "c"}, {}),
                                  {"task-a": "a", "task-b": "b", "old": "c"})
 
@@ -115,10 +115,10 @@ def worker():
         # partial path was resumed to step two, so compare to a fresh AC step.
         one_ac = read_g_pi_artifact(train_g_pi_interface(args("one-ac"))["artifact"])
         fixture.assert_same(one_ac["model"], without_ac["model"])
-        from evo_wam.g_pi_data import load_g_pi_sample
-        from evo_wam.g_pi_distributed import process_group, shard_pi, distributed_checksum
-        from evo_wam.g_pi_training import build_g_pi_system, _optimizer
-        from evo_wam.goal_training import goal_registry
+        from etude.g_pi_data import load_g_pi_sample
+        from etude.g_pi_distributed import process_group, shard_pi, distributed_checksum
+        from etude.g_pi_training import build_g_pi_system, _optimizer
+        from etude.goal_training import goal_registry
         from torch.distributed.fsdp import FSDPModule
         config = config_for("pi_goal")
         config["distributed"] = {"enabled": True, "activation_checkpointing": True}

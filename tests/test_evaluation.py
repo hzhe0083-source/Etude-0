@@ -5,7 +5,7 @@ import json
 import math
 import unittest
 
-from evo_wam.evaluation import (
+from etude.evaluation import (
     Candidate, InferenceCache, Provenance, closed_loop, local_oracle_at_4,
     prefix_length, rank_candidates, replay_candidate, result_json, select_baseline,
 )

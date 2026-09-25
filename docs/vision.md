@@ -7,8 +7,8 @@
 资源清单是交接模板，不能直接作为实验配置。
 
 ```bash
-evo-wam preprocess-visual --manifest /server/episode/raw.json --output /server/episode/encoded
-evo-wam predict --artifact /server/runs/joint/adapter.pt --checkpoint /server/zero-wam \
+etude preprocess-visual --manifest /server/episode/raw.json --output /server/episode/encoded
+etude predict --artifact /server/runs/joint/adapter.pt --checkpoint /server/zero-wam \
   --manifest /server/episode/encoded/observation.json --output /server/prediction
 ```
 

@@ -1,4 +1,4 @@
-"""Stage objectives and optimizer steps for the existing Evo-WAM modules.
+"""Stage objectives and optimizer steps for the existing Etude modules.
 
 Robot denoising inputs are constructed once outside the trainer and reused by
 the optional view pair. Sampling accepts only noise plus actual history, never a

@@ -14,12 +14,12 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.cli import make_fixture, file_sha256
-from evo_wam.data import load_sample
-from evo_wam.models import EffectReader
-from evo_wam.video_cli import (build_video_models, encode_demonstrations, evaluate_video,
+from etude.cli import make_fixture, file_sha256
+from etude.data import load_sample
+from etude.models import EffectReader
+from etude.video_cli import (build_video_models, encode_demonstrations, evaluate_video,
                                load_video_config, load_video_encoder, train_video)
-from evo_wam.video_data import load_video_window, patch_grid_coordinates, validate_video_sources
+from etude.video_data import load_video_window, patch_grid_coordinates, validate_video_sources
 
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs" / "video"
@@ -140,8 +140,8 @@ class VideoCliTests(unittest.TestCase):
         config_path.write_text(json.dumps(config))
         torch.manual_seed(37)
         initial_encoder, initial_predictor = build_video_models(config, "cpu")
-        with patch("evo_wam.video_cli.VideoEffectEncoder.forward", side_effect=AssertionError("no supervised target")), \
-             patch("evo_wam.video_cli.EffectFeaturePredictor.forward", side_effect=AssertionError("no supervised target")):
+        with patch("etude.video_cli.VideoEffectEncoder.forward", side_effect=AssertionError("no supervised target")), \
+             patch("etude.video_cli.EffectFeaturePredictor.forward", side_effect=AssertionError("no supervised target")):
             report = train_video(self.arguments(index=index, config=config_path))
         self.assertEqual(report["updates"], 0)
         self.assertEqual(report["domain_updates"], {"robot": 0, "human": 0})

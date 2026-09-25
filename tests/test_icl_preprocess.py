@@ -9,8 +9,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.icl_preprocess import preprocess_icl_video
-from evo_wam.vision import encode_rgb, read_video, sha256
+from etude.icl_preprocess import preprocess_icl_video
+from etude.vision import encode_rgb, read_video, sha256
 
 
 def raw_spec():
@@ -33,7 +33,7 @@ class IclPreprocessContractTest(unittest.TestCase):
                            {"geometry": []}, {"roi": []}, {"vae_sha256": {}},
                            {"vae_sha256": {"config.json": "bad-digest"}}, {"video": "https://example.com/clip"}):
                 path.write_text(json.dumps({**raw_spec(), **change}))
-                with self.subTest(change=change), patch("evo_wam.icl_preprocess.read_video") as reader:
+                with self.subTest(change=change), patch("etude.icl_preprocess.read_video") as reader:
                     with self.assertRaises(ValueError):
                         preprocess_icl_video(path, root / "out", device="cpu", vae=object())
                     reader.assert_not_called()
@@ -50,16 +50,16 @@ class IclPreprocessContractTest(unittest.TestCase):
             for latent in (torch.zeros(1, 2, 2, 2, 3), torch.full((1, 2, 3, 2, 3), float("nan")),
                            torch.zeros(1, 2, 3, 2, 3, dtype=torch.int64)):
                 with self.subTest(shape=latent.shape, dtype=latent.dtype), \
-                        patch("evo_wam.icl_preprocess.read_video", return_value=(frames, sampling)), \
-                        patch("evo_wam.icl_preprocess.encode_rgb", return_value=latent):
+                        patch("etude.icl_preprocess.read_video", return_value=(frames, sampling)), \
+                        patch("etude.icl_preprocess.encode_rgb", return_value=latent):
                     with self.assertRaisesRegex(ValueError, "one time per causal endpoint"):
                         preprocess_icl_video(path, root / "out", vae=object())
                 self.assertFalse((root / "out").exists())
             for malformed in ({"source_fps": float("inf")}, {"frame_indices": [0] * 9},
                               {"frame_indices": list(range(8))}, {"frame_indices": list(np.arange(9.))}):
                 with self.subTest(sampling=malformed), \
-                        patch("evo_wam.icl_preprocess.read_video", return_value=(frames, {**sampling, **malformed})), \
-                        patch("evo_wam.icl_preprocess.encode_rgb") as encoder:
+                        patch("etude.icl_preprocess.read_video", return_value=(frames, {**sampling, **malformed})), \
+                        patch("etude.icl_preprocess.encode_rgb") as encoder:
                     with self.assertRaises(ValueError):
                         preprocess_icl_video(path, root / "out", vae=object())
                     encoder.assert_not_called()
@@ -134,7 +134,7 @@ class NativeIclPreprocessTest(unittest.TestCase):
             with np.load(local["arrays"], allow_pickle=False) as archive:
                 np.testing.assert_array_equal(archive["latent"], expected)
             path.write_text(json.dumps({**robot_spec, "vae_sha256": {**identity, "config.json": "0" * 64}}))
-            with patch("evo_wam.icl_preprocess.read_video") as reader:
+            with patch("etude.icl_preprocess.read_video") as reader:
                 with self.assertRaisesRegex(ValueError, "identity mismatch"):
                     preprocess_icl_video(path, root / "bad-identity", device="cpu")
                 reader.assert_not_called()

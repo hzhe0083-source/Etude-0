@@ -1,4 +1,4 @@
-# Evo-WAM
+# Etude
 
 Training native Zero-WAM to use human or robot demonstrations through a robot-goal-supervised action interface.
 
@@ -31,8 +31,8 @@ The base model is [Zero-WAM](https://github.com/robbyant-research/Zero-WAM), pin
 Lightweight checks use Python 3.10, PyTorch 2.9, and the standard-library `unittest` module. Running the native backbone also requires the upstream dependencies; its documented test environment uses PyTorch 2.9.0 / CUDA 12.6. CPU and small-model checks do not replace validation with trained checkpoints, simulation, or real robots.
 
 ```bash
-git clone --recurse-submodules git@github.com:hzhe0083-source/Evo-WAM.git
-cd Evo-WAM
+git clone --recurse-submodules git@github.com:hzhe0083-source/Etude-0.git
+cd Etude-0
 uv venv --python 3.10 .venv
 uv pip install --python .venv/bin/python torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
 uv pip install --python .venv/bin/python -e .
@@ -41,11 +41,11 @@ uv pip install --python .venv/bin/python -e .
 ## Commands
 
 ```bash
-evo-wam doctor
-evo-wam check
-evo-wam make-fixture --output outputs/fixture
-evo-wam validate-data --index outputs/fixture/index.json
-evo-wam check-native
+etude doctor
+etude check
+etude make-fixture --output outputs/fixture
+etude validate-data --index outputs/fixture/index.json
+etude check-native
 ```
 
 The current route uses `cache-goal-language` and `preprocess-icl-video`, then `train-goal-interface --stage joint` with [`configs/se3/observed_dual.json`](configs/se3/observed_dual.json), followed by `export-goal-policy` and `predict-goal-policy`. It starts from the pretrained checkpoint without requiring the earlier nonvisual stage. No LoRA is installed: training keeps FP32 master parameters/optimizer state with BF16 CUDA autocast. Each query supervises one action block. The example sets `state_dim: 12` but remains **synthetic_dimensions_only**; SO101 action mapping, geometric targets, data, and resources still require validation. The output contains actions and predicted robot endpoint pose/gripper, without `generated_future`.

@@ -17,18 +17,18 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.goal_action import action_named_parameters, goal_action_forward, goal_action_sample
-from evo_wam.goal_data import load_goal_observation, load_goal_sample
-from evo_wam.goal_interface import goal_pose_loss, validate_goal_poses
-from evo_wam.goal_observed_interface import ObservedGoalInterface
-from evo_wam.goal_training import (
+from etude.goal_action import action_named_parameters, goal_action_forward, goal_action_sample
+from etude.goal_data import load_goal_observation, load_goal_sample
+from etude.goal_interface import goal_pose_loss, validate_goal_poses
+from etude.goal_observed_interface import ObservedGoalInterface
+from etude.goal_training import (
     ARCHITECTURE, OBSERVED_ARCHITECTURE, _system_state, autocast_for,
     build_goal_system, export_goal_policy, goal_architecture, goal_registry,
     goal_training_loss, load_goal_config, load_goal_policy, masked_action_loss,
     observed_goal_conditions, predict_goal_actions, read_goal_artifact,
     train_goal_interface, validate_goal_config,
 )
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_goal_data import write_goal_observation, write_goal_sample
 from test_icl_data import save_sample
 
@@ -63,7 +63,7 @@ class ObservedGoalConfigTest(unittest.TestCase):
                 validate_goal_config(changed)
 
         # Reject an incompatible stage before constructing/loading a backbone.
-        with patch("evo_wam.goal_training.build_icl_model",
+        with patch("etude.goal_training.build_icl_model",
                    side_effect=AssertionError("invalid stages cannot build a model")):
             for stage in ("goal", "visual"):
                 with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, "requires stage"):
@@ -151,7 +151,7 @@ class ObservedGoalTrainingTest(unittest.TestCase):
     def forbid_video_generation(self, native):
         stack = ExitStack()
         for name in ("generated_robot_features", "native_icl_loss", "prepare_icl_inputs"):
-            stack.enter_context(patch(f"evo_wam.goal_training.{name}",
+            stack.enter_context(patch(f"etude.goal_training.{name}",
                                       side_effect=AssertionError(f"joint training cannot call {name}")))
         stack.enter_context(patch.object(native.proj_out, "forward",
                             side_effect=AssertionError("joint training has no video output head")))
@@ -311,7 +311,7 @@ class ObservedGoalTrainingTest(unittest.TestCase):
             train_goal_interface(self.args("wrong-resume", resume=str(wrong_path)))
 
         policy_dir = self.root / "policy"
-        exported = subprocess.run([sys.executable, "-m", "evo_wam", "export-goal-policy",
+        exported = subprocess.run([sys.executable, "-m", "etude", "export-goal-policy",
             "--artifact", full_report["artifact"], "--output", str(policy_dir), "--max-shard-size", "50KB"],
             env={**os.environ, "PYTHONHASHSEED": "54321"}, capture_output=True, text=True, timeout=60)
         self.assertEqual(exported.returncode, 0, exported.stderr)
@@ -345,7 +345,7 @@ class ObservedGoalTrainingTest(unittest.TestCase):
         # The deployment bundle is sufficient after the training artifact disappears.
         Path(full_report["artifact"]).unlink()
         prediction_path = self.root / "prediction.npz"
-        predicted = subprocess.run([sys.executable, "-m", "evo_wam", "predict-goal-policy",
+        predicted = subprocess.run([sys.executable, "-m", "etude", "predict-goal-policy",
             "--policy", str(policy_dir), "--observation", str(observation_path), "--output", str(prediction_path),
             "--device", "cuda", "--seed", "17"], env={**os.environ, "PYTHONHASHSEED": "12345"},
             capture_output=True, text=True, timeout=90)

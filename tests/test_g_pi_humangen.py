@@ -9,14 +9,14 @@ import unittest
 import numpy as np
 import torch
 
-from evo_wam.g_pi_data import EventRules, load_g_pi_index, load_g_pi_sample, subgoal_control_indices
-from evo_wam.g_pi_humangen import (audit_humangen, convert_humangen, load_humangen_robot_latents,
+from etude.g_pi_data import EventRules, load_g_pi_index, load_g_pi_sample, subgoal_control_indices
+from etude.g_pi_humangen import (audit_humangen, convert_humangen, load_humangen_robot_latents,
                                  read_humangen_episode, read_humangen_latent)
-from evo_wam.g_pi_subgoals import (CANDIDATE_THRESHOLDS, RELATION_REGISTRY, VERSIONS,
+from etude.g_pi_subgoals import (CANDIDATE_THRESHOLDS, RELATION_REGISTRY, VERSIONS,
                                  generate_candidates, resolve_subgoal_indices)
-from evo_wam.icl_data import LATENT_NORMALIZATION
-from evo_wam.robotwin import RobotwinActionTransform, USED_CHANNELS
-from evo_wam.vision import sha256
+from etude.icl_data import LATENT_NORMALIZATION
+from etude.robotwin import RobotwinActionTransform, USED_CHANNELS
+from etude.vision import sha256
 from test_goal_language import write_goal_language
 
 

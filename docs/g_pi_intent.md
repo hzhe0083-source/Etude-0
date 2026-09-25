@@ -49,7 +49,7 @@ v1 另有 `object_family`，同目的组的物体属于经审核的相近类别�
 来源别名、内容完全相同的 latent 视频均合并为同一来源分量；重复 HumanGen 视频不能冒充独立正例。分组表与机器人索引还会联合检查训练/验证/测试泄漏。完全相同的内容检测无法识别重新裁切、重新编码的近重复，仍须提供可靠的来源元数据。
 
 ```bash
-.venv/bin/python -m evo_wam.cli train-goal-interface \
+.venv/bin/python -m etude.cli train-goal-interface \
   --config configs/se3/g_translator.json --index /data/g-index.json \
   --intent-groups /data/purpose-v1.json --stage g --tiny-native \
   --steps 2 --device cuda --output /tmp/evo-g-b
@@ -64,7 +64,7 @@ v1 另有 `object_family`，同目的组的物体属于经审核的相近类别�
 探针 manifest：`format_version:1`、`kind:g_pi_intent_probe`，包括 `purpose_table`、`layer`、`pool_grid:[4,2,2]`，可配置 `steps/learning_rate/seed`。可选 `feature_cache` 用于读取已有特征，或 `save_feature_cache` 保存本次提取；缓存保留基座、空提示词、层、池化和输入文件身份。
 
 ```bash
-.venv/bin/python -m evo_wam.cli probe-g-pi-intent \
+.venv/bin/python -m etude.cli probe-g-pi-intent \
   --manifest /data/probe.json --artifact /tmp/evo-g-b/goal_interface.pt \
   --device cuda --output /tmp/intent-probe.json
 ```
@@ -74,7 +74,7 @@ v1 另有 `object_family`，同目的组的物体属于经审核的相近类别�
 ## B3：基于测量的离线评测
 
 ```bash
-.venv/bin/python -m evo_wam.cli evaluate-g-pi \
+.venv/bin/python -m etude.cli evaluate-g-pi \
   --manifest /data/evaluation.json --device cuda --output /tmp/g-pi-evaluation.json
 ```
 

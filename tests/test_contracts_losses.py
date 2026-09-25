@@ -4,11 +4,11 @@ from dataclasses import replace
 
 import torch
 
-from evo_wam.contracts import (
+from etude.contracts import (
     BINDING_UNCERTAIN, BINDING_UNMATCHED, BINDING_UNUSED,
     EffectRequirement, PhysicalOutcome, TaskRequirement,
 )
-from evo_wam.losses import (
+from etude.losses import (
     MaskedLoss, aggregate_fields, masked_bce, masked_mean, masked_mse,
     merge_category_mass, paired_js, pair_supervised_mean,
 )

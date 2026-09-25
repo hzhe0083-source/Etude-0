@@ -49,16 +49,16 @@ The example configuration is deliberately marked synthetic. Before real training
 With actual audited configuration, paired data and local weights:
 
 ```bash
-evo-wam train-goal-interface \
+etude train-goal-interface \
   --config /data/evo/observed-so101.json --index /data/evo/goal-index.json \
   --stage joint --checkpoint /models/zero-wam --device cuda \
   --steps 1000 --seed 0 --output outputs/observed-joint
 
-evo-wam export-goal-policy \
+etude export-goal-policy \
   --artifact outputs/observed-joint/goal_interface.pt \
   --output outputs/observed-policy --dtype bfloat16
 
-evo-wam predict-goal-policy \
+etude predict-goal-policy \
   --policy outputs/observed-policy --observation /data/evo/current.json \
   --device cuda --seed 0 --output outputs/observed-prediction.npz
 ```

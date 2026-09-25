@@ -9,10 +9,10 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_data import (EventRules, GTranslatorSample, GripperEventDetector, PiGoalSample,
+from etude.g_pi_data import (EventRules, GTranslatorSample, GripperEventDetector, PiGoalSample,
                               _block_endpoint, detect_gripper_events, g_pi_sample_files, load_g_pi_index,
                               load_g_pi_sample, next_subgoal_time, subgoal_control_indices, validate_latent_grid)
-from evo_wam.icl_data import LATENT_NORMALIZATION
+from etude.icl_data import LATENT_NORMALIZATION
 from test_goal_language import write_goal_language
 
 
@@ -256,7 +256,7 @@ class GPiDataTest(unittest.TestCase):
         self.save(path, metadata, arrays)
         with self.assertRaisesRegex(ValueError, "latent availability"):
             load_g_pi_sample(path, route="pi_prior", current_time=.3)
-        with patch("evo_wam.g_pi_data._block_endpoint", return_value={"block_end_valid": False}):
+        with patch("etude.g_pi_data._block_endpoint", return_value={"block_end_valid": False}):
             with self.assertRaisesRegex(ValueError, "recorded state after"):
                 load_g_pi_sample(path, route="pi_prior", current_time=.4)
 
@@ -335,7 +335,7 @@ class GPiDataTest(unittest.TestCase):
     def test_g_never_loads_text_and_does_not_require_language_files(self):
         path, metadata, _ = write_g_pi_task(self.root)
         (self.root / metadata["language"]).unlink()
-        with patch("evo_wam.g_pi_data.load_goal_language", side_effect=AssertionError("G must not read text")):
+        with patch("etude.g_pi_data.load_goal_language", side_effect=AssertionError("G must not read text")):
             sample = load_g_pi_sample(path, route="g_translator", current_time=.4)
         self.assertIsNone(sample.language)
         self.assertIsNone(sample.language_identity)
@@ -351,7 +351,7 @@ class GPiDataTest(unittest.TestCase):
         path, metadata, _ = write_g_pi_task(self.root, demonstration=False)
         metadata.pop("language")
         path.write_text(json.dumps(metadata))
-        with patch("evo_wam.g_pi_data.load_goal_language", side_effect=AssertionError("no text")):
+        with patch("etude.g_pi_data.load_goal_language", side_effect=AssertionError("no text")):
             sample = load_g_pi_sample(path, current_time=.4, read_language=False)
         self.assertIsNone(sample.language)
         self.assertEqual(len(g_pi_sample_files(path, sample)), 2)

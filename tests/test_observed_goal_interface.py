@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from evo_wam.goal_interface import goal_pose_loss, validate_goal_poses
-from evo_wam.goal_observed_interface import ObservedGoalInterface
+from etude.goal_interface import goal_pose_loss, validate_goal_poses
+from etude.goal_observed_interface import ObservedGoalInterface
 
 
 class ObservedGoalInterfaceTests(unittest.TestCase):

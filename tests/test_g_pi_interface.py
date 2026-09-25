@@ -6,10 +6,10 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.g_pi_interface import (
+from etude.g_pi_interface import (
     GGoalDecoder, GTranslator, PiGoalInterface, PiGoalPolicy, g_goal_loss, normalize_z, perturb_goal,
 )
-from evo_wam.goal_interface import _PoseDecoder, _RecurrentGroup, validate_goal_poses
+from etude.goal_interface import _PoseDecoder, _RecurrentGroup, validate_goal_poses
 
 
 class GPiInterfaceTests(unittest.TestCase):
@@ -203,7 +203,7 @@ class GPiInterfaceTests(unittest.TestCase):
 
     def test_contrastive_and_regression_share_live_intent_parameters(self):
         from types import SimpleNamespace
-        from evo_wam.g_pi_intent import intent_contrastive_loss, ordered_intent_similarity
+        from etude.g_pi_intent import intent_contrastive_loss, ordered_intent_similarity
         demo = torch.randn(4, 6, 12, requires_grad=True)
         entries = [SimpleNamespace(demo_id=str(i), component=str(i), purpose_group=str(i // 2))
                    for i in range(4)]
@@ -287,7 +287,7 @@ class GPiInterfaceTests(unittest.TestCase):
         self.assertEqual(self.interface.pose_decoder.queries.shape, (2, 16))
         self.assertEqual(self.interface.pose_decoder.num_pose_tokens, 4)
         torch.testing.assert_close(conditions[-1][:, 3:], self.interface.condition_adapter(tokens))
-        from evo_wam.goal_interface import goal_pose_loss
+        from etude.goal_interface import goal_pose_loss
         loss = goal_pose_loss(predicted["goal_poses"], clean_endpoint,
             gripper_prediction=predicted["goal_gripper"], gripper_target=self.goal["goal_gripper"])["total"]
         loss.backward()
@@ -304,7 +304,7 @@ class GPiInterfaceTests(unittest.TestCase):
             torch.testing.assert_close(predicted[name], joint_prediction[name], rtol=0, atol=0)
 
     def test_endpoint_decoder_can_fit_independent_bimanual_block_ends(self):
-        from evo_wam.goal_interface import goal_pose_loss
+        from etude.goal_interface import goal_pose_loss
         torch.manual_seed(624)
         interface = PiGoalInterface(native_dim=12, feature_dim=12, state_dim=4, effectors=2,
             d_z=12, k_z=3, dim=16, num_tokens=4, num_heads=4, num_layers=2,
@@ -415,7 +415,7 @@ class GPiInterfaceTests(unittest.TestCase):
 class GPiNativeInterfaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from evo_wam.zerowam import NativeDependencyError, load_native_class
+        from etude.zerowam import NativeDependencyError, load_native_class
         try:
             load_native_class()
         except NativeDependencyError as exc:
@@ -423,9 +423,9 @@ class GPiNativeInterfaceTests(unittest.TestCase):
 
     def fixture(self, device="cpu"):
         from test_native_icl import tiny_model
-        from evo_wam.g_pi_context import FrozenGoalEncoder, install_empty_text
-        from evo_wam.g_pi_training import _set_precision
-        from evo_wam.goal_action import action_named_parameters, install_action_interface
+        from etude.g_pi_context import FrozenGoalEncoder, install_empty_text
+        from etude.g_pi_training import _set_precision
+        from etude.goal_action import action_named_parameters, install_action_interface
         torch.manual_seed(243)
         native = install_action_interface(tiny_model(device).float()).requires_grad_(False).eval()
         _set_precision(native, video_precision="bfloat16", route="pi_goal")
@@ -475,7 +475,7 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same native"):
             PiGoalPolicy(native, interface, config, action_shape=(1, 3, 1, 2, 1),
                          actions_mask=policy.actions_mask, video_native=deepcopy(native))
-        from evo_wam.goal_action import action_named_parameters
+        from etude.goal_action import action_named_parameters
         action_ids = {id(parameter) for _, parameter in action_named_parameters(native)}
         self.assertTrue(all(parameter.dtype == (torch.float32 if id(parameter) in action_ids else torch.bfloat16)
                             for parameter in native.parameters()))
@@ -501,25 +501,25 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         goal = decoder(torch.randn(1, 4, 36), torch.randn(1, 4, 36), state)
         history[:, :, 2:] = float("nan")
         features = {index: torch.randn(1, 4, 36) for index in range(2)}
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features) as read, \
-             patch("evo_wam.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)):
+        with patch("etude.g_pi_context.pi_context_features", return_value=features) as read, \
+             patch("etude.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)):
             policy.predict(history, state, language, goal, current_index=1)
         observed = read.call_args.args[1]
         self.assertEqual(observed.shape[2], 2)
         self.assertTrue(torch.isfinite(observed).all())
         del policy.config["latent_frame_dt"]
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
+        with patch("etude.g_pi_context.pi_context_features", return_value=features), \
              self.assertRaisesRegex(ValueError, "control_dt"):
             policy.predict(history, state, language, goal, current_index=1)
         interface.control_dt = .1
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
-             patch("evo_wam.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)), \
+        with patch("etude.g_pi_context.pi_context_features", return_value=features), \
+             patch("etude.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)), \
              patch.object(interface, "conditions", wraps=interface.conditions) as condition:
             policy.predict(history, state, language, goal, current_index=1)
         torch.testing.assert_close(condition.call_args.args[4], torch.tensor([0., .2], dtype=torch.float64))
         interface.latent_frame_dt = .3
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
-             patch("evo_wam.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)), \
+        with patch("etude.g_pi_context.pi_context_features", return_value=features), \
+             patch("etude.g_pi_interface.goal_action_sample", return_value=torch.zeros(1, 3, 1, 2, 1)), \
              patch.object(interface, "conditions", wraps=interface.conditions) as condition:
             policy.predict(history, state, language, goal, current_index=1)
         torch.testing.assert_close(condition.call_args.args[4], torch.tensor([0., .3], dtype=torch.float64))
@@ -534,8 +534,8 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         projection = native.condition_embedder_action.text_embedder
         hook = projection.register_forward_pre_hook(lambda _module, args: inputs.append(args[0].clone()))
         try:
-            with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
-                 patch("evo_wam.g_pi_interface.goal_action_sample",
+            with patch("etude.g_pi_context.pi_context_features", return_value=features), \
+                 patch("etude.g_pi_interface.goal_action_sample",
                        return_value=torch.zeros(1, 3, 1, 2, 1)) as sample:
                 policy.predict(history, state, goal=goal, current_index=1)
                 absent = sample.call_args.args[1]
@@ -561,8 +561,8 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         features = {index: torch.randn(1, 6, 36) for index in range(2)}
         def sample(_native, _conditions, shape, _mask, generator, **kwargs):
             return torch.randn(shape, generator=generator)
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
-             patch("evo_wam.g_pi_interface.goal_action_sample", side_effect=sample), \
+        with patch("etude.g_pi_context.pi_context_features", return_value=features), \
+             patch("etude.g_pi_interface.goal_action_sample", side_effect=sample), \
              patch.object(interface.endpoint_encoder, "forward", side_effect=AssertionError("prior read")), \
              patch.object(interface.pose_decoder, "forward", wraps=interface.pose_decoder.forward) as readout:
             seed = policy.generator.get_state()
@@ -573,8 +573,8 @@ class GPiNativeInterfaceTests(unittest.TestCase):
             self.assertEqual(readout.call_count, 1)
         torch.testing.assert_close(diagnostic["actions"], ordinary, rtol=0, atol=0)
         before = policy.generator.get_state()
-        with patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
-             patch("evo_wam.g_pi_interface.goal_action_sample", side_effect=AssertionError("action sampled")), \
+        with patch("etude.g_pi_context.pi_context_features", return_value=features), \
+             patch("etude.g_pi_interface.goal_action_sample", side_effect=AssertionError("action sampled")), \
              patch.object(interface.endpoint_encoder, "forward", side_effect=AssertionError("prior read")):
             standalone = policy.diagnose_endpoint(history, state, language, goal)
         torch.testing.assert_close(policy.generator.get_state(), before, rtol=0, atol=0)
@@ -591,9 +591,9 @@ class GPiNativeInterfaceTests(unittest.TestCase):
         demo_memory = torch.randn(1, 4, 36)
         robot_memory = torch.randn(1, 6, 36)
         isolated_memory = robot_memory + 5
-        with patch("evo_wam.g_pi_context.split_g_context_features",
+        with patch("etude.g_pi_context.split_g_context_features",
                    return_value=({1: demo_memory}, {1: robot_memory})), \
-             patch("evo_wam.g_pi_context.pi_context_features", return_value={1: isolated_memory}), \
+             patch("etude.g_pi_context.pi_context_features", return_value={1: isolated_memory}), \
              patch.object(decoder, "decode_goal", wraps=decoder.decode_goal) as read:
             results = translator.diagnose_intent(demo, history, state, use_cache=False)
         self.assertIs(read.call_args_list[0].args[1], robot_memory)
@@ -609,7 +609,7 @@ class GPiNativeInterfaceTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_native_g_step_changes_decoder_only_and_E_stays_exact(self):
-        from evo_wam.g_pi_context import frozen_base_checksum, split_g_context_features
+        from etude.g_pi_context import frozen_base_checksum, split_g_context_features
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture("cuda")
         translator = GTranslator(encoder.native, decoder, config)
         checksum = frozen_base_checksum(encoder.native)
@@ -638,10 +638,10 @@ class GPiNativeInterfaceTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "Native FlexAttention requires CUDA")
     def test_native_pi_step_changes_only_interface_and_action_expert(self):
-        from evo_wam.g_pi_context import frozen_base_checksum, pi_context_features
-        from evo_wam.goal_action import action_named_parameters, goal_action_forward
-        from evo_wam.g_pi_training import _set_training
-        from evo_wam.goal_interface import goal_pose_loss
+        from etude.g_pi_context import frozen_base_checksum, pi_context_features
+        from etude.goal_action import action_named_parameters, goal_action_forward
+        from etude.g_pi_training import _set_training
+        from etude.goal_interface import goal_pose_loss
         native, encoder, decoder, interface, config, demo, history, state, language = self.fixture("cuda")
         _set_training(native, interface, encoder, {"interface_type": "pi_goal",
             "pi_training": {"ablations": {"no_stage1": True, "exact_goal": True}}}, stage="pi")

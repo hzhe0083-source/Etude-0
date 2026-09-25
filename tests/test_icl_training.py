@@ -11,10 +11,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from evo_wam.icl_data import load_icl_sample
-from evo_wam.icl_training import (build_icl_model, load_icl_config,
+from etude.icl_data import load_icl_sample
+from etude.icl_training import (build_icl_model, load_icl_config,
                                   native_icl_loss, prepare_icl_inputs, train_native_icl)
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_icl_data import save_sample, write_sample
 
 
@@ -131,7 +131,7 @@ class NativeICLTrainingTests(unittest.TestCase):
         duplicate.write_bytes(cache.read_bytes())
         metadata["target"]["arrays"] = duplicate.name
         reverse.write_text(json.dumps(metadata))
-        with patch("evo_wam.icl_training.build_icl_model", side_effect=AssertionError("validate coverage before model loading")):
+        with patch("etude.icl_training.build_icl_model", side_effect=AssertionError("validate coverage before model loading")):
             with self.assertRaisesRegex(ValueError, "every demo video cache"):
                 train_native_icl(self.args("unmatched", 1))
 
@@ -172,7 +172,7 @@ class NativeICLTrainingTests(unittest.TestCase):
         # Diffusers' private default-value metadata has hash-dependent ordering;
         # artifact identity must survive exporting in a fresh Python process.
         hash_seed = "98765" if os.environ.get("PYTHONHASHSEED") != "98765" else "98766"
-        result = subprocess.run([sys.executable, "-m", "evo_wam", "export-native-icl",
+        result = subprocess.run([sys.executable, "-m", "etude", "export-native-icl",
             "--artifact", full_report["artifact"], "--output", str(self.root / "export"), "--device", "cpu"],
             env={**os.environ, "PYTHONHASHSEED": hash_seed}, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)

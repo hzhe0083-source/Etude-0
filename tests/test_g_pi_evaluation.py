@@ -8,8 +8,8 @@ import unittest
 import numpy as np
 import torch
 
-from evo_wam.g_pi_controller import GoalThresholds
-from evo_wam.g_pi_evaluation import (EvaluationCase, _load_replay, delta_metrics, evaluate_g_pi_cli,
+from etude.g_pi_controller import GoalThresholds
+from etude.g_pi_evaluation import (EvaluationCase, _load_replay, delta_metrics, evaluate_g_pi_cli,
     endpoint_swap_metrics, evaluate_records, grouped_statistics, scene_modal_goals,
     valid_goal_region, write_evaluation_plots)
 
@@ -256,7 +256,7 @@ class EvaluationMetricsTest(unittest.TestCase):
                 self.run_records([case()], endpoint_seed=seed)
 
     def test_no_lit_pose_contract_marks_unsupervised_endpoint_readout(self):
-        from evo_wam.g_pi_training import pi_stage_contract
+        from etude.g_pi_training import pi_stage_contract
         from test_g_pi_training import config_for
 
         config = config_for("pi_goal")
@@ -331,9 +331,9 @@ class EvaluationMetricsTest(unittest.TestCase):
 class EvaluationNativeTest(unittest.TestCase):
     def test_real_exported_policies_end_to_end_command(self):
         import test_g_pi_training as training_tests
-        from evo_wam.g_pi_data import load_g_pi_sample
-        from evo_wam.g_pi_deployment import save_goal_prediction
-        from evo_wam.g_pi_training import export_g_pi_policy, load_g_pi_policy, train_g_pi_interface
+        from etude.g_pi_data import load_g_pi_sample
+        from etude.g_pi_deployment import save_goal_prediction
+        from etude.g_pi_training import export_g_pi_policy, load_g_pi_policy, train_g_pi_interface
 
         fixture = training_tests.GPiNativeTrainingTest()
         fixture.setUpClass()

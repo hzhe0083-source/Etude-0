@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.goal_data import load_goal_index, load_goal_observation, load_goal_sample
+from etude.goal_data import load_goal_index, load_goal_observation, load_goal_sample
 from test_icl_data import LATENT_NORMALIZATION, write_sample
 from test_goal_language import write_goal_language
 
@@ -93,7 +93,7 @@ class GoalDataTest(unittest.TestCase):
         for source in ("measured_endpoint", "controller_target"):
             metadata["goal_source"] = source
             self.save(path, metadata, arrays)
-            with patch("evo_wam.goal_data.load_icl_sample", side_effect=AssertionError("Stage 1 must not load videos")), \
+            with patch("etude.goal_data.load_icl_sample", side_effect=AssertionError("Stage 1 must not load videos")), \
                     patch("numpy.load", wraps=original_load) as loads:
                 sample = load_goal_sample(path)
             self.assertEqual(loads.call_count, 2)

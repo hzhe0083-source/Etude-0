@@ -9,10 +9,10 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from evo_wam.g_pi_deployment import save_goal_prediction
-from evo_wam.g_pi_noise import (calibrate_g_pi_noise, calibrate_noise, perturb_goal_bounded,
+from etude.g_pi_deployment import save_goal_prediction
+from etude.g_pi_noise import (calibrate_g_pi_noise, calibrate_noise, perturb_goal_bounded,
                                validate_goal_noise)
-from evo_wam.goal_interface import validate_goal_poses
+from etude.goal_interface import validate_goal_poses
 from test_g_pi_calibration import encoder_identity, goal
 
 

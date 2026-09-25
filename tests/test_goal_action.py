@@ -4,9 +4,9 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.goal_action import (action_named_parameters, goal_action_forward,
+from etude.goal_action import (action_named_parameters, goal_action_forward,
                                  goal_action_sample, install_action_interface)
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_native_icl import tiny_model
 
 

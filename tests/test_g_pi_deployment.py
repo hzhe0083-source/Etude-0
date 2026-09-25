@@ -7,9 +7,9 @@ import unittest
 import numpy as np
 import torch
 
-from evo_wam.g_pi_deployment import (GObservation, PiObservation, load_g_pi_observation,
+from etude.g_pi_deployment import (GObservation, PiObservation, load_g_pi_observation,
                                      load_goal_prediction, save_goal_prediction)
-from evo_wam.goal_language import load_goal_language
+from etude.goal_language import load_goal_language
 from test_goal_data import write_goal_observation
 
 

@@ -8,12 +8,12 @@ import unittest
 
 import torch
 
-from evo_wam.cli import make_fixture
-from evo_wam.data import load_experiment, load_sample
-from evo_wam.models import EffectReader, RequirementCodec, decoded_requirement_loss
-from evo_wam.video_cli import build_video_models, load_video_config, make_capacity_configs
-from evo_wam.video_data import patch_grid_coordinates
-from evo_wam.video_effects import VideoEffectEncoder, EffectFeaturePredictor, effect_pretraining_loss
+from etude.cli import make_fixture
+from etude.data import load_experiment, load_sample
+from etude.models import EffectReader, RequirementCodec, decoded_requirement_loss
+from etude.video_cli import build_video_models, load_video_config, make_capacity_configs
+from etude.video_data import patch_grid_coordinates
+from etude.video_effects import VideoEffectEncoder, EffectFeaturePredictor, effect_pretraining_loss
 
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"

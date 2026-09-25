@@ -1,6 +1,6 @@
 # Prefix-matched evaluation
 
-`src/evo_wam/evaluation.py` contains simulator-independent rollout functions. The
+`src/etude/evaluation.py` contains simulator-independent rollout functions. The
 only toy environment lives in the tests; passing those checks proves protocol
 properties, not learned task understanding, RoboTwin success, or hardware readiness.
 
@@ -26,7 +26,7 @@ state. A learned effect-matching threshold is not a hardware safety mechanism.
 ## Calling the evaluator
 
 ```python
-from evo_wam.evaluation import Candidate, Provenance, closed_loop, result_json
+from etude.evaluation import Candidate, Provenance, closed_loop, result_json
 
 def policy(observation, rng):
     # Replace with the real deployment policy, converted to atomic action steps.
@@ -35,7 +35,7 @@ def policy(observation, rng):
 
 provenance = Provenance(
     kind="simulated", backend="RoboTwin-<exact-revision>",
-    policy_id="Evo-WAM-<config-digest>", checkpoint_id="<weight-digest>",
+    policy_id="Etude-<config-digest>", checkpoint_id="<weight-digest>",
     success_criterion="original-<criterion-revision>",
 )
 episode = closed_loop(env, policy, budget=500, seed=7, provenance=provenance)

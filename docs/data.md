@@ -1,6 +1,6 @@
 # Single-view data, optional synchronized pairs, and experiment inputs
 
-`evo_wam.data` owns sampling and validates inputs. It does not infer contacts,
+`etude.data` owns sampling and validates inputs. It does not infer contacts,
 task necessity, human/robot alignment, or camera calibration from a filename.
 All IDs and annotation provenance stay in metadata; they are never appended
 to model tokens or task text.

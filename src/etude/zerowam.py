@@ -48,7 +48,7 @@ except ImportError:
         def flash_attn_func(*args, **kwargs):
             raise ImportError(
                 "Legacy FlashAttention execution requires a real flash-attn installation; "
-                "the Evo-WAM ICL path uses upstream PyTorch FlexAttention."
+                "the Etude ICL path uses upstream PyTorch FlexAttention."
             ) from _EVO_FLASH_IMPORT_ERROR
 """
 
@@ -390,7 +390,7 @@ class ZeroWAMAdapter(nn.Module):
 
     def _condition_input(self, inputs: dict, conditions: TaskConditions) -> dict:
         if inputs.get("icl_latent_dict") is not None:
-            raise ValueError("Raw ICL tokens bypass the Evo-WAM task interface")
+            raise ValueError("Raw ICL tokens bypass the Etude task interface")
         null = conditions.null
         if null.ndim != 3 or null.shape[0] != 1 or null.shape[1] < 1 or null.shape[2] != self.native.config.text_dim:
             raise ValueError("null must be a nonempty native [1,N,text_dim] embedding")

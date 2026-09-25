@@ -8,10 +8,10 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.cli import file_sha256
-from evo_wam.demo_context import install_demo_interface
-from evo_wam.icl_deployment import attach_bottleneck_server, load_bottleneck_deployment
-from evo_wam.zerowam import NativeDependencyError, ZERO_WAM_COMMIT, load_native_class
+from etude.cli import file_sha256
+from etude.demo_context import install_demo_interface
+from etude.icl_deployment import attach_bottleneck_server, load_bottleneck_deployment
+from etude.zerowam import NativeDependencyError, ZERO_WAM_COMMIT, load_native_class
 from test_native_icl import tiny_model
 
 
@@ -83,7 +83,7 @@ class BottleneckDeploymentTests(unittest.TestCase):
     def test_missing_tampered_untracked_and_escaping_files_fail_before_load(self):
         sidecar = self.bundle / "demo_bottleneck.pt"
         original = sidecar.read_bytes()
-        with patch("evo_wam.icl_deployment.load_native_class", side_effect=AssertionError("loaded before auditing")):
+        with patch("etude.icl_deployment.load_native_class", side_effect=AssertionError("loaded before auditing")):
             sidecar.unlink()
             with self.assertRaisesRegex(ValueError, "missing or untracked"):
                 load_bottleneck_deployment(self.bundle, device="cpu")

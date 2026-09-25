@@ -10,13 +10,13 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_calibration import (DISTANCES, _subgoal_keys, calibrate_g_pi_thresholds, calibrate_goal_thresholds,
+from etude.g_pi_calibration import (DISTANCES, _subgoal_keys, calibrate_g_pi_thresholds, calibrate_goal_thresholds,
     calibrate_validation, load_calibration_artifact, load_calibration_policy)
-from evo_wam.g_pi_context import save_target_cache
-from evo_wam.g_pi_controller import goal_distances, goal_reached
-from evo_wam.g_pi_data import load_g_pi_sample
-from evo_wam.g_pi_deployment import save_goal_prediction
-from evo_wam.goal_training import goal_registry
+from etude.g_pi_context import save_target_cache
+from etude.g_pi_controller import goal_distances, goal_reached
+from etude.g_pi_data import load_g_pi_sample
+from etude.g_pi_deployment import save_goal_prediction
+from etude.goal_training import goal_registry
 from test_g_pi_data import write_g_pi_task
 
 
@@ -189,7 +189,7 @@ class GPiCalibrationFileTest(unittest.TestCase):
 
     def test_cache_only_command_reads_robot_tasks_without_native_or_text(self):
         args = SimpleNamespace(manifest=self.manifest, output=self.output)
-        with patch("evo_wam.g_pi_training.load_g_pi_policy", side_effect=AssertionError("no model needed")):
+        with patch("etude.g_pi_training.load_g_pi_policy", side_effect=AssertionError("no model needed")):
             summary = calibrate_g_pi_thresholds(args)
         self.assertEqual(summary["recordings"], 2)
         artifact = load_calibration_artifact(self.output, self.identity, self.registry)
@@ -240,7 +240,7 @@ class GPiCalibrationFileTest(unittest.TestCase):
         payload = {"encoder_identity": self.identity, "registry": self.registry}
         args = SimpleNamespace(manifest=self.manifest, output=self.output,
                                artifact="training.pt", device="cpu", checkpoint=None)
-        with patch("evo_wam.g_pi_training.load_g_pi_encoder", return_value=(fake_encoder, payload)) as loader:
+        with patch("etude.g_pi_training.load_g_pi_encoder", return_value=(fake_encoder, payload)) as loader:
             result = calibrate_g_pi_thresholds(args)
         loader.assert_called_once_with("training.pt", device="cpu", checkpoint=None)
         self.assertEqual(result["recordings"], 2)
@@ -284,7 +284,7 @@ class GPiCalibrationFileTest(unittest.TestCase):
             metadata.pop("language")
             path.write_text(json.dumps(metadata))
         self.write_manifest()
-        with patch("evo_wam.g_pi_data.load_goal_language", side_effect=AssertionError("G calibration has no text")):
+        with patch("etude.g_pi_data.load_goal_language", side_effect=AssertionError("G calibration has no text")):
             result = calibrate_validation(self.manifest, self.output)
         self.assertIsNone(result["registry"]["language_identity"])
         self.assertEqual(len(result["validation_files"]), 7)

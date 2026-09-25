@@ -44,7 +44,7 @@ B 的类默认值改为每窗口64个768维 tokens、内部宽度512；P默认�
 已有配置加载器要求明确填写模型维度，因此不会静默采用类默认值。数据就绪后，从审核过的视频和机器人配置生成上述对照：
 
 ```bash
-evo-wam make-capacity-configs \
+etude make-capacity-configs \
   --video-config /server/audited-video-config.json \
   --robot-config /server/audited-robot-config.json \
   --output /server/capacity-configs
@@ -67,10 +67,10 @@ evo-wam make-capacity-configs \
 `patch_coordinate_system="normalized_xy_patch_centers"` 和逐槽位的 `patch_coordinates[N,2]`；不能从 patch 数量猜测二维布局。索引仍为 format v1。
 
 ```bash
-evo-wam preprocess-video --manifest /server/raw-human-video.json --output /server/windows/human-001
-evo-wam pretrain-video --config /server/capacity-configs/video_K64.json \
+etude preprocess-video --manifest /server/raw-human-video.json --output /server/windows/human-001
+etude pretrain-video --config /server/capacity-configs/video_K64.json \
   --index /server/video-index.json --steps 900 --device cuda --output /server/runs/video-effects
-evo-wam pretrain-video --config /server/capacity-configs/video_K64.json \
+etude pretrain-video --config /server/capacity-configs/video_K64.json \
   --index /server/video-index.json --steps 100 --device cuda \
   --resume /server/runs/video-effects/video_encoder.pt --output /server/runs/video-effects
 ```
@@ -95,9 +95,9 @@ artifact 的 `feature_kind_updates` 分别记录 `patches` 和 `tracked_entities
 展平顺序固定为时间、高度、宽度、通道；不能从展平序列猜测视频时间轴或空间布局。
 
 ```bash
-evo-wam encode-demonstrations --artifact /server/runs/video-effects/video_encoder.pt \
+etude encode-demonstrations --artifact /server/runs/video-effects/video_encoder.pt \
   --manifest /server/robot-sample/sample.json --output /server/robot-sample-encoded
-evo-wam train --config /server/capacity-configs/robot_768.json --index /server/encoded-index.json \
+etude train --config /server/capacity-configs/robot_768.json --index /server/encoded-index.json \
   --demo-encoder /server/runs/video-effects/video_encoder.pt --checkpoint /server/zero-wam \
   --stage interface --steps 1000 --output /server/runs/interface
 ```
@@ -128,7 +128,7 @@ evo-wam train --config /server/capacity-configs/robot_768.json --index /server/e
 上述U系列JSON中的微型维度是数值验收用，真实特征维度需要服务器配置。U系列的数据／监督对照与K16／K64／K100容量对照是两个独立实验轴。
 
 ```bash
-evo-wam evaluate-video --artifact /server/runs/video-effects/video_encoder.pt \
+etude evaluate-video --artifact /server/runs/video-effects/video_encoder.pt \
   --index /server/heldout-video-index.json --split validation --output /server/results/video-diagnostics.json
 ```
 

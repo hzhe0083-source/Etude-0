@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.native_icl import forward_video_only, install_icl_lora, merge_icl_lora
-from evo_wam.zerowam import NativeDependencyError, VideoLoRA, load_native_class
+from etude.native_icl import forward_video_only, install_icl_lora, merge_icl_lora
+from etude.zerowam import NativeDependencyError, VideoLoRA, load_native_class
 
 
 def tiny_model(device="cpu"):

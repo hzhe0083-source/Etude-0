@@ -3,10 +3,10 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.g_pi_context import (
+from etude.g_pi_context import (
     RobotPrefixCache, g_context_features, pi_context_features, split_g_context_features,
 )
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_g_pi_context import CONFIG, context_model
 
 
@@ -84,7 +84,7 @@ class NativePrefixTests(unittest.TestCase):
     def test_closed_prefix_reuses_all_features_without_native_work(self):
         cache = RobotPrefixCache("pi")
         first = pi_context_features(self.native, self.history, CONFIG, current_index=3, prefix_cache=cache)
-        with patch("evo_wam.g_pi_context._context", side_effect=AssertionError("cached prefix recomputed")):
+        with patch("etude.g_pi_context._context", side_effect=AssertionError("cached prefix recomputed")):
             repeated = pi_context_features(self.native, self.history, CONFIG, current_index=3, prefix_cache=cache)
         self.assertEqual(cache.last_processed_tokens, 0)
         for layer in range(2):
@@ -119,7 +119,7 @@ class NativePrefixTests(unittest.TestCase):
         read(self.history, current_index=1, prefix_cache=cache)
 
     def test_wrappers_own_separate_task_caches_and_preserve_action_rng(self):
-        from evo_wam.g_pi_interface import GTranslator, PiGoalPolicy
+        from etude.g_pi_interface import GTranslator, PiGoalPolicy
         from test_g_pi_interface import GPiNativeInterfaceTests
         native, encoder, decoder, interface, config, demo, history, state, language = (
             GPiNativeInterfaceTests().fixture("cuda"))

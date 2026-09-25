@@ -5,7 +5,7 @@ import unittest
 import torch
 from torch import nn
 
-from evo_wam.demo_bottleneck import TemporalDemoBottleneck
+from etude.demo_bottleneck import TemporalDemoBottleneck
 
 
 class TemporalDemoBottleneckTests(unittest.TestCase):

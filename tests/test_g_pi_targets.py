@@ -9,10 +9,10 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.cli import file_sha256
-from evo_wam.g_pi_context import FrozenGoalEncoder, save_target_cache
-from evo_wam.g_pi_data import load_g_pi_sample
-from evo_wam.g_pi_targets import build_target_cache_index, cache_g_pi_targets, load_target_cache_index
+from etude.cli import file_sha256
+from etude.g_pi_context import FrozenGoalEncoder, save_target_cache
+from etude.g_pi_data import load_g_pi_sample
+from etude.g_pi_targets import build_target_cache_index, cache_g_pi_targets, load_target_cache_index
 from test_g_pi_context import CAMERAS, context_model
 from test_g_pi_data import write_g_pi_task
 
@@ -171,7 +171,7 @@ class TargetCacheTests(unittest.TestCase):
     def test_command_reconstructs_encoder_and_emits_usable_index(self):
         args = SimpleNamespace(index=self.index, output=self.root / "cache", artifact="fixture.pt",
                                checkpoint=None, device="cpu", split="train")
-        with patch("evo_wam.g_pi_training.load_g_pi_encoder", return_value=(self.encoder, {})) as factory:
+        with patch("etude.g_pi_training.load_g_pi_encoder", return_value=(self.encoder, {})) as factory:
             result = cache_g_pi_targets(args)
         factory.assert_called_once_with("fixture.pt", device="cpu", checkpoint=None)
         cache = load_target_cache_index(result["target_cache_index"], self.encoder.identity)
@@ -185,7 +185,7 @@ class TargetCacheTests(unittest.TestCase):
         (self.root / self.metadata["demonstration"]["arrays"]).unlink()
         args = SimpleNamespace(index=self.index, output=self.root / "cache", config=config,
                                checkpoint="base", device="cpu", tiny_native=True)
-        with patch("evo_wam.g_pi_training.build_g_pi_encoder",
+        with patch("etude.g_pi_training.build_g_pi_encoder",
                    return_value=(None, self.encoder, {}, [])) as factory:
             result = cache_g_pi_targets(args)
         factory.assert_called_once_with({"interface_type": "pi_goal"}, stage="pi", device="cpu",
@@ -197,8 +197,8 @@ class TargetCacheTests(unittest.TestCase):
             cache_g_pi_targets(SimpleNamespace())
 
     def test_fresh_encoder_matches_full_system_identity_without_task_language(self):
-        from evo_wam.g_pi_training import build_g_pi_encoder, build_g_pi_system
-        from evo_wam.goal_training import goal_registry
+        from etude.g_pi_training import build_g_pi_encoder, build_g_pi_system
+        from etude.goal_training import goal_registry
         from test_g_pi_training import config_for
         from test_native_icl import tiny_model
 
@@ -210,7 +210,7 @@ class TargetCacheTests(unittest.TestCase):
         registry = goal_registry(sample)
         registry["action_space"] = dict(registry["action_space"], dimension=3,
                                          valid_channels=[True, True, False])
-        with patch("evo_wam.g_pi_training.build_icl_model", side_effect=build):
+        with patch("etude.g_pi_training.build_icl_model", side_effect=build):
             for route, stage in (("pi_goal", "pi"), ("g_translator", "g")):
                 config = config_for(route)
                 native, encoder, identity, layers = build_g_pi_encoder(config, stage=stage,
@@ -229,7 +229,7 @@ class TargetCacheTests(unittest.TestCase):
         config.write_text(json.dumps(original))
         args = SimpleNamespace(index=self.index, output=self.root / "cache", config=config,
                                device="cpu", tiny_native=True)
-        with patch("evo_wam.g_pi_training.build_g_pi_encoder",
+        with patch("etude.g_pi_training.build_g_pi_encoder",
                    return_value=(None, self.encoder, {}, [])) as factory:
             result = cache_g_pi_targets(args)
         settings = factory.call_args.args[0]["intent_training"]

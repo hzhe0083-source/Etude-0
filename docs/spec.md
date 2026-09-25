@@ -1,4 +1,4 @@
-# Evo-WAM scope and archived specification
+# Etude scope and archived specification
 
 ## Current experiment: observed-context dual features
 

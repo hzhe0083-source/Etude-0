@@ -4,10 +4,10 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.demo_context import (PreparedDemoContext, cache_demo_context,
+from etude.demo_context import (PreparedDemoContext, cache_demo_context,
                                    install_demo_interface, prepare_demo_context)
-from evo_wam.native_icl import forward_video_only, install_icl_lora
-from evo_wam.zerowam import NativeDependencyError, load_native_class
+from etude.native_icl import forward_video_only, install_icl_lora
+from etude.zerowam import NativeDependencyError, load_native_class
 from test_native_icl import inputs, tiny_model
 
 

@@ -12,12 +12,12 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from evo_wam.demo_context import PreparedDemoContext, prepare_demo_context
-from evo_wam.icl_data import load_icl_sample
-from evo_wam.icl_deployment import load_bottleneck_deployment
-from evo_wam.icl_training import (_model_state, build_icl_model, export_native_icl,
+from etude.demo_context import PreparedDemoContext, prepare_demo_context
+from etude.icl_data import load_icl_sample
+from etude.icl_deployment import load_bottleneck_deployment
+from etude.icl_training import (_model_state, build_icl_model, export_native_icl,
                                   native_icl_loss, prepare_icl_inputs, train_native_icl)
-from evo_wam.native_icl import forward_video_only
+from etude.native_icl import forward_video_only
 import test_icl_training as fixtures
 
 
@@ -58,7 +58,7 @@ class BottleneckTrainingTests(unittest.TestCase):
         for name in ("human", "robot"):
             sample = load_icl_sample(self.root / f"{name}.json")
             raw = prepare_icl_inputs(sample, raw_config, raw_model, null, torch.Generator().manual_seed(11))
-            with patch("evo_wam.demo_context.prepare_demo_context", wraps=prepare_demo_context) as compress:
+            with patch("etude.demo_context.prepare_demo_context", wraps=prepare_demo_context) as compress:
                 compressed = prepare_icl_inputs(sample, self.config, native, null, torch.Generator().manual_seed(11))
             self.assertEqual(compress.call_count, 1)  # H2 never encodes the appearance copy.
             self.assertNotIn("appearance_tokens", compressed)
@@ -130,7 +130,7 @@ class BottleneckTrainingTests(unittest.TestCase):
         self.assertEqual(full["domain_updates"], {"robot": 1, "human": 3})
         self.assertTrue(full_report["demo_bottleneck_updated"])
         destination = self.root / "h2-export"
-        result = subprocess.run([sys.executable, "-m", "evo_wam", "export-native-icl",
+        result = subprocess.run([sys.executable, "-m", "etude", "export-native-icl",
             "--artifact", full_report["artifact"], "--output", str(destination), "--device", "cpu"],
             env={**os.environ, "PYTHONHASHSEED": "91873"}, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -174,13 +174,13 @@ class BottleneckTrainingTests(unittest.TestCase):
         sample = load_icl_sample(self.root / "human.json")
         h2_config = {**self.config, "demo_bottleneck": {**self.config["demo_bottleneck"], "consistency_weight": 0.}}
         h2 = prepare_icl_inputs(sample, h2_config, native, null, torch.Generator().manual_seed(11))
-        with patch("evo_wam.demo_context.prepare_demo_context", wraps=prepare_demo_context) as compress:
+        with patch("etude.demo_context.prepare_demo_context", wraps=prepare_demo_context) as compress:
             h3 = prepare_icl_inputs(sample, self.config, native, null, torch.Generator().manual_seed(11))
         self.assertEqual(compress.call_count, 2)
         for key in h2.keys() - {"icl_latent_dict"}:
             self.assert_same(h2[key], h3[key])
         self.assert_same(h2["icl_latent_dict"]["latent"].hidden, h3["icl_latent_dict"]["latent"].hidden)
-        with patch("evo_wam.icl_training.forward_video_only", wraps=forward_video_only) as wam:
+        with patch("etude.icl_training.forward_video_only", wraps=forward_video_only) as wam:
             losses = native_icl_loss(native, h3, self.config, human=True)
         self.assertEqual(wam.call_count, 1)
         original, augmented = h3["icl_latent_dict"]["latent"].tokens, h3["appearance_tokens"]

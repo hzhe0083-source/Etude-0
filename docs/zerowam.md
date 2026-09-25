@@ -1,6 +1,6 @@
 # Native Zero-WAM integration
 
-`evo_wam.zerowam` calls the upstream transformer at commit
+`etude.zerowam` calls the upstream transformer at commit
 `08e2c4ae41e2b63573a299825cebe6753481407c`. Loading verifies both HEAD and
 tracked-file cleanliness. It does not download model weights. Use
 `ZeroWAMAdapter.from_checkpoint(local_path, condition_dim=...)` with a local

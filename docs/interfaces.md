@@ -1,6 +1,6 @@
 # Learned effect interfaces
 
-`src/evo_wam/models.py` contains trainable PyTorch modules, not trained robot skills.
+`src/etude/models.py` contains trainable PyTorch modules, not trained robot skills.
 The CPU checks verify indexing, gradient and information-flow contracts; they do
 not establish grasping, migration or closed-loop success.
 

@@ -26,7 +26,7 @@ G、π 各有自己的缓存，不能互换。G 的 `one_way` 机器人 K/V 含�
 E 目标可在训练前离线生成，不需要先训练一个模型：
 
 ```bash
-.venv/bin/python -m evo_wam.cli cache-g-pi-targets \
+.venv/bin/python -m etude.cli cache-g-pi-targets \
   --config configs/se3/pi_goal.json --tiny-native --index /data/index.json \
   --split train --device cuda --output /tmp/evo-targets
 # 有训练工件时可将 --config/--tiny-native 换成 --artifact /data/goal_interface.pt。
@@ -45,7 +45,7 @@ E 目标可在训练前离线生成，不需要先训练一个模型：
 
 ```bash
 taskset -c 0 .venv/bin/python -m torch.distributed.run --standalone \
-  --nproc_per_node=1 -m evo_wam.cli train-goal-interface \
+  --nproc_per_node=1 -m etude.cli train-goal-interface \
   --config configs/se3/pi_goal_fsdp.json --index /data/pi-index.json \
   --stage pi --initialize /tmp/evo-pi-prior/goal_interface.pt \
   --tiny-native --steps 2 --device cuda --output /tmp/evo-pi-fsdp
@@ -67,9 +67,9 @@ taskset -c 0 .venv/bin/python -m torch.distributed.run --standalone \
 两个命令均只读本地文件，不下载、不安装依赖、不加载模型：
 
 ```bash
-.venv/bin/python -m evo_wam.cli audit-humangen-g-pi \
+.venv/bin/python -m etude.cli audit-humangen-g-pi \
   --manifest /data/audit.json --output /tmp/humangen-preflight.json
-.venv/bin/python -m evo_wam.cli convert-humangen-g-pi \
+.venv/bin/python -m etude.cli convert-humangen-g-pi \
   --manifest /data/conversion.json --output /tmp/humangen-g-pi
 ```
 

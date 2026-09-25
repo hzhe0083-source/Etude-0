@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import torch
 
-from evo_wam.video_data import (PATCH_COORDINATE_SYSTEM, load_video_index, load_video_window,
+from etude.video_data import (PATCH_COORDINATE_SYSTEM, load_video_index, load_video_window,
                                 patch_grid_coordinates, select_training_sources,
                                 validate_patch_coordinates, validate_video_sources)
 

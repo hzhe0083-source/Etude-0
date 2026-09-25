@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import torch
 
-from evo_wam.video_effects import (VideoEffectEncoder, EffectFeaturePredictor,
+from etude.video_effects import (VideoEffectEncoder, EffectFeaturePredictor,
                                     effect_pretraining_loss)
 
 
@@ -213,7 +213,7 @@ class VideoEffectTests(unittest.TestCase):
         past = torch.randn(1, 2, 2048, 6)
         valid = torch.ones_like(past, dtype=torch.bool)
         tokens = torch.zeros(1, 4, 8)
-        with patch("evo_wam.video_effects._pair_features", side_effect=AssertionError("quadratic pair allocation")):
+        with patch("etude.video_effects._pair_features", side_effect=AssertionError("quadratic pair allocation")):
             # Explicit 32 x 64 pixel-center grid, never inferred from N.
             y, x = torch.meshgrid((torch.arange(32) + .5) / 16 - 1,
                                   (torch.arange(64) + .5) / 32 - 1, indexing="ij")

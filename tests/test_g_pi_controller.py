@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from evo_wam.g_pi_controller import (ControllerState, GoalThresholds, controller_step, goal_distances, goal_reached)
-from evo_wam.g_pi_data import EventRules
+from etude.g_pi_controller import (ControllerState, GoalThresholds, controller_step, goal_distances, goal_reached)
+from etude.g_pi_data import EventRules
 
 
 THRESHOLDS = GoalThresholds(z=.05)

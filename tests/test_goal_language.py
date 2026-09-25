@@ -9,8 +9,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.goal_language import cache_goal_language, load_goal_language
-from evo_wam.vision import sha256
+from etude.goal_language import cache_goal_language, load_goal_language
+from etude.vision import sha256
 
 
 def write_goal_language(root, name="language", *, text="Follow the demonstrated operation.", dimension=8):

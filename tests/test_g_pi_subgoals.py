@@ -9,11 +9,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_data import EventRules, PiGoalSample, load_g_pi_sample
-from evo_wam.g_pi_subgoals import (CANDIDATE_THRESHOLDS, RELATION_REGISTRY, SIM_THRESHOLDS, VERSIONS,
+from etude.g_pi_data import EventRules, PiGoalSample, load_g_pi_sample
+from etude.g_pi_subgoals import (CANDIDATE_THRESHOLDS, RELATION_REGISTRY, SIM_THRESHOLDS, VERSIONS,
                                    generate_candidate_annotation, generate_candidates,
                                    resolve_subgoal_indices, validate_relations)
-from evo_wam.icl_preprocess import encode_g_pi_frames
+from etude.icl_preprocess import encode_g_pi_frames
 from test_g_pi_data import write_g_pi_task
 
 
@@ -284,7 +284,7 @@ class SubgoalSourcesTest(unittest.TestCase):
         frames = np.arange(17, dtype=np.uint8)[:, None, None, None] * np.ones((17, 2, 2, 3), dtype=np.uint8)
         def encode(vae, rgb, size):
             return torch.tensor(rgb[::4, 0, 0, 0].copy(), dtype=torch.float32).reshape(1, 1, -1, 1, 1)
-        with patch("evo_wam.icl_preprocess.encode_rgb", side_effect=encode) as encoder:
+        with patch("etude.icl_preprocess.encode_rgb", side_effect=encode) as encoder:
             result, metadata = encode_g_pi_frames(None, frames, arrays["control_times"], arrays["gripper"],
                                                   frame_stride=1, control_dt=.1, event_rules=EventRules(), size=(2, 2),
                                                   subgoal_metadata={"subgoal_source": "sim_relation", "subgoal_annotation": audit},

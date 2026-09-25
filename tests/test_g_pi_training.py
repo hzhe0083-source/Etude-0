@@ -10,15 +10,15 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from evo_wam.g_pi_context import frozen_base_checksum
-from evo_wam.g_pi_data import EventRules, load_g_pi_sample
-from evo_wam.g_pi_training import (ROUTES, _training_language, language_drop_probability, _base_location, _base_reference, _frozen_checksums, _optimizer, _restore_system, _set_precision, _system_state,
+from etude.g_pi_context import frozen_base_checksum
+from etude.g_pi_data import EventRules, load_g_pi_sample
+from etude.g_pi_training import (ROUTES, _training_language, language_drop_probability, _base_location, _base_reference, _frozen_checksums, _optimizer, _restore_system, _set_precision, _system_state,
     build_g_pi_system, export_g_pi_policy, g_pi_architecture, g_pi_artifact_version, g_pi_training_loss, g_intent_training_loss, intent_training_settings, pi_training_settings, pi_stage_contract, _check_stage, _interface_state, _initialization, _initialize_pi, _endpoint_losses,
     load_g_pi_policy, conditioning_mode, load_g_pi_encoder, read_g_pi_artifact, train_g_pi_interface, validate_g_pi_artifact, validate_g_pi_config)
-from evo_wam.goal_action import action_named_parameters
-from evo_wam.goal_training import goal_registry
-from evo_wam.cli import file_sha256
-from evo_wam.zerowam import NativeDependencyError, ZERO_WAM_COMMIT, load_native_class
+from etude.goal_action import action_named_parameters
+from etude.goal_training import goal_registry
+from etude.cli import file_sha256
+from etude.zerowam import NativeDependencyError, ZERO_WAM_COMMIT, load_native_class
 from test_g_pi_data import write_g_pi_task
 from test_native_icl import tiny_model
 
@@ -165,10 +165,10 @@ class GPiTrainingContractTest(unittest.TestCase):
             torch.save(torch.arange(24, dtype=torch.float32).reshape(3, 8), path)
             config["empty_emb_path"] = str(path)
             source_identity = {"kind": "fixture", "config": {"patch_size": (1, 1, 1), "mcp_hidden_collect_layers": (0, 1)}}
-            with patch("evo_wam.g_pi_training.build_icl_model", return_value=(native, torch.zeros(1, 2, 8), source_identity)) as builder, \
-                 patch("evo_wam.g_pi_training.install_action_interface"), \
-                 patch("evo_wam.g_pi_training._interface", return_value=torch.nn.Linear(4, 4)), \
-                 patch("evo_wam.g_pi_context.FrozenGoalEncoder", return_value=torch.nn.Linear(4, 4)) as encoder:
+            with patch("etude.g_pi_training.build_icl_model", return_value=(native, torch.zeros(1, 2, 8), source_identity)) as builder, \
+                 patch("etude.g_pi_training.install_action_interface"), \
+                 patch("etude.g_pi_training._interface", return_value=torch.nn.Linear(4, 4)), \
+                 patch("etude.g_pi_context.FrozenGoalEncoder", return_value=torch.nn.Linear(4, 4)) as encoder:
                 _, _, _, identity, _ = build_g_pi_system(config, {}, stage="g", tiny_native=True, device="cpu")
             self.assertEqual(builder.call_args.kwargs["empty_text_path"], str(path))
             self.assertEqual(native.g_pi_empty_text_identity["source"]["path"], str(path))
@@ -228,7 +228,7 @@ class GPiTrainingContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 export_g_pi_policy(SimpleNamespace(**arguments, stop_thresholds=explicit_thresholds(),
                                                      calibration="calibration.json"))
-            from evo_wam.g_pi_calibration import calibrate_goal_thresholds
+            from etude.g_pi_calibration import calibrate_goal_thresholds
 
             def goal(position):
                 poses = torch.eye(4)[None, None]
@@ -342,7 +342,7 @@ class GPiBaseConstructionTest(unittest.TestCase):
             self.assertEqual(kwargs["device"], "cpu")
             return tiny_model("cpu").float(), torch.ones(1, 3, 8), {"kind": "native-test-fixture", "layers": (0, 1)}
 
-        self.patcher = patch("evo_wam.g_pi_training.build_icl_model", side_effect=build)
+        self.patcher = patch("etude.g_pi_training.build_icl_model", side_effect=build)
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
 
@@ -370,9 +370,9 @@ class GPiBaseConstructionTest(unittest.TestCase):
             initial_rng = generators["language"].get_state().clone()
             try:
                 with patch.object(encoder, "forward", return_value=z), \
-                     patch("evo_wam.g_pi_context.pi_context_features", return_value=features), \
+                     patch("etude.g_pi_context.pi_context_features", return_value=features), \
                      patch.object(interface, "read_layer", wraps=interface.read_layer) as reader, \
-                     patch("evo_wam.g_pi_training.goal_action_forward", side_effect=lambda model, noisy, times, conditions: noisy * 0) as action:
+                     patch("etude.g_pi_training.goal_action_forward", side_effect=lambda model, noisy, times, conditions: noisy * 0) as action:
                     g_pi_training_loss(native, interface, encoder, sample, config, generators,
                                        stage="pi", feature_layers=layers)
             finally:
@@ -400,8 +400,8 @@ class GPiBaseConstructionTest(unittest.TestCase):
         z = torch.nn.functional.normalize(torch.randn(1, encoder.k_z, encoder.d_z), dim=-1)
         entries = [SimpleNamespace(demo_id=str(i), component=i, purpose_group=str(i // 2)) for i in range(4)]
         with patch.object(encoder, "forward", return_value=z), \
-             patch("evo_wam.g_pi_context.split_g_context_features", return_value=(demo_features, robot_features)), \
-             patch("evo_wam.g_pi_context.demo_context_features", return_value=demo_features):
+             patch("etude.g_pi_context.split_g_context_features", return_value=(demo_features, robot_features)), \
+             patch("etude.g_pi_context.demo_context_features", return_value=demo_features):
             single = g_pi_training_loss(native, interface, encoder, sample, config, {}, stage="g", feature_layers=layers)
             mixed = g_intent_training_loss(native, interface, encoder,
                 [(demo, sample), (demo, None), (demo, None), (demo, None)], entries, config)
@@ -532,7 +532,7 @@ class GPiNativeTrainingTest(unittest.TestCase):
             null = torch.arange(24, dtype=torch.float32, device=next(native.parameters()).device).reshape(1, 3, 8) / 24
             return native, null, {"kind": "native-test-fixture", "layers": 2}
 
-        self.patcher = patch("evo_wam.g_pi_training.build_icl_model", side_effect=build)
+        self.patcher = patch("etude.g_pi_training.build_icl_model", side_effect=build)
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
 
@@ -630,7 +630,7 @@ class GPiNativeTrainingTest(unittest.TestCase):
         self.assertFalse((self.root / "cross-split").exists())
 
     def test_unpaired_regression_only_batch_is_not_counted_as_an_update(self):
-        from evo_wam.g_pi_intent import load_intent_table
+        from etude.g_pi_intent import load_intent_table
 
         table = load_intent_table(self.intent_manifest())
         args = self.intent_args("unpaired-regression")
@@ -638,7 +638,7 @@ class GPiNativeTrainingTest(unittest.TestCase):
         config["goal_interface"]["intent_mode"] = "regression_only"
         config["intent_training"]["contrastive_weight"] = 0.
         Path(args.config).write_text(json.dumps(config))
-        with patch("evo_wam.g_pi_intent.sample_intent_batch", return_value=table.entries[1:]):
+        with patch("etude.g_pi_intent.sample_intent_batch", return_value=table.entries[1:]):
             report = train_g_pi_interface(args)
         payload = read_g_pi_artifact(report["artifact"])
         self.assertEqual(payload["updates"], 0)
@@ -706,12 +706,12 @@ class GPiNativeTrainingTest(unittest.TestCase):
         return args
 
     def test_prior_has_no_visual_forward_and_exact_resume_owns_only_prior_parameters(self):
-        from evo_wam.g_pi_context import FrozenGoalEncoder
+        from etude.g_pi_context import FrozenGoalEncoder
 
         forbidden = AssertionError("stage 1 accessed a visual path")
         with patch.object(FrozenGoalEncoder, "forward", side_effect=forbidden), \
-             patch("evo_wam.g_pi_context.pi_context_features", side_effect=forbidden), \
-             patch("evo_wam.g_pi_context.split_g_context_features", side_effect=forbidden):
+             patch("etude.g_pi_context.pi_context_features", side_effect=forbidden), \
+             patch("etude.g_pi_context.split_g_context_features", side_effect=forbidden):
             complete = train_g_pi_interface(self.stage_args("pi_prior", "prior-full", steps=2))
             partial = train_g_pi_interface(self.stage_args("pi_prior", "prior-part"))
             resumed = train_g_pi_interface(self.stage_args("pi_prior", "prior-part", resume=partial["artifact"]))
@@ -800,8 +800,8 @@ class GPiNativeTrainingTest(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in interface.endpoint_encoder.parameters()))
 
     def test_cached_targets_preserve_updates_and_resume_without_calling_E(self):
-        from evo_wam.g_pi_context import FrozenGoalEncoder
-        from evo_wam.g_pi_targets import build_target_cache_index, load_target_cache_index
+        from etude.g_pi_context import FrozenGoalEncoder
+        from etude.g_pi_targets import build_target_cache_index, load_target_cache_index
 
         for route in ROUTES:
             with self.subTest(route=route):
@@ -894,7 +894,7 @@ class GPiNativeTrainingTest(unittest.TestCase):
         native, pi, encoder, metadata = load_g_pi_policy(policies["pi_goal"], device="cuda")
         before = {name: value.detach().clone() for name, value in action_named_parameters(native)}
         checksum = frozen_base_checksum(native)
-        with patch("evo_wam.g_pi_training.build_g_pi_system", side_effect=AssertionError("must not rebuild shared base")):
+        with patch("etude.g_pi_training.build_g_pi_system", side_effect=AssertionError("must not rebuild shared base")):
             shared, decoder, target, _ = load_g_pi_policy(policies["g_translator"], device="cuda",
                 shared_base=(native, encoder, metadata))
         self.assertIs(shared, native)

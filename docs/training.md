@@ -1,6 +1,6 @@
 # Training objectives and runtime contract
 
-`EvoTrainer` in `src/etude/training.py` composes the existing codec, reader,
+`EtudeTrainer` in `src/etude/training.py` composes the existing codec, reader,
 physical predictor, temporal interaction head and `ZeroWAMAdapter`. It does not
 replace the upstream transformer or introduce a second model protocol.
 

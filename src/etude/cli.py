@@ -261,7 +261,7 @@ def fresh_native(sample, config, generator, device, dtype):
 
 def build_trainer(config, *, checkpoint=None, tiny_native=False, device="cuda", stage="interface"):
     from .models import RequirementCodec, EffectReader, CausalEffectPredictor, TemporalInteractionHead
-    from .training import EvoTrainer, LossWeights
+    from .training import EtudeTrainer, LossWeights
     from .zerowam import ZeroWAMAdapter, DEFAULT_SOURCE
     dims, lora = config["dimensions"], config["lora"]
     options = dict(current_tokens=config["tokens"]["current"], remaining_tokens=config["tokens"]["remaining"],
@@ -303,7 +303,7 @@ def build_trainer(config, *, checkpoint=None, tiny_native=False, device="cuda", 
     physical = CausalEffectPredictor(dims["entity_dim"], dims["proprio_dim"], dims["action_dim"], dims["embodiment_dim"],
                                      dims["geometry_dim"], dims["relation_dim"], dims["event_dim"]).to(device)
     interaction = TemporalInteractionHead(adapter.native.inner_dim, dims["relation_dim"], dims["event_dim"]).to(device)
-    trainer = EvoTrainer(adapter, codec, reader, physical, interaction, stage=stage,
+    trainer = EtudeTrainer(adapter, codec, reader, physical, interaction, stage=stage,
                          weights=LossWeights(**config["training"]["loss_weights"]),
                          exec_start_step=config["training"]["exec_start_step"], enable_ifp=config["ifp"]["enabled"],
                          enable_interaction=config["interaction_supervision"],

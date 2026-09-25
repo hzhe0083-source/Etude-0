@@ -10,7 +10,7 @@ from torch import nn
 from etude.contracts import EffectRequirement, PhysicalOutcome, TaskRequirement
 from etude.models import (CausalEffectPredictor, EffectReader, RequirementCodec,
                             TemporalInteractionHead)
-from etude.training import EvoTrainer, LossWeights, TrainingBatch
+from etude.training import EtudeTrainer, LossWeights, TrainingBatch
 from etude.zerowam import GeneratedFuture, NativeOutput
 
 
@@ -113,7 +113,7 @@ def make_batch():
 
 
 def trainer(stage="joint", weights=None, exec_start_step=0):
-    return EvoTrainer(TinyAdapter(), RequirementCodec(3, 2, 2, 1, roles=2, token_dim=4),
+    return EtudeTrainer(TinyAdapter(), RequirementCodec(3, 2, 2, 1, roles=2, token_dim=4),
                       EffectReader(5, 3, 2, 2, roles=2, token_dim=4),
                       CausalEffectPredictor(3, 2, 4, 2, 2, 2, 1, hidden_dim=4),
                       TemporalInteractionHead(4, 2, 1, hidden_dim=4),

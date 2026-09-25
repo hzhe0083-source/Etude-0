@@ -16,7 +16,7 @@ from torch import nn
 
 from etude import cli
 from etude.data import load_experiment, load_sample, load_observation
-from etude.training import EvoTrainer, LossWeights
+from etude.training import EtudeTrainer, LossWeights
 from etude.zerowam import TaskConditions, ZERO_WAM_COMMIT
 
 
@@ -118,8 +118,8 @@ class CliTests(unittest.TestCase):
             proxy = SimpleNamespace(adapter=adapter, enable_ifp=True,
                                     weights=LossWeights(next_video=0, native_action=0, ifp=0))
             condition = TaskConditions(torch.zeros(1, 8, 32), torch.zeros(1, 8, 32), batch.null_text)
-            EvoTrainer._native(proxy, batch, condition, include_action=False, include_interaction=False)
-            EvoTrainer._native(proxy, batch, condition, include_action=False, include_interaction=False)
+            EtudeTrainer._native(proxy, batch, condition, include_action=False, include_interaction=False)
+            EtudeTrainer._native(proxy, batch, condition, include_action=False, include_interaction=False)
             first, second = [call.args[0] for call in adapter.forward_train.call_args_list]
             self.assertIs(first["latent_dict"], second["latent_dict"])
             self.assertIs(first["action_dict"], second["action_dict"])

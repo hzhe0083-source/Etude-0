@@ -146,7 +146,7 @@ def _native_loss(prediction: Tensor, stream: dict, patch_size) -> Tensor:
     return masked_mean(error, valid).loss
 
 
-class EvoTrainer(nn.Module):
+class EtudeTrainer(nn.Module):
     """One optimizer over the parameters selected by the current training stage.
 
     ``set_stage`` deliberately rebuilds AdamW: moments from interface fitting do
